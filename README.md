@@ -1,4 +1,4 @@
-# skills.rs
+# Skills.rs
 
 **Infinite Skills. Finite Context.**
 
