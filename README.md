@@ -496,6 +496,11 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
 
 ## 📚 Documentation
 
+### LLM Agent Prompts
+- **[PROMPT_CLI.md](./PROMPT_CLI.md)** - System prompt for AI agents using `skills` CLI (~300 Tokens)
+- **[PROMPT_MCP.md](./PROMPT_MCP.md)** - System prompt for AI agents using skills.rs as MCP server (~390 Tokens but may not be necessary)
+
+### Guides
 - **[QUICKSTART.md](./QUICKSTART.md)** - Step-by-step getting started guide
 - **[OPERATIONS.md](./OPERATIONS.md)** - Complete operations guide (deployment, configuration, CLI usage)
 - **[PRODUCTION_CHECKLIST.md](./PRODUCTION_CHECKLIST.md)** - Production readiness verification
