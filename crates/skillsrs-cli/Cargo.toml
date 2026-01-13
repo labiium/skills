@@ -1,8 +1,8 @@
 [package]
-name = "skillsrs-cli"
+name = "skillsrs"
 version.workspace = true
 edition.workspace = true
-description = "CLI for skills.rs - Infinite Skills. Finite Context."
+description = "Infinite Skills. Finite Context. - Unified MCP server aggregating tools and skills with 99% token reduction"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
