@@ -96,7 +96,7 @@ schemars = { version = "1.2", features = ["derive"] }
 blake3 = "1.5"
 
 # Indexing/Search
-tantivy = "0.22"
+tantivy = "0.25"
 
 # Filesystem watching
 notify = "6.1"
