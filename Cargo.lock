@@ -3426,7 +3426,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "skills"
+name = "skillsrs"
 version = "0.1.0"
 dependencies = [
  "anyhow",

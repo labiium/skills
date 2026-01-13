@@ -2,6 +2,7 @@
 name = "skillsrs-runtime"
 version.workspace = true
 edition.workspace = true
+description = "Runtime execution engine for skills.rs - Sandboxed skill execution with WASM support"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

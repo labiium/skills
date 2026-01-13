@@ -2,6 +2,7 @@
 name = "skillsrs-skillstore"
 version.workspace = true
 edition.workspace = true
+description = "Skill storage and filesystem management for skills.rs - Load and watch skill definitions"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -2,6 +2,7 @@
 name = "skillsrs-index"
 version.workspace = true
 edition.workspace = true
+description = "Search and indexing for skills.rs - Fast skill discovery with tantivy-based search"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

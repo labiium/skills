@@ -2,6 +2,7 @@
 name = "skillsrs-core"
 version.workspace = true
 edition.workspace = true
+description = "Core types and traits for skills.rs - MCP server skill management"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -2,6 +2,7 @@
 name = "skillsrs-policy"
 version.workspace = true
 edition.workspace = true
+description = "Policy engine for skills.rs - Access control and security policies for MCP skills"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

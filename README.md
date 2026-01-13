@@ -47,6 +47,9 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
 # Install directly from GitHub (recommended)
 cargo install --git https://github.com/labiium/skills
 
+# Install skills.rs from Crates.io
+cargo install skillsrs
+
 # Or clone and build from source
 git clone https://github.com/labiium/skills
 cd skills

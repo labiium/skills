@@ -2,6 +2,7 @@
 name = "skillsrs-upstream"
 version.workspace = true
 edition.workspace = true
+description = "Upstream MCP server integration for skills.rs - Connect and aggregate external MCP servers"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

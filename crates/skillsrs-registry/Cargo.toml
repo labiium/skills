@@ -2,6 +2,7 @@
 name = "skillsrs-registry"
 version.workspace = true
 edition.workspace = true
+description = "Registry management for skills.rs - MCP server skill registration and discovery"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
