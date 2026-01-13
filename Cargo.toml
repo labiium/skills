@@ -135,7 +135,7 @@ config = "0.14"
 directories = "5.0"
 
 # Axum for HTTP server
-axum = "0.7"
+axum = "0.8"
 tower-http = { version = "0.5", features = ["cors"] }
 
 [profile.release]
