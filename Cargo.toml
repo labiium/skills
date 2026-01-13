@@ -1,0 +1,149 @@
+[package]
+name = "skills"
+version = "0.1.0"
+edition = "2021"
+description = "Infinite Skills. Finite Context. - Unified MCP server aggregating tools and skills with 99% token reduction"
+authors = ["Emmanuel A. Olowe", "LABIIUM"]
+license = "Apache-2.0"
+repository = "https://github.com/labiium/skills"
+default-run = "skills"
+
+[[bin]]
+name = "skills"
+path = "crates/skillsrs-cli/src/main.rs"
+
+[dependencies]
+skillsrs-core = { path = "crates/skillsrs-core" }
+skillsrs-registry = { path = "crates/skillsrs-registry" }
+skillsrs-index = { path = "crates/skillsrs-index" }
+skillsrs-upstream = { path = "crates/skillsrs-upstream" }
+skillsrs-skillstore = { path = "crates/skillsrs-skillstore" }
+skillsrs-runtime = { path = "crates/skillsrs-runtime" }
+skillsrs-policy = { path = "crates/skillsrs-policy" }
+skillsrs-mcp = { path = "crates/skillsrs-mcp" }
+serde_json = "1.0"
+tokio = { version = "1.42", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+config = "0.14"
+regex = "1.11"
+rmcp = { version = "0.8.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+[dev-dependencies]
+tempfile = "3.24"
+
+[workspace]
+members = [
+    "crates/skillsrs-core",
+    "crates/skillsrs-registry",
+    "crates/skillsrs-index",
+    "crates/skillsrs-upstream",
+    "crates/skillsrs-skillstore",
+    "crates/skillsrs-runtime",
+    "crates/skillsrs-policy",
+    "crates/skillsrs-mcp",
+    "crates/skillsrs-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["skills.rs team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/labiium/skills"
+
+[workspace.dependencies]
+# Internal crates
+skillsrs-core = { path = "crates/skillsrs-core" }
+skillsrs-registry = { path = "crates/skillsrs-registry" }
+skillsrs-index = { path = "crates/skillsrs-index" }
+skillsrs-upstream = { path = "crates/skillsrs-upstream" }
+skillsrs-skillstore = { path = "crates/skillsrs-skillstore" }
+skillsrs-runtime = { path = "crates/skillsrs-runtime" }
+skillsrs-policy = { path = "crates/skillsrs-policy" }
+skillsrs-mcp = { path = "crates/skillsrs-mcp" }
+
+# MCP SDK (official Rust implementation)
+rmcp = { version = "0.8.0", features = ["server"] }
+rmcp-macros = "0.8.0"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# JSON Schema validation (using schemars which rmcp uses)
+jsonschema = "0.18"
+schemars = { version = "1.2", features = ["derive"] }
+
+# Hashing
+blake3 = "1.5"
+
+# Indexing/Search
+tantivy = "0.22"
+
+# Filesystem watching
+notify = "6.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6.1"
+regex = "1.11"
+glob = "0.3"
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1.8"
+
+# WASM runtime (optional for script mode)
+wasmtime = "26.0"
+
+# Config
+config = "0.14"
+
+# System directories
+directories = "5.0"
+
+# Axum for HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

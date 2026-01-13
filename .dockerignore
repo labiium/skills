@@ -1,0 +1,71 @@
+# Git
+.git
+.gitignore
+.github
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock for libraries
+# Keep Cargo.lock for binary crates
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# CI/CD
+.travis.yml
+.gitlab-ci.yml
+azure-pipelines.yml
+
+# Test files
+tests/fixtures/
+**/test_data/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Coverage reports
+*.profraw
+*.profdata
+coverage/
+lcov.info
+target/llvm-cov/
+
+# Benchmark results
+target/criterion/
+benches/
+
+# Cache directories
+.cache/
+*.cache
+
+# Scripts that aren't needed in container
+scripts/
+
+# Example and development files
+examples/
+config.example.yaml
+
+# License and contribution docs
+LICENSE
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md

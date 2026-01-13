@@ -1,0 +1,131 @@
+# skills.rs Configuration Example
+#
+# This file demonstrates all available configuration options for the
+# skills.rs unified MCP server (Infinite Skills. Finite Context.).
+
+# Server configuration
+server:
+  # Bind address for HTTP mode
+  bind: "127.0.0.1:8000"
+
+  # Transport mode: stdio or http
+  transport: "stdio"
+
+  # Log level: trace, debug, info, warn, error
+  log_level: "info"
+
+# Paths configuration (optional - uses system defaults if not specified)
+# All paths support environment variable overrides (e.g., SKILLS_ROOT)
+paths:
+  # Data directory (parent for database and skills)
+  # Default:
+  #   Linux: ~/.local/share/skills
+  #   macOS: ~/Library/Application Support/skills
+  #   Windows: %APPDATA%\labiium\skills
+  # data_dir: "/custom/data/dir"
+
+  # Configuration directory
+  # Default:
+  #   Linux: ~/.config/skills
+  #   macOS: ~/Library/Preferences/skills
+  #   Windows: %APPDATA%\labiium\skills\config
+  # config_dir: "/custom/config/dir"
+
+  # Cache directory
+  # Default:
+  #   Linux: ~/.cache/skills
+  #   macOS: ~/Library/Caches/skills
+  #   Windows: %LOCALAPPDATA%\labiium\skills\cache
+  # cache_dir: "/custom/cache/dir"
+
+  # Database file path
+  # Default: <data_dir>/skills.db
+  # database_path: "/custom/path/skills.db"
+
+  # Skills root directory
+  # Default: <data_dir>/skills
+  # skills_root: "./skills"
+
+  # Logs directory
+  # Default: <data_dir>/logs
+  # logs_dir: "/custom/logs/dir"
+
+# Index configuration
+index:
+  # Engine type: memory or tantivy
+  engine: "memory"
+
+  # Maximum search results
+  max_results: 50
+
+# Policy configuration
+policy:
+  # Default risk tier for unknown callables
+  # Options: read_only, writes, destructive, admin, unknown
+  default_risk: "unknown"
+
+  # Risk tiers that require consent
+  require_consent_for:
+    - "writes"
+    - "destructive"
+    - "admin"
+
+  # Trusted server aliases (empty = trust none, ["*"] = trust all)
+  trusted_servers:
+    - "local-fs"
+    - "local-tools"
+
+  # Denied tags (callables with these tags are blocked)
+  deny_tags:
+    - "payments"
+    - "destructive-ops"
+
+  # Maximum calls per skill execution
+  max_calls_per_skill: 30
+
+  # Maximum execution time in milliseconds
+  max_exec_ms: 120000
+
+  # Allow patterns (glob-style, empty = allow none, ["*"] = allow all)
+  allow_patterns:
+    - "*"
+
+  # Deny patterns (glob-style)
+  deny_patterns: []
+
+# Upstream MCP servers
+upstreams:
+  # Example: stdio server
+  - alias: "filesystem"
+    transport: "stdio"
+    command:
+      - "npx"
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/tmp"
+    tags:
+      - "filesystem"
+      - "local"
+
+  # Example: HTTP server
+  - alias: "github"
+    transport: "http"
+    url: "https://api.example.com/mcp"
+    auth:
+      type: "bearer"
+      env: "GITHUB_TOKEN"
+    tags:
+      - "github"
+      - "remote"
+
+  # Example: local tool server
+  - alias: "keysight"
+    transport: "stdio"
+    command:
+      - "/usr/local/bin/keysight-mcp"
+      - "--mode"
+      - "lab"
+    tags:
+      - "instruments"
+      - "vna"
+      - "trusted"

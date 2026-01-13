@@ -1,0 +1,447 @@
+//! Registry store for callables (tools + skills)
+//!
+//! Provides thread-safe concurrent access to the unified catalog of all
+//! discoverable callables, with support for incremental updates from
+//! upstream servers and skill store.
+
+use dashmap::DashMap;
+use parking_lot::RwLock;
+use skillsrs_core::{CallableId, CallableKind, CallableRecord};
+use std::collections::HashMap;
+use std::sync::Arc;
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+#[derive(Error, Debug)]
+pub enum RegistryError {
+    #[error("Callable not found: {0}")]
+    NotFound(String),
+
+    #[error("Duplicate callable ID: {0}")]
+    DuplicateId(String),
+
+    #[error("Invalid update: {0}")]
+    InvalidUpdate(String),
+
+    #[error("Core error: {0}")]
+    Core(#[from] skillsrs_core::CoreError),
+}
+
+pub type Result<T> = std::result::Result<T, RegistryError>;
+
+/// Server health state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerHealth {
+    Connected,
+    Degraded,
+    Down,
+}
+
+/// Server metadata
+#[derive(Debug, Clone)]
+pub struct ServerInfo {
+    pub alias: String,
+    pub health: ServerHealth,
+    pub tool_count: usize,
+    pub last_refresh: chrono::DateTime<chrono::Utc>,
+    pub tags: Vec<String>,
+}
+
+/// Statistics about the registry
+#[derive(Debug, Clone)]
+pub struct RegistryStats {
+    pub total_callables: usize,
+    pub total_tools: usize,
+    pub total_skills: usize,
+    pub servers: Vec<ServerInfo>,
+    pub stale_servers: Vec<String>,
+}
+
+/// Thread-safe registry store
+#[derive(Clone)]
+pub struct Registry {
+    /// Main callable store (concurrent map for fast reads)
+    callables: Arc<DashMap<CallableId, CallableRecord>>,
+
+    /// Secondary index by FQ name
+    by_fq_name: Arc<DashMap<String, CallableId>>,
+
+    /// Secondary index by server (tool -> server mapping)
+    by_server: Arc<DashMap<String, Vec<CallableId>>>,
+
+    /// Server metadata
+    servers: Arc<RwLock<HashMap<String, ServerInfo>>>,
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Registry {
+            callables: Arc::new(DashMap::new()),
+            by_fq_name: Arc::new(DashMap::new()),
+            by_server: Arc::new(DashMap::new()),
+            servers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a callable (tool or skill)
+    pub fn register(&self, record: CallableRecord) -> Result<()> {
+        let id = record.id.clone();
+        let fq_name = record.fq_name.clone();
+        let server_alias = record.server_alias.clone();
+
+        // Check for duplicates
+        if self.callables.contains_key(&id) {
+            warn!("Duplicate callable ID, replacing: {}", id);
+        }
+
+        // Update secondary indices
+        self.by_fq_name.insert(fq_name.clone(), id.clone());
+
+        if let Some(server) = &server_alias {
+            self.by_server
+                .entry(server.clone())
+                .or_default()
+                .push(id.clone());
+        }
+
+        // Insert main record
+        self.callables.insert(id.clone(), record);
+
+        debug!("Registered callable: {} ({})", id, fq_name);
+        Ok(())
+    }
+
+    /// Register multiple callables (batch operation)
+    pub fn register_batch(&self, records: Vec<CallableRecord>) -> Result<()> {
+        for record in records {
+            self.register(record)?;
+        }
+        Ok(())
+    }
+
+    /// Get a callable by ID
+    pub fn get(&self, id: &CallableId) -> Option<CallableRecord> {
+        self.callables.get(id).map(|entry| entry.value().clone())
+    }
+
+    /// Get a callable by fully qualified name
+    pub fn get_by_fq_name(&self, fq_name: &str) -> Option<CallableRecord> {
+        self.by_fq_name
+            .get(fq_name)
+            .and_then(|id| self.get(id.value()))
+    }
+
+    /// Get all callables for a server
+    pub fn get_by_server(&self, server_alias: &str) -> Vec<CallableRecord> {
+        self.by_server
+            .get(server_alias)
+            .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    /// Remove a callable
+    pub fn remove(&self, id: &CallableId) -> Option<CallableRecord> {
+        if let Some((_, record)) = self.callables.remove(id) {
+            // Clean up secondary indices
+            self.by_fq_name.remove(&record.fq_name);
+
+            if let Some(server) = &record.server_alias {
+                if let Some(mut ids) = self.by_server.get_mut(server) {
+                    ids.retain(|cid| cid != id);
+                }
+            }
+
+            debug!("Removed callable: {}", id);
+            Some(record)
+        } else {
+            None
+        }
+    }
+
+    /// Remove all callables for a server (for refresh)
+    pub fn remove_server(&self, server_alias: &str) -> usize {
+        let ids = self
+            .by_server
+            .get(server_alias)
+            .map(|ids| ids.clone())
+            .unwrap_or_default();
+
+        let count = ids.len();
+        for id in ids {
+            self.remove(&id);
+        }
+
+        self.by_server.remove(server_alias);
+        info!("Removed {} callables from server: {}", count, server_alias);
+        count
+    }
+
+    /// Get all callables (for indexing)
+    pub fn all(&self) -> Vec<CallableRecord> {
+        self.callables
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Get callables by kind
+    pub fn by_kind(&self, kind: CallableKind) -> Vec<CallableRecord> {
+        self.callables
+            .iter()
+            .filter(|entry| entry.value().kind == kind)
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Update server metadata
+    pub fn update_server(&self, info: ServerInfo) {
+        let alias = info.alias.clone();
+        let mut servers = self.servers.write();
+        servers.insert(alias, info);
+    }
+
+    /// Get server info
+    pub fn get_server(&self, alias: &str) -> Option<ServerInfo> {
+        self.servers.read().get(alias).cloned()
+    }
+
+    /// Get all server info
+    pub fn all_servers(&self) -> Vec<ServerInfo> {
+        self.servers.read().values().cloned().collect()
+    }
+
+    /// Mark server as degraded
+    pub fn mark_server_degraded(&self, alias: &str) {
+        let mut servers = self.servers.write();
+        if let Some(info) = servers.get_mut(alias) {
+            info.health = ServerHealth::Degraded;
+            warn!("Server marked as degraded: {}", alias);
+        }
+    }
+
+    /// Mark server as down
+    pub fn mark_server_down(&self, alias: &str) {
+        let mut servers = self.servers.write();
+        if let Some(info) = servers.get_mut(alias) {
+            info.health = ServerHealth::Down;
+            warn!("Server marked as down: {}", alias);
+        }
+    }
+
+    /// Get registry statistics
+    pub fn stats(&self) -> RegistryStats {
+        let all_callables = self.all();
+        let tools = all_callables
+            .iter()
+            .filter(|c| c.kind == CallableKind::Tool)
+            .count();
+        let skills = all_callables
+            .iter()
+            .filter(|c| c.kind == CallableKind::Skill)
+            .count();
+
+        let servers = self.all_servers();
+        let stale_servers: Vec<String> = servers
+            .iter()
+            .filter(|s| s.health != ServerHealth::Connected)
+            .map(|s| s.alias.clone())
+            .collect();
+
+        RegistryStats {
+            total_callables: all_callables.len(),
+            total_tools: tools,
+            total_skills: skills,
+            servers,
+            stale_servers,
+        }
+    }
+
+    /// Check if a callable exists
+    pub fn contains(&self, id: &CallableId) -> bool {
+        self.callables.contains_key(id)
+    }
+
+    /// Get count of callables
+    pub fn len(&self) -> usize {
+        self.callables.len()
+    }
+
+    /// Check if registry is empty
+    pub fn is_empty(&self) -> bool {
+        self.callables.is_empty()
+    }
+
+    /// Clear all callables (for testing)
+    pub fn clear(&self) {
+        self.callables.clear();
+        self.by_fq_name.clear();
+        self.by_server.clear();
+        self.servers.write().clear();
+        info!("Registry cleared");
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skillsrs_core::{CallableId, CallableKind, CostHints, RiskTier, SchemaDigest};
+
+    fn make_test_tool(server: &str, name: &str) -> CallableRecord {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string" }
+            }
+        });
+        let digest = SchemaDigest::from_schema(&schema).unwrap();
+        let id = CallableId::tool(server, name, digest.as_str());
+
+        CallableRecord {
+            id: id.clone(),
+            kind: CallableKind::Tool,
+            fq_name: format!("{}.{}", server, name),
+            name: name.to_string(),
+            title: Some(format!("Test Tool {}", name)),
+            description: Some("Test description".to_string()),
+            tags: vec!["test".to_string()],
+            input_schema: schema,
+            output_schema: None,
+            schema_digest: digest,
+            server_alias: Some(server.to_string()),
+            upstream_tool_name: Some(name.to_string()),
+            skill_version: None,
+            uses: vec![],
+            cost_hints: CostHints::default(),
+            risk_tier: RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_register_and_get() {
+        let registry = Registry::new();
+        let tool = make_test_tool("test-server", "test-tool");
+        let id = tool.id.clone();
+
+        registry.register(tool).unwrap();
+
+        assert!(registry.contains(&id));
+        assert_eq!(registry.len(), 1);
+
+        let retrieved = registry.get(&id).unwrap();
+        assert_eq!(retrieved.name, "test-tool");
+    }
+
+    #[test]
+    fn test_get_by_fq_name() {
+        let registry = Registry::new();
+        let tool = make_test_tool("test-server", "test-tool");
+
+        registry.register(tool).unwrap();
+
+        let retrieved = registry.get_by_fq_name("test-server.test-tool").unwrap();
+        assert_eq!(retrieved.name, "test-tool");
+    }
+
+    #[test]
+    fn test_get_by_server() {
+        let registry = Registry::new();
+        registry
+            .register(make_test_tool("server1", "tool1"))
+            .unwrap();
+        registry
+            .register(make_test_tool("server1", "tool2"))
+            .unwrap();
+        registry
+            .register(make_test_tool("server2", "tool3"))
+            .unwrap();
+
+        let server1_tools = registry.get_by_server("server1");
+        assert_eq!(server1_tools.len(), 2);
+
+        let server2_tools = registry.get_by_server("server2");
+        assert_eq!(server2_tools.len(), 1);
+    }
+
+    #[test]
+    fn test_remove() {
+        let registry = Registry::new();
+        let tool = make_test_tool("test-server", "test-tool");
+        let id = tool.id.clone();
+
+        registry.register(tool).unwrap();
+        assert_eq!(registry.len(), 1);
+
+        let removed = registry.remove(&id).unwrap();
+        assert_eq!(removed.name, "test-tool");
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_server() {
+        let registry = Registry::new();
+        registry
+            .register(make_test_tool("server1", "tool1"))
+            .unwrap();
+        registry
+            .register(make_test_tool("server1", "tool2"))
+            .unwrap();
+        registry
+            .register(make_test_tool("server2", "tool3"))
+            .unwrap();
+
+        let removed = registry.remove_server("server1");
+        assert_eq!(removed, 2);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn test_stats() {
+        let registry = Registry::new();
+        registry
+            .register(make_test_tool("server1", "tool1"))
+            .unwrap();
+        registry
+            .register(make_test_tool("server1", "tool2"))
+            .unwrap();
+
+        let stats = registry.stats();
+        assert_eq!(stats.total_callables, 2);
+        assert_eq!(stats.total_tools, 2);
+        assert_eq!(stats.total_skills, 0);
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let registry = Arc::new(Registry::new());
+        let mut handles = vec![];
+
+        // Spawn multiple threads registering tools
+        for i in 0..10 {
+            let reg = Arc::clone(&registry);
+            let handle = thread::spawn(move || {
+                for j in 0..10 {
+                    let tool = make_test_tool(&format!("server{}", i), &format!("tool{}", j));
+                    reg.register(tool).unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(registry.len(), 100);
+    }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "skillsrs-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skillsrs-core = { workspace = true }
+skillsrs-registry = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+# Optional Tantivy for advanced indexing
+tantivy = { version = "0.22", optional = true }
+
+[features]
+default = ["memory"]
+memory = []
+tantivy-index = ["tantivy"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+chrono = { workspace = true }

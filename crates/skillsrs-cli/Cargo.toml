@@ -1,0 +1,54 @@
+[package]
+name = "skillsrs-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI for skills.rs - Infinite Skills. Finite Context."
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "skills"
+path = "src/main.rs"
+
+[dependencies]
+skillsrs-core = { workspace = true }
+skillsrs-registry = { workspace = true }
+skillsrs-index = { workspace = true }
+skillsrs-upstream = { workspace = true }
+skillsrs-skillstore = { workspace = true }
+skillsrs-runtime = { workspace = true }
+skillsrs-policy = { workspace = true }
+skillsrs-mcp = { workspace = true }
+
+# MCP SDK
+rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI framework
+clap = { workspace = true }
+
+# Config
+config = { workspace = true }
+
+# System directories
+directories = { workspace = true }
+
+# Pattern matching
+regex = { workspace = true }
+
+# Server
+axum = { workspace = true }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile = "3.24"

@@ -1,0 +1,27 @@
+[package]
+name = "skillsrs-skillstore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skillsrs-core = { workspace = true }
+skillsrs-registry = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+notify = { workspace = true }
+glob = { workspace = true }
+chrono = { workspace = true }
+semver = "1.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile = "3.8"
