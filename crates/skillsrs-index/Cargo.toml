@@ -21,7 +21,7 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 
 # Optional Tantivy for advanced indexing
-tantivy = { version = "0.22", optional = true }
+tantivy = { version = "0.25", optional = true }
 
 [features]
 default = ["memory"]
