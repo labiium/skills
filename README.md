@@ -68,26 +68,78 @@ skills paths
 
 ### Configuration
 
-Skills.rs uses sensible defaults but can be customized. Create a config file at `~/.config/skills/config.yaml` (Linux) or use `--config` flag:
+Skills.rs supports both **project-local** and **global** configuration.
+
+#### Project-local (recommended)
+
+Initialize a project-local setup in the repo root:
+
+```bash
+skills init
+```
+
+This creates:
+
+- `.skills/config.yaml`
+- `.skills/skills/`
+- `.skills/skills.db`
+
+`skills` will automatically discover the nearest `.skills/config.yaml` by walking up from the current directory.
+
+Minimal `.skills/config.yaml`:
 
 ```yaml
-# Optional path overrides (uses system defaults if not specified)
 paths:
-  skills_root: "/custom/skills"  # Override skills directory
-  database_path: "/custom/skills.db"  # Override database location
+  data_dir: ".skills"
+  skills_root: ".skills/skills"
+  database_path: ".skills/skills.db"
 
-# Server settings
-server:
-  bind: "127.0.0.1:8000"
-  transport: stdio
-  log_level: info
+sandbox:
+  backend: timeout
+  timeout_ms: 30000
+  allow_read: []
+  allow_write: []
+  allow_network: false
+  max_memory_bytes: 536870912
+  max_cpu_seconds: 30
 
-# Upstream MCP servers
-upstreams:
-  - alias: brave
-    transport: stdio
-    command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
+use_global:
+  enabled: false
+
+upstreams: []
 ```
+
+To disable sandboxing entirely:
+
+```yaml
+sandbox:
+  backend: none
+```
+
+#### Global configuration
+
+Global config is stored in the system config directory (varies by platform). To force using global config (ignore project `.skills/config.yaml`):
+
+```bash
+skills --global list
+```
+
+You can also point at a specific file:
+
+```bash
+skills --config /path/to/config.yaml list
+```
+
+#### Global + project combined (recommended for teams)
+
+If you want to use **global upstreams/skills** in addition to project ones, set in `.skills/config.yaml`:
+
+```yaml
+use_global:
+  enabled: true
+```
+
+This overlays project settings on top of the global config and appends project `upstreams` to the global list.
 
 **Environment Variable Overrides:**
 ```bash
@@ -101,7 +153,11 @@ skills server
 skills server --skills-root /custom/skills --database /custom/db/skills.db
 ```
 
-See [PATHS.md](PATHS.md) for complete directory documentation.
+To see the directories in use on your machine, run:
+
+```bash
+skills paths
+```
 
 ### Run the Server
 

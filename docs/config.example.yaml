@@ -14,6 +14,27 @@ server:
   # Log level: trace, debug, info, warn, error
   log_level: "info"
 
+# Sandbox configuration (applies to bundled tool execution)
+# To disable sandboxing entirely, set:
+#   backend: none
+sandbox:
+  # Backend: none, timeout, restricted, bubblewrap
+  backend: "timeout"
+
+  # Maximum execution time (milliseconds)
+  timeout_ms: 30000
+
+  # Allowed read/write paths (implementation-dependent; empty = default policy)
+  allow_read: []
+  allow_write: []
+
+  # Allow network access for sandboxed executions
+  allow_network: false
+
+  # Resource limits
+  max_memory_bytes: 536870912 # 512MB
+  max_cpu_seconds: 30
+
 # Paths configuration (optional - uses system defaults if not specified)
 # All paths support environment variable overrides (e.g., SKILLS_ROOT)
 paths:

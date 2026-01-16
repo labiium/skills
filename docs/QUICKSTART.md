@@ -20,22 +20,39 @@ cargo build --release
 
 ---
 
-## 2. Create Config
+## 2. Initialize Project Config
 
-Create `config.yaml`:
+Initialize a project-local setup (run in the repo root):
+
+```bash
+./target/release/skills init
+```
+
+This creates:
+
+- `.skills/config.yaml`
+- `.skills/skills/`
+- `.skills/skills.db`
+
+Edit `.skills/config.yaml` as needed. Example:
 
 ```yaml
-server:
-  bind: "127.0.0.1:8000"
-  transport: stdio
-  log_level: info
-
-skillstore:
-  root: "./skills"
+paths:
+  data_dir: ".skills"
+  skills_root: ".skills/skills"
+  database_path: ".skills/skills.db"
 
 sandbox:
-  backend: timeout  # Use 'restricted' or 'bubblewrap' for production
+  backend: timeout
   timeout_ms: 30000
+  allow_read: []
+  allow_write: []
+  allow_network: false
+  max_memory_bytes: 536870912
+  max_cpu_seconds: 30
+
+use_global:
+  enabled: false
 
 upstreams:
   - alias: brave
@@ -44,16 +61,23 @@ upstreams:
     tags: ["search", "web"]
 ```
 
+To disable sandboxing entirely:
+
+```yaml
+sandbox:
+  backend: none
+```
+
 ---
 
 ## 3. Create Your First Skill
 
 ```bash
-# Create skills directory
-mkdir -p skills/my-first-skill
+# Create skills directory (matches paths.skills_root in .skills/config.yaml)
+mkdir -p .skills/skills/my-first-skill
 
 # Create skill manifest
-cat > skills/my-first-skill/skill.json << 'EOF'
+cat > .skills/skills/my-first-skill/skill.json << 'EOF'
 {
   "id": "my-first-skill",
   "title": "My First Skill",
@@ -87,7 +111,7 @@ cat > skills/my-first-skill/skill.json << 'EOF'
 EOF
 
 # Create skill instructions
-cat > skills/my-first-skill/SKILL.md << 'EOF'
+cat > .skills/skills/my-first-skill/SKILL.md << 'EOF'
 # My First Skill
 
 ## Purpose
@@ -112,12 +136,12 @@ EOF
 
 **Stdio mode (for MCP clients):**
 ```bash
-./target/release/skills stdio --config config.yaml
+./target/release/skills stdio
 ```
 
 **HTTP mode (for testing):**
 ```bash
-./target/release/skills http --bind 127.0.0.1:8000 --config config.yaml
+./target/release/skills http --bind 127.0.0.1:8000
 ```
 
 The server will:
@@ -254,7 +278,7 @@ npx -y @modelcontextprotocol/server-brave-search
 **Bundled script not executing?**
 ```bash
 # Test script directly
-cd skills/my-first-skill
+cd .skills/skills/my-first-skill
 export SKILL_ARGS_JSON='{"message":"test"}'
 python3 process.py
 

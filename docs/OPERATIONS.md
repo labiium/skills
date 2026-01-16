@@ -154,14 +154,16 @@ Paths are resolved in this order (highest to lowest):
 
 ### Configuration File Location
 
-Skills.rs looks for `config.yaml` in:
+Skills.rs configuration is discovered in this order:
 1. Path specified with `--config` flag
-2. `$SKILLS_CONFIG_DIR/config.yaml`
-3. `./config.yaml` (current directory)
+2. Nearest `.skills/config.yaml` found by walking up from the current directory (project-local)
+3. System config directory `config.yaml` (global)
+
+To force using global config only (ignore project `.skills/config.yaml`), use `--global`.
 
 ### Basic Configuration
 
-Create `~/.config/skills/config.yaml` (Linux) or equivalent:
+Create a project-local config at `.skills/config.yaml` (recommended), or use the global config in the system config directory (varies by platform).
 
 ```yaml
 # Upstream MCP servers
@@ -191,7 +193,7 @@ upstreams:
 sandbox:
   backend: restricted  # none, timeout, restricted, bubblewrap
   timeout_ms: 30000
-  max_memory_mb: 512
+  max_memory_bytes: 536870912
 
 # Policy configuration (optional)
 policy:

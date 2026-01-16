@@ -6,6 +6,7 @@ description = "Infinite Skills. Finite Context. - Unified MCP server aggregating
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "skills"

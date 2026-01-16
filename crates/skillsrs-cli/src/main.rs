@@ -42,6 +42,10 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
+    /// Force using only global config + global skills/upstreams (ignore local config discovery)
+    #[arg(long)]
+    global: bool,
+
     /// Data directory (overrides config and system default)
     #[arg(long, env = "SKILLS_DATA_DIR")]
     data_dir: Option<String>,
@@ -69,6 +73,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a project-local skills configuration in the current directory
+    ///
+    /// Creates a `.skills/` directory containing:
+    /// - `.skills/config.yaml` (project-local config)
+    /// - `.skills/skills/` (project-local skills root)
+    /// - `.skills/skills.db` (project-local sqlite database)
+    ///
+    /// After init, commands will automatically discover `.skills/config.yaml`
+    /// when run from this project (or any subdirectory).
+    Init {
+        /// Overwrite existing `.skills/config.yaml` if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Run server in stdio mode (default for MCP)
     Server {
         #[command(subcommand)]
@@ -178,6 +197,20 @@ struct Config {
 
     #[serde(default)]
     paths: PathsConfig,
+
+    #[serde(default)]
+    sandbox: SandboxConfig,
+
+    #[serde(default)]
+    use_global: UseGlobalSettings,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct UseGlobalSettings {
+    /// If true, overlay the project config on top of global config.
+    /// This allows using global upstreams/skills together with project ones.
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -239,6 +272,55 @@ fn load_config(path: &std::path::Path) -> Result<Config> {
     let contents = std::fs::read_to_string(path)?;
     let config: Config = serde_yaml::from_str(&contents)?;
     Ok(config)
+}
+
+fn merge_config(base: &mut Config, overlay: Config) {
+    // Merge semantics: overlay wins when it sets something meaningful.
+    // Keep it intentionally simple and safe:
+    // - always append upstreams
+    // - paths/sandbox/policy: overlay replaces the corresponding section if it differs from default
+    // - server: overlay replaces bind/transport/log_level if not default values
+    base.upstreams.extend(overlay.upstreams);
+
+    if overlay.paths.data_dir.is_some()
+        || overlay.paths.config_dir.is_some()
+        || overlay.paths.cache_dir.is_some()
+        || overlay.paths.database_path.is_some()
+        || overlay.paths.skills_root.is_some()
+        || overlay.paths.logs_dir.is_some()
+    {
+        base.paths = overlay.paths;
+    }
+
+    if overlay.sandbox.backend != SandboxBackend::default()
+        || overlay.sandbox.timeout_ms != SandboxConfig::default().timeout_ms
+        || overlay.sandbox.allow_read != SandboxConfig::default().allow_read
+        || overlay.sandbox.allow_write != SandboxConfig::default().allow_write
+        || overlay.sandbox.allow_network != SandboxConfig::default().allow_network
+        || overlay.sandbox.max_memory_bytes != SandboxConfig::default().max_memory_bytes
+        || overlay.sandbox.max_cpu_seconds != SandboxConfig::default().max_cpu_seconds
+    {
+        base.sandbox = overlay.sandbox;
+    }
+
+    // PolicyConfig is external; treat non-default as override by replacing when serialized differs.
+    // This avoids relying on internal field visibility.
+    if serde_json::to_value(&overlay.policy).ok()
+        != serde_json::to_value(PolicyConfig::default()).ok()
+    {
+        base.policy = overlay.policy;
+    }
+
+    // ServerConfig has defaults; only override when values differ from defaults.
+    let d = ServerConfig::default();
+    if overlay.server.bind != d.bind
+        || overlay.server.transport != d.transport
+        || overlay.server.log_level != d.log_level
+    {
+        base.server = overlay.server;
+    }
+
+    base.use_global = overlay.use_global;
 }
 
 /// Resolve paths with precedence: CLI args > env vars > config > system defaults
@@ -308,7 +390,15 @@ async fn init_server(
     search_engine.rebuild();
 
     // Create runtime (after upstream_manager is initialized)
-    let runtime = Arc::new(Runtime::new(registry.clone(), upstream_manager));
+    let mut sandbox_config = config.sandbox.clone();
+    if no_sandbox {
+        sandbox_config.backend = SandboxBackend::None;
+    }
+    let runtime = Arc::new(Runtime::with_sandbox_config(
+        registry.clone(),
+        upstream_manager,
+        sandbox_config,
+    ));
 
     // Create skill store with resolved paths
     let skill_store = Arc::new(SkillStore::new(&paths.skills_root, registry.clone())?);
@@ -347,29 +437,55 @@ fn print_banner() {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
     init_logging(&cli.log_level);
 
-    // Determine config file path
-    let config_path = if let Some(ref config_file) = cli.config {
-        std::path::PathBuf::from(config_file)
-    } else {
-        // Try system config directory first
+    let (project_config_path, sys_config_path) = {
         let sys_paths = SkillsPaths::new()?;
         let sys_config = sys_paths.default_config_file();
 
-        // Fall back to ./config.yaml if system config doesn't exist
-        if sys_config.exists() {
-            sys_config
+        let project = if cli.global || cli.config.is_some() {
+            None
         } else {
-            std::path::PathBuf::from("config.yaml")
-        }
+            let cwd = std::env::current_dir()?;
+
+            let mut cursor: Option<&std::path::Path> = Some(cwd.as_path());
+            let mut found: Option<std::path::PathBuf> = None;
+
+            while let Some(dir) = cursor {
+                let candidate = dir.join(".skills").join("config.yaml");
+                if candidate.exists() {
+                    found = Some(candidate);
+                    break;
+                }
+                cursor = dir.parent();
+            }
+
+            found
+        };
+
+        (project, sys_config)
     };
 
-    // Load configuration
-    let config = load_config(&config_path)?;
+    let mut config = if let Some(ref config_file) = cli.config {
+        load_config(std::path::Path::new(config_file))?
+    } else if cli.global {
+        load_config(&sys_config_path)?
+    } else if let Some(ref p) = project_config_path {
+        load_config(p)?
+    } else {
+        load_config(&sys_config_path)?
+    };
 
-    // Resolve all paths with proper precedence
+    if !cli.global
+        && cli.config.is_none()
+        && project_config_path.is_some()
+        && config.use_global.enabled
+    {
+        let mut base = load_config(&sys_config_path)?;
+        merge_config(&mut base, config);
+        config = base;
+    }
+
     let mut paths = resolve_paths(&cli, &config)?;
 
     // Handle --current-dir flag
@@ -381,10 +497,55 @@ async fn main() -> Result<()> {
         paths.database_path = cwd.join("skills.db");
     }
 
-    // Determine if sandboxing should be disabled
     let no_sandbox = cli.no_sandbox || cli.current_dir;
 
     match cli.command {
+        Commands::Init { force } => {
+            let cwd = std::env::current_dir()?;
+            let skills_dir = cwd.join(".skills");
+            let skills_root = skills_dir.join("skills");
+            let db_path = skills_dir.join("skills.db");
+            let config_file = skills_dir.join("config.yaml");
+
+            if config_file.exists() && !force {
+                eprintln!(
+                    "Refusing to overwrite existing config: {}\nRe-run with --force to overwrite.",
+                    config_file.display()
+                );
+                return Ok(());
+            }
+
+            std::fs::create_dir_all(&skills_root)?;
+
+            let yaml = r#"paths:
+  data_dir: ".skills"
+  skills_root: ".skills/skills"
+  database_path: ".skills/skills.db"
+
+sandbox:
+  backend: timeout
+  timeout_ms: 30000
+  allow_read: []
+  allow_write: []
+  allow_network: false
+  max_memory_bytes: 536870912
+  max_cpu_seconds: 30
+
+use_global:
+  enabled: false
+"#;
+
+            std::fs::write(&config_file, yaml)?;
+
+            eprintln!("Initialized project-local skills.rs configuration:");
+            eprintln!("  Config:      {}", config_file.display());
+            eprintln!("  Skills root: {}", skills_root.display());
+            eprintln!("  Database:    {}", db_path.display());
+            eprintln!("\nNext:");
+            eprintln!("  - Run `skills list` to verify discovery");
+            eprintln!("  - Edit `.skills/config.yaml` to add upstream MCP servers");
+        }
+
         Commands::Server { mode } => {
             let mode = mode.unwrap_or(ServerMode::Stdio);
             match mode {
