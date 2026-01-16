@@ -3325,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3355,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3373,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3433,7 +3433,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-registry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-skillstore"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "skillsrs-upstream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
