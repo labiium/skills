@@ -31,7 +31,7 @@ skillsrs-policy = { version = "0.1.0", path = "crates/skillsrs-policy" }
 skillsrs-mcp = { version = "0.1.0", path = "crates/skillsrs-mcp" }
 
 # MCP SDK (official Rust implementation)
-rmcp = { version = "0.12.0", features = ["server"] }
+rmcp = { version = "0.13.0", features = ["server"] }
 rmcp-macros = "0.12.0"
 
 # Async runtime
