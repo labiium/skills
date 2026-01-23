@@ -20,7 +20,7 @@ use skillsrs_runtime::{sandbox::SandboxBackend, sandbox::SandboxConfig, Runtime}
 use skillsrs_skillstore::SkillStore;
 use skillsrs_upstream::UpstreamManager;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -154,6 +154,39 @@ enum Commands {
     /// Validate configuration and skills
     Validate,
 
+    /// Add a skill from a GitHub repository (Vercel skills.sh compatible)
+    ///
+    /// Usage:
+    ///   skills add <owner/repo>              # Add all skills from repo
+    ///   skills add <url> --skill <name>      # Add specific skill
+    ///   skills add <owner/repo> --skill <name> --skill <name2>  # Add multiple
+    ///
+    /// Examples:
+    ///   skills add vercel-labs/agent-skills
+    ///   skills add https://github.com/wshobson/agents --skill monorepo-management
+    Add {
+        /// Repository URL or GitHub shorthand (owner/repo)
+        repo: String,
+
+        /// Specific skill name(s) to import (if omitted, imports all)
+        #[arg(short, long)]
+        skill: Vec<String>,
+
+        /// Git ref (branch, tag, or commit) - defaults to main/master
+        #[arg(long)]
+        git_ref: Option<String>,
+
+        /// Force overwrite existing skills
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Sync Agent Skills from config.yaml repositories
+    ///
+    /// Synchronizes all Agent Skills declared in config.yaml agent_skills_repos.
+    /// Adds new skills, updates changed ones, and removes skills from deleted repos.
+    Sync,
+
     /// Show system paths and configuration
     Paths,
 
@@ -203,6 +236,10 @@ struct Config {
 
     #[serde(default)]
     use_global: UseGlobalSettings,
+
+    /// Agent Skills repositories to auto-sync
+    #[serde(default)]
+    agent_skills_repos: Vec<skillsrs_skillstore::sync::AgentSkillsRepoConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -399,6 +436,43 @@ async fn init_server(
         upstream_manager,
         sandbox_config,
     ));
+
+    // Sync Agent Skills from config before loading
+    if !config.agent_skills_repos.is_empty() {
+        info!(
+            "Syncing {} Agent Skills repositories from config",
+            config.agent_skills_repos.len()
+        );
+        match skillsrs_skillstore::sync::AgentSkillsSync::new(&paths.skills_root).await {
+            Ok(mut sync) => match sync.sync_all(&config.agent_skills_repos).await {
+                Ok(report) => {
+                    if !report.is_empty() {
+                        info!("Agent Skills sync complete:");
+                        if !report.added.is_empty() {
+                            info!("  Added: {}", report.added.join(", "));
+                        }
+                        if !report.updated.is_empty() {
+                            info!("  Updated: {}", report.updated.join(", "));
+                        }
+                        if !report.removed.is_empty() {
+                            info!("  Removed: {}", report.removed.join(", "));
+                        }
+                        if !report.errors.is_empty() {
+                            warn!("  Errors: {}", report.errors.join(", "));
+                        }
+                    } else {
+                        info!("All Agent Skills up-to-date");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to sync Agent Skills: {}", e);
+                }
+            },
+            Err(e) => {
+                error!("Failed to initialize Agent Skills sync: {}", e);
+            }
+        }
+    }
 
     // Create skill store with resolved paths
     let skill_store = Arc::new(SkillStore::new(&paths.skills_root, registry.clone())?);
@@ -1034,6 +1108,272 @@ use_global:
             eprintln!("  Database: {}", paths.database_path.display());
 
             eprintln!("\n✓ Configuration is valid");
+        }
+
+        Commands::Add {
+            repo,
+            skill,
+            git_ref,
+            force,
+        } => {
+            use skillsrs_skillstore::agent_skills::AgentSkill;
+            use std::path::PathBuf;
+
+            info!("Adding skill(s) from repository: {}", repo);
+            eprintln!("🔍 Fetching skills from: {}", repo);
+
+            // Parse repo URL
+            let repo_url = if repo.starts_with("http://") || repo.starts_with("https://") {
+                repo.clone()
+            } else if repo.contains('/') && !repo.contains(':') {
+                // GitHub shorthand: owner/repo
+                format!("https://github.com/{}", repo)
+            } else {
+                eprintln!("❌ Invalid repository format. Use 'owner/repo' or full URL");
+                return Ok(());
+            };
+
+            // Clone to temp directory
+            let temp_dir = tempfile::tempdir()?;
+            let clone_path = temp_dir.path();
+
+            eprintln!("📦 Cloning repository...");
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("clone");
+            if let Some(ref git_ref_val) = git_ref {
+                cmd.arg("--branch").arg(git_ref_val);
+            }
+            cmd.arg("--depth").arg("1");
+            cmd.arg(&repo_url);
+            cmd.arg(clone_path);
+
+            let output = cmd.output()?;
+            if !output.status.success() {
+                eprintln!(
+                    "❌ Failed to clone repository:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return Ok(());
+            }
+
+            eprintln!("✓ Repository cloned successfully");
+
+            // Discover all SKILL.md files (Agent Skills format)
+            eprintln!("🔍 Discovering Agent Skills...");
+            let mut discovered_skills = Vec::new();
+
+            fn find_skill_md(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if path.join("SKILL.md").exists() {
+                                found.push(path);
+                            } else {
+                                // Recurse into subdirectories
+                                find_skill_md(&path, found);
+                            }
+                        }
+                    }
+                }
+            }
+
+            find_skill_md(clone_path, &mut discovered_skills);
+
+            if discovered_skills.is_empty() {
+                eprintln!("❌ No Agent Skills found in repository");
+                return Ok(());
+            }
+
+            eprintln!("✓ Found {} Agent Skill(s)", discovered_skills.len());
+
+            // Filter by requested skills if specified
+            let skills_to_import: Vec<PathBuf> = if skill.is_empty() {
+                discovered_skills
+            } else {
+                discovered_skills
+                    .into_iter()
+                    .filter(|path| {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            skill.contains(&name.to_string())
+                        } else {
+                            false
+                        }
+                    })
+                    .collect()
+            };
+
+            if skills_to_import.is_empty() {
+                eprintln!("❌ None of the requested skills found in repository");
+                return Ok(());
+            }
+
+            eprintln!("\n📥 Importing {} skill(s):", skills_to_import.len());
+
+            let mut imported = 0;
+            let mut skipped = 0;
+            let mut errors = 0;
+
+            for skill_path in &skills_to_import {
+                let skill_name = skill_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+
+                eprint!("  • {} ... ", skill_name);
+
+                // Parse the Agent Skill
+                match AgentSkill::from_directory(skill_path).await {
+                    Ok(agent_skill) => {
+                        // Check if skill already exists
+                        let dest_path = paths.skills_root.join(skill_name);
+                        if dest_path.exists() && !force {
+                            eprintln!("⚠️  skipped (already exists, use --force to overwrite)");
+                            skipped += 1;
+                            continue;
+                        }
+
+                        // Create destination directory
+                        std::fs::create_dir_all(&dest_path)?;
+
+                        // Copy all files from source to destination
+                        fn copy_dir_all(
+                            src: &std::path::Path,
+                            dst: &std::path::Path,
+                        ) -> std::io::Result<()> {
+                            std::fs::create_dir_all(dst)?;
+                            for entry in std::fs::read_dir(src)? {
+                                let entry = entry?;
+                                let path = entry.path();
+                                let dest_path = dst.join(entry.file_name());
+                                if path.is_dir() {
+                                    copy_dir_all(&path, &dest_path)?;
+                                } else {
+                                    std::fs::copy(&path, &dest_path)?;
+                                }
+                            }
+                            Ok(())
+                        }
+
+                        if let Err(e) = copy_dir_all(skill_path, &dest_path) {
+                            eprintln!("❌ failed ({})", e);
+                            errors += 1;
+                            continue;
+                        }
+
+                        eprintln!("✓ imported (v{})", agent_skill.version());
+                        imported += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ failed ({})", e);
+                        errors += 1;
+                    }
+                }
+            }
+
+            eprintln!("\n📊 Summary:");
+            eprintln!("  ✓ Imported: {}", imported);
+            if skipped > 0 {
+                eprintln!("  ⚠️  Skipped:  {}", skipped);
+            }
+            if errors > 0 {
+                eprintln!("  ❌ Errors:   {}", errors);
+            }
+
+            if imported > 0 {
+                eprintln!("\n✅ Skills imported successfully!");
+                eprintln!("   Run `skills list` to see all available skills");
+            }
+        }
+
+        Commands::Sync => {
+            use skillsrs_skillstore::sync::AgentSkillsSync;
+
+            info!("Syncing Agent Skills from config.yaml");
+            eprintln!("🔄 Syncing Agent Skills from configuration...\n");
+
+            if config.agent_skills_repos.is_empty() {
+                eprintln!("❌ No agent_skills_repos defined in config.yaml");
+                eprintln!("\nAdd repositories to your config.yaml:");
+                eprintln!(
+                    r#"
+agent_skills_repos:
+  - repo: vercel-labs/agent-skills
+    skills:
+      - web-design-guidelines
+  - repo: wshobson/agents
+    skills:
+      - monorepo-management
+"#
+                );
+                return Ok(());
+            }
+
+            eprintln!(
+                "📦 Configured repositories: {}",
+                config.agent_skills_repos.len()
+            );
+            for repo_config in &config.agent_skills_repos {
+                eprintln!("  • {}", repo_config.repo);
+                if let Some(ref skills) = repo_config.skills {
+                    eprintln!("    Skills: {}", skills.join(", "));
+                }
+            }
+            eprintln!();
+
+            match AgentSkillsSync::new(&paths.skills_root).await {
+                Ok(mut sync) => match sync.sync_all(&config.agent_skills_repos).await {
+                    Ok(report) => {
+                        if report.is_empty() {
+                            eprintln!("✅ All Agent Skills are up-to-date!");
+                        } else {
+                            eprintln!("📊 Sync Results:\n");
+
+                            if !report.added.is_empty() {
+                                eprintln!("  ✅ Added ({}):", report.added.len());
+                                for skill in &report.added {
+                                    eprintln!("     • {}", skill);
+                                }
+                            }
+
+                            if !report.updated.is_empty() {
+                                eprintln!("  🔄 Updated ({}):", report.updated.len());
+                                for skill in &report.updated {
+                                    eprintln!("     • {}", skill);
+                                }
+                            }
+
+                            if !report.removed.is_empty() {
+                                eprintln!("  🗑️  Removed ({}):", report.removed.len());
+                                for skill in &report.removed {
+                                    eprintln!("     • {}", skill);
+                                }
+                            }
+
+                            if !report.errors.is_empty() {
+                                eprintln!("  ❌ Errors ({}):", report.errors.len());
+                                for error in &report.errors {
+                                    eprintln!("     • {}", error);
+                                }
+                            }
+
+                            eprintln!(
+                                "\n✅ Sync complete! {} total changes",
+                                report.total_changes()
+                            );
+                            eprintln!("   Run `skills list` to see all available skills");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Sync failed: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("❌ Failed to initialize sync: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Paths => {

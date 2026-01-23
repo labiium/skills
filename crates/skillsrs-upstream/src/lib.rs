@@ -48,6 +48,12 @@ pub enum Transport {
     Http,
     #[serde(rename = "http+sse")]
     HttpSse,
+    /// Agent Skills from a Git repository
+    #[serde(rename = "agent_skills_repo")]
+    AgentSkillsRepo,
+    /// Agent Skills from local filesystem
+    #[serde(rename = "agent_skills_fs")]
+    AgentSkillsFs,
 }
 
 /// Upstream server configuration
@@ -62,6 +68,18 @@ pub struct UpstreamConfig {
     // For HTTP
     pub url: Option<String>,
     pub auth: Option<AuthConfig>,
+
+    // For Agent Skills Repo
+    /// Git repository URL (e.g., "https://github.com/owner/repo" or "owner/repo")
+    pub repo: Option<String>,
+    /// Git ref (branch, tag, or commit SHA)
+    pub git_ref: Option<String>,
+    /// Specific skill names to import (if omitted, imports all)
+    pub skills: Option<Vec<String>>,
+
+    // For Agent Skills FS
+    /// Local filesystem roots to scan for Agent Skills
+    pub roots: Option<Vec<String>>,
 
     pub tags: Vec<String>,
 }
@@ -182,6 +200,16 @@ impl UpstreamManager {
             Transport::Stdio => self.connect_stdio(&config).await?,
             Transport::Http => self.connect_http(&config).await?,
             Transport::HttpSse => self.connect_http_sse(&config).await?,
+            Transport::AgentSkillsRepo => {
+                // Agent Skills Repo: skills are added via CLI 'skills add' command
+                // This transport type is for configuration only, no connection needed
+                info!("Agent Skills Repo transport - use 'skills add' to import skills");
+            }
+            Transport::AgentSkillsFs => {
+                // Agent Skills FS: skills are indexed from filesystem
+                // No connection needed, skills are loaded directly by SkillStore
+                info!("Agent Skills FS transport - skills loaded from filesystem");
+            }
         }
 
         // Fetch tools
@@ -458,6 +486,12 @@ impl UpstreamManager {
         let tools = match config.transport {
             Transport::Stdio => self.list_tools_stdio(alias).await?,
             Transport::Http | Transport::HttpSse => self.list_tools_http(alias).await?,
+            Transport::AgentSkillsRepo | Transport::AgentSkillsFs => {
+                // Agent Skills don't provide MCP tools, they provide skills
+                // Skills are discovered by SkillStore directly
+                debug!("Agent Skills transport - no MCP tools to refresh");
+                Vec::new()
+            }
         };
 
         // Remove old tools for this server
@@ -711,6 +745,11 @@ impl UpstreamManager {
                 self.call_tool_http(server_alias, tool_name, arguments)
                     .await
             }
+            Transport::AgentSkillsRepo | Transport::AgentSkillsFs => {
+                Err(UpstreamError::RequestFailed(
+                    "Agent Skills transport does not support tool calls".to_string(),
+                ))
+            }
         }
     }
 
@@ -909,6 +948,10 @@ mod tests {
             command: Some(vec!["echo".to_string(), "test".to_string()]),
             url: None,
             auth: None,
+            repo: None,
+            git_ref: None,
+            skills: None,
+            roots: None,
             tags: vec!["test".to_string()],
         };
 
@@ -932,6 +975,10 @@ mod tests {
             command: None,
             url: Some("http://example.com".to_string()),
             auth: None,
+            repo: None,
+            git_ref: None,
+            skills: None,
+            roots: None,
             tags: vec![],
         };
 

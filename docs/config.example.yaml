@@ -150,3 +150,27 @@ upstreams:
       - "instruments"
       - "vna"
       - "trusted"
+
+# Agent Skills repositories (Vercel skills.sh compatible)
+# Auto-syncs skills from GitHub repositories in Agent Skills format
+agent_skills_repos:
+  # Example: Import specific skills from Vercel's repository
+  - repo: "vercel-labs/agent-skills"
+    skills:
+      - "web-design-guidelines"
+      - "vercel-react-best-practices"
+    # Optional: specify git ref (branch, tag, or commit)
+    # git_ref: "main"
+
+  # Example: Import all skills from a repository
+  - repo: "wshobson/agents"
+    # If 'skills' is omitted, imports all Agent Skills found
+
+  # Example: Full GitHub URL with specific skill
+  - repo: "https://github.com/owner/repo"
+    skills:
+      - "monorepo-management"
+    git_ref: "v1.0.0"
+
+# Note: Skills are auto-synced on server startup and can be manually synced with:
+#   skills sync

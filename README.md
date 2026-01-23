@@ -19,6 +19,7 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
 - 🔍 **Unified Discovery** - Search across all tools and skills from one interface
 - 📦 **Progressive Disclosure** - Load skill content on-demand to save tokens (99% token reduction)
 - 🤖 **AI Agent CLI** - Drop-in replacement for mcp-cli with enhanced features
+- 🌐 **Agent Skills Compatible** - Import skills from Vercel skills.sh ecosystem (`skills add owner/repo`)
 - 🛡️ **Sandboxed Execution** - Safe execution of bundled scripts with resource limits
 - 💾 **Persistence** - SQLite-based storage for registry and execution history
 - ✅ **Validation** - Comprehensive skill validation and dependency checking
@@ -397,6 +398,213 @@ Research topics using web search and save findings.
 ## Expected Output
 A markdown file with research summary.
 ```
+
+---
+
+## 🌐 Agent Skills (Vercel skills.sh Compatible)
+
+skills.rs is **fully compatible** with the [Agent Skills format](https://agentskills.io/specification) pioneered by Vercel. You can import and use skills from the growing ecosystem of Agent Skills repositories.
+
+### What is Agent Skills?
+
+Agent Skills is an open standard for packaging AI agent instructions and tools. A skill is a directory containing:
+- **SKILL.md** with YAML frontmatter (required)
+- **scripts/** for bundled executables (optional)
+- **references/** for supporting documents (optional)
+- **assets/** for additional files (optional)
+
+### Quick Start: Import Skills
+
+Import skills directly from GitHub repositories:
+
+```bash
+# Import all skills from a repository
+skills add vercel-labs/agent-skills
+
+# Import specific skill(s)
+skills add wshobson/agents --skill monorepo-management
+
+# Import from full GitHub URL
+skills add https://github.com/owner/repo --skill skill-name
+
+# Import multiple skills
+skills add vercel-labs/agent-skills --skill web-design-guidelines --skill vercel-react-best-practices
+
+# Specify git ref (branch, tag, or commit)
+skills add owner/repo --skill my-skill --git-ref v1.0.0
+
+# Force overwrite existing skills
+skills add owner/repo --force
+```
+
+### Auto-Sync from Configuration
+
+Add Agent Skills repositories to your `config.yaml` for automatic synchronization:
+
+```yaml
+agent_skills_repos:
+  # Import specific skills from Vercel's repository
+  - repo: "vercel-labs/agent-skills"
+    skills:
+      - "web-design-guidelines"
+      - "vercel-react-best-practices"
+    # Optional: specify git ref
+    # git_ref: "main"
+
+  # Import all skills from a repository
+  - repo: "wshobson/agents"
+    # Omit 'skills' to import all
+
+  # Full GitHub URL with version pinning
+  - repo: "https://github.com/owner/repo"
+    skills:
+      - "monorepo-management"
+    git_ref: "v1.0.0"
+```
+
+Skills are automatically synced on server startup and can be manually synced with:
+
+```bash
+skills sync
+```
+
+**Sync behavior**:
+- ✅ **Adds** new skills from configured repositories
+- 🔄 **Updates** existing skills when commit SHA changes
+- 🗑️ **Removes** skills from repositories deleted from config
+- 🔍 **Validates** all skills against Agent Skills specification
+
+### Agent Skills Format Example
+
+Here's a minimal Agent Skill (`SKILL.md`):
+
+```markdown
+---
+name: pdf-processing
+description: Extract text and tables from PDF files using Python tools
+license: MIT
+compatibility: Works best with Claude and GPT-4
+metadata:
+  author: your-name
+  version: "1.0.0"
+allowed-tools: Bash(python3) Read Write
+---
+
+# PDF Processing
+
+Extract and process content from PDF files.
+
+## Purpose
+This skill helps you extract text, tables, and metadata from PDF documents.
+
+## Steps
+1. Use the `extract.py` script to process the PDF
+2. Parse the extracted text
+3. Save results to a structured format
+
+## Tools Used
+- `python3` - Run the extraction script
+- File system tools for reading/writing
+
+## Expected Output
+JSON file containing extracted text and tables.
+```
+
+With optional `scripts/extract.py`:
+
+```python
+#!/usr/bin/env python3
+import sys
+import json
+
+# PDF extraction logic here
+```
+
+### Compatibility Matrix
+
+skills.rs supports all Agent Skills features:
+
+| Feature | Supported | Notes |
+|---------|-----------|-------|
+| YAML frontmatter | ✅ | Full spec compliance |
+| Name validation | ✅ | Lowercase, hyphens, 1-64 chars |
+| Field constraints | ✅ | Description ≤1024, compatibility ≤500 |
+| scripts/ | ✅ | Python, Bash, Node.js |
+| references/ | ✅ | Progressive disclosure |
+| assets/ | ✅ | Progressive disclosure |
+| allowed-tools | ✅ | Maps to tool_policy.allow |
+| Recursive discovery | ✅ | Finds skills in nested directories |
+| Mixed formats | ✅ | Agent Skills + skills.rs formats coexist |
+
+### Format Detection
+
+skills.rs automatically detects skill format:
+
+- **Has `SKILL.md` only**: Agent Skills format
+- **Has `skill.json` + `SKILL.md`**: Traditional skills.rs format
+- **Has both**: Traditional format takes precedence
+
+Skills are seamlessly converted to the unified internal format and available through all 7 MCP tools.
+
+### Progressive Disclosure
+
+Agent Skills leverage progressive disclosure to minimize token usage:
+
+**Level 1** (always loaded): Name, description, metadata  
+**Level 2** (on-demand): SKILL.md content  
+**Level 3** (on-demand): references/, assets/ files  
+**Level 4** (execution): scripts/ bundled tools
+
+Use `skills.get_content` to load additional content:
+
+```json
+{
+  "skill_id": "pdf-processing",
+  "filename": "references/guide.md"  // optional
+}
+```
+
+### Differences from skills.sh
+
+While fully compatible, skills.rs adds enterprise features:
+
+| Feature | skills.sh | skills.rs |
+|---------|-----------|-----------|
+| Skill import | ✅ | ✅ |
+| GitHub shorthand | ✅ | ✅ |
+| Config-based sync | ❌ | ✅ |
+| Auto cleanup | ❌ | ✅ |
+| MCP server mode | ❌ | ✅ |
+| Sandboxing | ❌ | ✅ |
+| SQLite persistence | ❌ | ✅ |
+| Tool validation | ❌ | ✅ |
+| Risk assessment | ❌ | ✅ |
+
+### CLI Commands
+
+```bash
+# Import skills
+skills add <owner/repo> [--skill <name>] [--git-ref <ref>] [--force]
+
+# Sync from config
+skills sync
+
+# List all skills (including Agent Skills)
+skills list
+
+# Search for skills
+skills grep "*pdf*"
+
+# Get skill schema
+skills tool local/pdf-processing
+
+# Show system paths
+skills paths
+```
+
+### Telemetry
+
+Unlike Vercel's `skills.sh`, skills.rs does **not** send telemetry data. All skill operations are local and private.
 
 ---
 

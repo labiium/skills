@@ -22,7 +22,7 @@ notify = { workspace = true }
 glob = { workspace = true }
 chrono = { workspace = true }
 semver = "1.0"
+tempfile = "3.24"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-tempfile = "3.24"

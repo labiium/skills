@@ -6,7 +6,14 @@
 //! - SKILL.md (documentation)
 //! - workflow.yaml (optional entrypoint)
 //!
+//! Also supports Agent Skills format (Vercel skills.sh compatible):
+//! - SKILL.md with YAML frontmatter
+//! - Optional scripts/, references/, assets/ directories
+//!
 //! Supports filesystem watching for hot-reload during development.
+
+pub mod agent_skills;
+pub mod sync;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -48,6 +55,9 @@ pub enum SkillStoreError {
 
     #[error("Missing dependency: {0}")]
     MissingDependency(String),
+
+    #[error("Agent Skills error: {0}")]
+    AgentSkills(#[from] agent_skills::AgentSkillsError),
 }
 
 pub type Result<T> = std::result::Result<T, SkillStoreError>;
@@ -424,9 +434,18 @@ impl SkillStore {
     /// Load a single skill from a directory
     pub async fn load_skill(&self, path: &Path) -> Result<Skill> {
         let manifest_path = path.join("skill.json");
+        let skill_md_path = path.join("SKILL.md");
+
+        // Check if this is an Agent Skills format (has SKILL.md but no skill.json)
+        if !manifest_path.exists() && skill_md_path.exists() {
+            debug!("Detected Agent Skills format at {:?}", path);
+            return self.load_agent_skill(path).await;
+        }
+
+        // Standard skills.rs format
         if !manifest_path.exists() {
             return Err(SkillStoreError::InvalidManifest(
-                "skill.json not found".to_string(),
+                "Neither skill.json nor Agent Skills SKILL.md found".to_string(),
             ));
         }
 
@@ -441,6 +460,24 @@ impl SkillStore {
         } else {
             None
         };
+
+        Ok(Skill {
+            manifest,
+            path: path.to_path_buf(),
+            documentation,
+        })
+    }
+
+    /// Load a skill in Agent Skills format (Vercel skills.sh compatible)
+    async fn load_agent_skill(&self, path: &Path) -> Result<Skill> {
+        let agent_skill = agent_skills::AgentSkill::from_directory(path).await?;
+        let manifest = agent_skill.to_skill_manifest();
+        let documentation = Some(agent_skill.content.clone());
+
+        info!(
+            "Loaded Agent Skill: {} v{} from {:?}",
+            manifest.id, manifest.version, path
+        );
 
         Ok(Skill {
             manifest,
