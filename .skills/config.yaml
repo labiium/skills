@@ -1,0 +1,16 @@
+paths:
+  data_dir: ".skills"
+  skills_root: ".skills/skills"
+  database_path: ".skills/skills.db"
+
+sandbox:
+  backend: timeout
+  timeout_ms: 30000
+  allow_read: []
+  allow_write: []
+  allow_network: false
+  max_memory_bytes: 536870912
+  max_cpu_seconds: 30
+
+use_global:
+  enabled: false

@@ -92,9 +92,24 @@ fn default_limit() -> usize {
     10
 }
 
+/// Custom schema for JsonValue fields - accepts any JSON value
+fn json_value_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({})).unwrap()
+}
+
+/// Custom schema for Vec<JsonValue> fields - array of any JSON values
+fn json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "type": "array",
+        "items": {}
+    }))
+    .unwrap()
+}
+
 /// Output schema for skills.search
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchOutput {
+    #[schemars(schema_with = "json_value_vec_schema")]
     pub matches: Vec<JsonValue>,
     pub next_cursor: Option<String>,
     pub stats: SearchStats,
@@ -151,10 +166,13 @@ pub struct SchemaOutput {
     pub callable: CallableInfo,
     pub schema_digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "json_value_schema")]
     pub input_schema: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "json_value_schema")]
     pub output_schema: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "json_value_schema")]
     pub signature: Option<JsonValue>,
 }
 
@@ -175,6 +193,7 @@ pub struct ExecInput {
     pub id: String,
 
     /// Arguments to pass to the callable
+    #[schemars(schema_with = "json_value_schema")]
     pub arguments: JsonValue,
 
     /// Validate without executing
@@ -215,12 +234,15 @@ pub struct TraceArgs {
 /// Output schema for skills.exec
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecOutput {
+    #[schemars(schema_with = "json_value_schema")]
     pub result: JsonValue,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "json_value_schema")]
     pub timing: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "json_value_vec_schema")]
     pub steps: Option<Vec<JsonValue>>,
 }
 

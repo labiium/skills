@@ -164,12 +164,14 @@ skills paths
 
 **Stdio mode (for MCP clients):**
 ```bash
-skills stdio
+skills server stdio
+# or simply
+skills server  # stdio is the default mode
 ```
 
 **HTTP mode (for testing):**
 ```bash
-skills http --bind 127.0.0.1:8000
+skills server http --bind 127.0.0.1:8000
 ```
 
 ---
