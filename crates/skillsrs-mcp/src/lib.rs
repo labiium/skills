@@ -55,6 +55,7 @@ pub struct SearchInput {
     /// Maximum results to return
     #[serde(default = "default_limit")]
     #[schemars(description = "Maximum results to return (1-50)")]
+    #[schemars(schema_with = "non_negative_int_schema")]
     pub limit: usize,
 
     /// Filters for search results
@@ -106,6 +107,14 @@ fn json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Sche
     .unwrap()
 }
 
+fn non_negative_int_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "type": "integer",
+        "minimum": 0
+    }))
+    .unwrap()
+}
+
 /// Schema for bundled_files: array of [filename, content] tuples (or null).
 fn bundled_files_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     serde_json::from_value(serde_json::json!({
@@ -136,9 +145,13 @@ pub struct SearchOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchStats {
+    #[schemars(schema_with = "non_negative_int_schema")]
     pub total_callables: usize,
+    #[schemars(schema_with = "non_negative_int_schema")]
     pub total_tools: usize,
+    #[schemars(schema_with = "non_negative_int_schema")]
     pub total_skills: usize,
+    #[schemars(schema_with = "non_negative_int_schema")]
     pub searched_servers: usize,
     pub stale_servers: Vec<String>,
 }
@@ -160,6 +173,7 @@ pub struct SchemaInput {
 
     /// Maximum response size in bytes
     #[serde(default = "default_max_bytes")]
+    #[schemars(schema_with = "non_negative_int_schema")]
     pub max_bytes: usize,
 
     /// JSON Pointer to schema subtree
