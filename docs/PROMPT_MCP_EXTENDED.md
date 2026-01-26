@@ -6,27 +6,27 @@ You have access to skills.rs, a unified MCP server exposing 7 tools. Beyond exec
 
 | Tool | Purpose |
 |------|---------|
-| `skills.search` | Find tools/skills by query |
-| `skills.schema` | Get full schema for a callable |
-| `skills.exec` | Execute a tool or skill |
-| `skills.get_content` | Load skill SKILL.md and files |
-| `skills.create` | Create a new skill |
-| `skills.update` | Update an existing skill |
-| `skills.delete` | Delete a skill |
+| `search` | Find tools/skills by query |
+| `schema` | Get full schema for a callable |
+| `exec` | Execute a tool or skill |
+| `get_content` | Load skill SKILL.md and files |
+| `create` | Create a new skill |
+| `update` | Update an existing skill |
+| `delete` | Delete a skill |
 
 ---
 
 ## Standard Tool Workflow
 
-1. **Search** → `skills.search({"q": "..."})`
-2. **Schema** → `skills.schema({"id": "<id-from-search>"})` (always before exec!)
-3. **Execute** → `skills.exec({"id": "<id>", "arguments": {...}})`
+1. **Search** → `search({"q": "..."})`
+2. **Schema** → `schema({"id": "<id-from-search>"})` (always before exec!)
+3. **Execute** → `exec({"id": "<id>", "arguments": {...}})`
 
 ---
 
 ## Tool Reference
 
-### skills.search
+### search
 
 Find tools and skills by query.
 
@@ -75,7 +75,7 @@ Find tools and skills by query.
 }
 ```
 
-### skills.schema
+### schema
 
 Get full schema for a callable. **Always call before exec.**
 
@@ -121,7 +121,7 @@ Get full schema for a callable. **Always call before exec.**
 }
 ```
 
-### skills.exec
+### exec
 
 Execute a callable with validation and policy enforcement.
 
@@ -153,7 +153,7 @@ Execute a callable with validation and policy enforcement.
 | `trace.include_route` | bool | `false` | Include execution route |
 | `trace.include_timing` | bool | `false` | Include timing info |
 
-### skills.get_content
+### get_content
 
 Load skill instructions (SKILL.md) for progressive disclosure.
 
@@ -184,7 +184,7 @@ Load skill instructions (SKILL.md) for progressive disclosure.
 - Additional files: config.json
 ```
 
-### skills.create
+### create
 
 Create a new skill with SKILL.md and optional bundled files.
 
@@ -222,7 +222,7 @@ Create a new skill with SKILL.md and optional bundled files.
 }
 ```
 
-### skills.update
+### update
 
 Update an existing skill.
 
@@ -250,7 +250,7 @@ Update an existing skill.
 | `bundled_files` | array | null | New bundled files (null = keep existing) |
 | `tags` | array | `[]` | New tags |
 
-### skills.delete
+### delete
 
 Delete a skill from the store.
 
@@ -333,7 +333,7 @@ When you finish a multi-step task successfully:
 I've completed [task]. This workflow could be useful again.
 Let me save it as a skill.
 
-skills.create({
+create({
   "name": "task-name",
   "description": "...",
   "skill_md": "...",
@@ -350,7 +350,7 @@ User: "Remember how to do X"
 
 I'll create a skill to capture this workflow.
 
-skills.create({...})
+create({...})
 
 Done. Skill "x-workflow" saved. I can execute it anytime you need.
 ```
@@ -363,7 +363,7 @@ When solving a problem that has reusable patterns:
 This approach for [problem] is generalizable.
 Creating skill "solve-problem-type" for future use.
 
-skills.create({...})
+create({...})
 ```
 
 ---
@@ -374,12 +374,12 @@ skills.create({...})
 
 1. **Search for existing skills:**
    ```json
-   skills.search({"q": "deploy", "kind": "skills"})
+   search({"q": "deploy", "kind": "skills"})
    ```
 
 2. **If skill exists, load instructions:**
    ```json
-   skills.get_content({"skill_id": "deploy-to-staging"})
+   get_content({"skill_id": "deploy-to-staging"})
    ```
 
 3. **Follow the SKILL.md steps** using the tools specified
@@ -389,16 +389,16 @@ skills.create({...})
 ### Skill Execution Flow
 
 ```
-1. skills.search({"q": "task keyword", "kind": "skills"})
+1. search({"q": "task keyword", "kind": "skills"})
    → Find relevant skill
 
-2. skills.get_content({"skill_id": "skill-name"})
+2. get_content({"skill_id": "skill-name"})
    → Load SKILL.md instructions
 
 3. Follow steps in SKILL.md:
-   - skills.search for each tool needed
-   - skills.schema for each tool
-   - skills.exec to execute each step
+   - search for each tool needed
+   - schema for each tool
+   - exec to execute each step
 ```
 
 ---
@@ -408,7 +408,7 @@ skills.create({...})
 Improve skills when you find better approaches:
 
 ```json
-skills.update({
+update({
   "skill_id": "deploy-to-staging",
   "name": "deploy-to-staging",
   "version": "1.1.0",
@@ -430,7 +430,7 @@ skills.update({
 For complex automation, include executable scripts:
 
 ```json
-skills.create({
+create({
   "name": "analyze-logs",
   "version": "1.0.0",
   "description": "Parse and analyze application logs",
@@ -471,7 +471,7 @@ Scripts receive input via `SKILL_ARGS_JSON` environment variable.
 
 ### Maintenance
 - Update skills when you find improvements
-- Delete obsolete skills: `skills.delete({"skill_id": "old-skill"})`
+- Delete obsolete skills: `delete({"skill_id": "old-skill"})`
 - Keep skills focused - split large workflows into composable skills
 
 ### Composition
@@ -506,7 +506,7 @@ When creating:
 **Scenario**: You just helped debug a Node.js application.
 
 ```json
-skills.create({
+create({
   "name": "debug-node-app",
   "version": "1.0.0",
   "description": "Debug Node.js application by analyzing logs and tracing errors",
@@ -522,20 +522,20 @@ skills.create({
 
 ```
 # Discovery
-skills.search({"q": "...", "kind": "any|tools|skills"})
+search({"q": "...", "kind": "any|tools|skills"})
 
 # Inspect
-skills.schema({"id": "<id>"})
-skills.get_content({"skill_id": "<name>"})
+schema({"id": "<id>"})
+get_content({"skill_id": "<name>"})
 
 # Execute
-skills.exec({"id": "<id>", "arguments": {...}})
-skills.exec({"id": "<id>", "arguments": {...}, "dry_run": true})
+exec({"id": "<id>", "arguments": {...}})
+exec({"id": "<id>", "arguments": {...}, "dry_run": true})
 
 # Skill Management
-skills.create({"name": "...", "description": "...", "skill_md": "..."})
-skills.update({"skill_id": "...", "name": "...", "version": "...", "skill_md": "..."})
-skills.delete({"skill_id": "..."})
+create({"name": "...", "description": "...", "skill_md": "..."})
+update({"skill_id": "...", "name": "...", "version": "...", "skill_md": "..."})
+delete({"skill_id": "..."})
 ```
 
 ---

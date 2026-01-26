@@ -35,7 +35,7 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
 
 2. **Server Mode** (MCP Protocol)
    - Run as MCP server exposing meta-tools
-   - `skills.search`, `skills.schema`, `skills.exec`
+   - `search`, `schema`, `exec`
    - Aggregate multiple upstream MCP servers
 
 ---
@@ -242,7 +242,7 @@ See [MCP_CLI_REPLACEMENT.md](MCP_CLI_REPLACEMENT.md) for complete migration guid
 
 ### Core Discovery & Execution
 
-#### 1. `skills.search`
+#### 1. `search`
 Fast discovery over unified registry (tools + skills)
 
 ```json
@@ -253,7 +253,7 @@ Fast discovery over unified registry (tools + skills)
 }
 ```
 
-#### 2. `skills.schema`
+#### 2. `schema`
 Fetch full schema and signature for a callable
 
 ```json
@@ -263,7 +263,7 @@ Fetch full schema and signature for a callable
 }
 ```
 
-#### 3. `skills.exec`
+#### 3. `exec`
 Execute a callable with validation and policy enforcement
 
 ```json
@@ -276,7 +276,7 @@ Execute a callable with validation and policy enforcement
 
 ### Skill Management
 
-#### 4. `skills.create`
+#### 4. `create`
 Create a new skill with SKILL.md and bundled scripts
 
 ```json
@@ -290,7 +290,7 @@ Create a new skill with SKILL.md and bundled scripts
 }
 ```
 
-#### 5. `skills.get_content`
+#### 5. `get_content`
 Progressive disclosure: load SKILL.md and files on demand
 
 ```json
@@ -300,7 +300,7 @@ Progressive disclosure: load SKILL.md and files on demand
 }
 ```
 
-#### 6. `skills.update`
+#### 6. `update`
 Update an existing skill
 
 ```json
@@ -312,7 +312,7 @@ Update an existing skill
 }
 ```
 
-#### 7. `skills.delete`
+#### 7. `delete`
 Delete a skill from the store
 
 ```json
@@ -557,7 +557,7 @@ Agent Skills leverage progressive disclosure to minimize token usage:
 **Level 3** (on-demand): references/, assets/ files  
 **Level 4** (execution): scripts/ bundled tools
 
-Use `skills.get_content` to load additional content:
+Use `get_content` to load additional content:
 
 ```json
 {

@@ -6,35 +6,35 @@ You have access to skills.rs, a unified MCP server exposing 7 tools.
 
 | Tool | Purpose |
 |------|---------|
-| `skills.search` | Find tools/skills by query |
-| `skills.schema` | Get full schema (call before exec!) |
-| `skills.exec` | Execute a tool or skill |
-| `skills.get_content` | Load skill SKILL.md |
+| `search` | Find tools/skills by query |
+| `schema` | Get full schema (call before exec!) |
+| `exec` | Execute a tool or skill |
+| `get_content` | Load skill SKILL.md |
 
 ## Workflow
 
-1. **Search** → `skills.search({"q": "..."})`
-2. **Schema** → `skills.schema({"id": "<id-from-search>"})`
-3. **Execute** → `skills.exec({"id": "<id>", "arguments": {...}})`
+1. **Search** → `search({"q": "..."})`
+2. **Schema** → `schema({"id": "<id-from-search>"})`
+3. **Execute** → `exec({"id": "<id>", "arguments": {...}})`
 
 ## Tool Inputs
 
-**skills.search**
+**search**
 ```json
 {"q": "query", "kind": "any|tools|skills", "limit": 10}
 ```
 
-**skills.schema**
+**schema**
 ```json
 {"id": "tool://server/name@digest"}
 ```
 
-**skills.exec**
+**exec**
 ```json
 {"id": "tool://server/name@digest", "arguments": {...}}
 ```
 
-**skills.get_content** (for skills only)
+**get_content** (for skills only)
 ```json
 {"skill_id": "skill-name", "filename": null}
 ```
@@ -43,9 +43,9 @@ You have access to skills.rs, a unified MCP server exposing 7 tools.
 
 | Tool | Purpose |
 |------|---------|
-| `skills.create` | Create skill with SKILL.md |
-| `skills.update` | Update existing skill |
-| `skills.delete` | Delete a skill |
+| `create` | Create skill with SKILL.md |
+| `update` | Update existing skill |
+| `delete` | Delete a skill |
 
 ## Callable ID Format
 
@@ -56,6 +56,6 @@ Always use IDs from search results — never construct manually.
 
 ## Tips
 
-- Always call `skills.schema` before `skills.exec`
-- Use `skills.get_content` for skill instructions
+- Always call `schema` before `exec`
+- Use `get_content` for skill instructions
 - Use `dry_run: true` to validate without executing

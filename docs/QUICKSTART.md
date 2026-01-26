@@ -155,7 +155,7 @@ The server will:
 
 ### Search for your skill
 
-**Tool:** `skills.search`
+**Tool:** `search`
 
 **Input:**
 ```json
@@ -170,7 +170,7 @@ The server will:
 
 ### Get skill content
 
-**Tool:** `skills.get_content`
+**Tool:** `get_content`
 
 **Input:**
 ```json
@@ -183,7 +183,7 @@ The server will:
 
 ### Execute the skill
 
-**Tool:** `skills.exec`
+**Tool:** `exec`
 
 **Input:**
 ```json

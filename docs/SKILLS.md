@@ -34,9 +34,9 @@ skills.rs introduces a radical approach: **expose 7 focused meta-tools instead o
 
 Instead of loading every tool description into context, agents can:
 
-1. **Search** for tools on-demand (`skills.search`)
-2. **Inspect** only the tools they need (`skills.schema`)
-3. **Execute** with validation and sandboxing (`skills.exec`)
+1. **Search** for tools on-demand (`search`)
+2. **Inspect** only the tools they need (`schema`)
+3. **Execute** with validation and sandboxing (`exec`)
 
 This achieves a **99% token reduction** in tool metadata while enabling *unlimited* tool discovery.
 
@@ -63,13 +63,13 @@ skills.rs Approach:
 │ Agent Context (8K tokens)              │
 │ ┌────────────────────────────────────┐ │
 │ │ 7 Meta-tools (350 tokens)          │ │
-│ │   - skills.search                  │ │
-│ │   - skills.schema                  │ │
-│ │   - skills.exec                    │ │
-│ │   - skills.create                  │ │
-│ │   - skills.get_content             │ │
-│ │   - skills.update                  │ │
-│ │   - skills.delete                  │ │
+│ │   - search                  │ │
+│ │   - schema                  │ │
+│ │   - exec                    │ │
+│ │   - create                  │ │
+│ │   - get_content             │ │
+│ │   - update                  │ │
+│ │   - delete                  │ │
 │ └────────────────────────────────────┘ │
 │ Task: "Search for latest AI news"     │
 │ (7,650+ tokens available!)             │
@@ -95,21 +95,21 @@ Your AI agent connects via MCP protocol and uses progressive disclosure:
 ```javascript
 // Step 1: Search for tools (lightweight)
 {
-  "tool": "skills.search",
+  "tool": "search",
   "args": { "q": "search web", "kind": "tool", "limit": 5 }
 }
 // Returns: 5 matching tools with minimal metadata
 
 // Step 2: Get schema for the right tool
 {
-  "tool": "skills.schema",
+  "tool": "schema",
   "args": { "id": "tool://brave_search@1.0" }
 }
 // Returns: Full JSON schema only for this tool
 
 // Step 3: Execute
 {
-  "tool": "skills.exec",
+  "tool": "exec",
   "args": {
     "id": "tool://brave_search@1.0",
     "arguments": {"query": "latest AI news"}

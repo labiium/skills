@@ -627,7 +627,7 @@ use_global:
                     print_banner();
                     info!("Starting skills.rs in stdio mode");
                     eprintln!("Mode: stdio");
-                    eprintln!("Exposing 3 tools: skills.search, skills.schema, skills.exec");
+                    eprintln!("Exposing 3 tools: search, schema, exec");
                     eprintln!("Skills directory: {}", paths.skills_root.display());
                     if no_sandbox {
                         eprintln!("⚠️  Sandboxing: DISABLED");
@@ -647,7 +647,7 @@ use_global:
                     eprintln!("Mode: HTTP");
                     eprintln!("Listening on: http://{}", bind);
                     eprintln!("MCP Endpoint: http://{}/mcp", bind);
-                    eprintln!("Exposing 3 tools: skills.search, skills.schema, skills.exec");
+                    eprintln!("Exposing 3 tools: search, schema, exec");
                     eprintln!("Skills directory: {}", paths.skills_root.display());
                     if no_sandbox {
                         eprintln!("⚠️  Sandboxing: DISABLED");
@@ -683,9 +683,9 @@ use_global:
                                     <p>MCP endpoint available at: <a href="/mcp">/mcp</a></p>
                                     <p>Exposes exactly 3 tools:</p>
                                     <ul>
-                                        <li><code>skills.search</code> - Discovery over registry</li>
-                                        <li><code>skills.schema</code> - On-demand schema fetching</li>
-                                        <li><code>skills.exec</code> - Validated execution</li>
+                                        <li><code>search</code> - Discovery over registry</li>
+                                        <li><code>schema</code> - On-demand schema fetching</li>
+                                        <li><code>exec</code> - Validated execution</li>
                                     </ul>
                                 </body>
                                 </html>

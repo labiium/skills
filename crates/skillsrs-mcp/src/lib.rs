@@ -1,9 +1,9 @@
 //! MCP Server Façade using Official rmcp SDK
 //!
 //! Exposes exactly three MCP tools to the host LLM:
-//! - skills.search: Discovery over unified registry
-//! - skills.schema: On-demand schema fetching
-//! - skills.exec: Validated execution with policy enforcement
+//! - search: Discovery over unified registry
+//! - schema: On-demand schema fetching
+//! - exec: Validated execution with policy enforcement
 //!
 //! This implementation uses the official Rust MCP SDK (rmcp) to ensure
 //! full protocol compliance and leverage battle-tested infrastructure.
@@ -36,7 +36,7 @@ pub struct SkillsServer {
     tool_router: ToolRouter<Self>,
 }
 
-/// Input schema for skills.search
+/// Input schema for search
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchInput {
     /// Search query
@@ -125,7 +125,7 @@ fn bundled_files_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schem
     .unwrap()
 }
 
-/// Output schema for skills.search
+/// Output schema for search
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchOutput {
     #[schemars(schema_with = "json_value_vec_schema")]
@@ -143,7 +143,7 @@ pub struct SearchStats {
     pub stale_servers: Vec<String>,
 }
 
-/// Input schema for skills.schema
+/// Input schema for schema
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaInput {
     /// Callable ID from search results
@@ -179,7 +179,7 @@ fn default_max_bytes() -> usize {
     50000
 }
 
-/// Output schema for skills.schema
+/// Output schema for schema
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaOutput {
     pub callable: CallableInfo,
@@ -205,7 +205,7 @@ pub struct CallableInfo {
     pub version: Option<String>,
 }
 
-/// Input schema for skills.exec
+/// Input schema for exec
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecInput {
     /// Callable ID from search results
@@ -250,7 +250,7 @@ pub struct TraceArgs {
     pub include_steps: bool,
 }
 
-/// Output schema for skills.exec
+/// Output schema for exec
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecOutput {
     #[schemars(schema_with = "json_value_schema")]
@@ -324,14 +324,14 @@ impl SkillsServer {
     /// Fast discovery over registry (tools + skills) with filters.
     /// Use this to find callables before execution.
     #[tool(
-        name = "skills.search",
+        name = "search",
         description = "Fast discovery over registry (tools + skills) with filters. Use this to find callables before execution."
     )]
     async fn search(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<SearchInput>,
     ) -> Result<Json<SearchOutput>, String> {
-        debug!("skills.search called with query: {}", input.0.q);
+        debug!("search called with query: {}", input.0.q);
 
         let query = SearchQuery {
             q: input.0.q,
@@ -366,7 +366,7 @@ impl SkillsServer {
             },
         };
 
-        info!("skills.search returned {} matches", output.matches.len());
+        info!("search returned {} matches", output.matches.len());
 
         Ok(Json(output))
     }
@@ -374,14 +374,14 @@ impl SkillsServer {
     /// Fetch full schema and signature for a callable.
     /// Use this after search to get detailed parameter info.
     #[tool(
-        name = "skills.schema",
+        name = "schema",
         description = "Fetch full schema and signature for a callable. Use this after search to get detailed parameter info."
     )]
     async fn schema(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<SchemaInput>,
     ) -> Result<Json<SchemaOutput>, String> {
-        debug!("skills.schema called for: {}", input.0.id);
+        debug!("schema called for: {}", input.0.id);
 
         let callable_id: CallableId = input.0.id.into();
         let record = self
@@ -441,21 +441,21 @@ impl SkillsServer {
             ));
         }
 
-        info!("skills.schema returned schema for {}", record.fq_name);
+        info!("schema returned schema for {}", record.fq_name);
         Ok(Json(output))
     }
 
     /// Execute a callable with validation and policy enforcement.
     /// Always search and get schema first.
     #[tool(
-        name = "skills.exec",
+        name = "exec",
         description = "Execute a callable with validation and policy enforcement. Always search and get schema first."
     )]
     async fn exec(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<ExecInput>,
     ) -> Result<String, String> {
-        debug!("skills.exec called for: {}", input.0.id);
+        debug!("exec called for: {}", input.0.id);
 
         let callable_id: CallableId = input.0.id.into();
         let dry_run = input.0.dry_run;
@@ -515,7 +515,7 @@ impl SkillsServer {
             .await
             .map_err(|e| format!("Execution failed: {}", e))?;
 
-        info!("skills.exec completed for {}", record.fq_name);
+        info!("exec completed for {}", record.fq_name);
 
         // Convert ToolResult to string representation
         let text = if result.is_error {
@@ -548,14 +548,14 @@ impl SkillsServer {
 
     /// Create a new skill
     #[tool(
-        name = "skills.create",
+        name = "create",
         description = "Create a new skill with SKILL.md content, bundled files, and tool dependencies."
     )]
     async fn create_skill(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<CreateSkillInput>,
     ) -> Result<Json<CreateSkillOutput>, String> {
-        debug!("skills.create called for: {}", input.0.name);
+        debug!("create called for: {}", input.0.name);
 
         let request = CreateSkillRequest {
             name: input.0.name.clone(),
@@ -584,14 +584,14 @@ impl SkillsServer {
 
     /// Get skill content (SKILL.md and file list) for progressive disclosure
     #[tool(
-        name = "skills.get_content",
+        name = "get_content",
         description = "Get skill content (SKILL.md and file list) for progressive disclosure. Use this after search to load skill instructions."
     )]
     async fn get_skill_content(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<GetContentInput>,
     ) -> Result<String, String> {
-        debug!("skills.get_content called for: {}", input.0.skill_id);
+        debug!("get_content called for: {}", input.0.skill_id);
 
         let content = self
             .skill_store
@@ -636,14 +636,14 @@ impl SkillsServer {
 
     /// Update an existing skill
     #[tool(
-        name = "skills.update",
+        name = "update",
         description = "Update an existing skill's content, dependencies, or bundled files."
     )]
     async fn update_skill(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<UpdateSkillInput>,
     ) -> Result<Json<CreateSkillOutput>, String> {
-        debug!("skills.update called for: {}", input.0.skill_id);
+        debug!("update called for: {}", input.0.skill_id);
 
         let request = CreateSkillRequest {
             name: input.0.name.clone(),
@@ -671,12 +671,12 @@ impl SkillsServer {
     }
 
     /// Delete a skill
-    #[tool(name = "skills.delete", description = "Delete a skill from the store.")]
+    #[tool(name = "delete", description = "Delete a skill from the store.")]
     async fn delete_skill(
         &self,
         input: rmcp::handler::server::wrapper::Parameters<DeleteSkillInput>,
     ) -> Result<String, String> {
-        debug!("skills.delete called for: {}", input.0.skill_id);
+        debug!("delete called for: {}", input.0.skill_id);
 
         self.skill_store
             .delete_skill(&input.0.skill_id)
@@ -763,7 +763,7 @@ impl ServerHandler for SkillsServer {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
-                name: "skills.rs".to_string(),
+                name: "skillsrs".to_string(),
                 title: Some("Infinite Skills. Finite Context.".to_string()),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 website_url: Some("https://github.com/labiium/skills".to_string()),
@@ -772,8 +772,8 @@ impl ServerHandler for SkillsServer {
             instructions: Some(
                 "Unified MCP server that aggregates upstream MCP tools and Skills into a unified registry. \
                 Exposes exactly 3 tools for discovery, schema inspection, and execution. \
-                Usage: (1) skills.search to find callables, (2) skills.schema to get parameters, \
-                (3) skills.exec to execute."
+                Usage: (1) search to find callables, (2) schema to get parameters, \
+                (3) exec to execute."
                     .to_string(),
             ),
             ..Default::default()
@@ -814,34 +814,16 @@ mod tests {
         );
 
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+        assert!(tool_names.contains(&"search".to_string()), "Missing search");
+        assert!(tool_names.contains(&"schema".to_string()), "Missing schema");
+        assert!(tool_names.contains(&"exec".to_string()), "Missing exec");
+        assert!(tool_names.contains(&"create".to_string()), "Missing create");
         assert!(
-            tool_names.contains(&"skills.search".to_string()),
-            "Missing skills.search"
+            tool_names.contains(&"get_content".to_string()),
+            "Missing get_content"
         );
-        assert!(
-            tool_names.contains(&"skills.schema".to_string()),
-            "Missing skills.schema"
-        );
-        assert!(
-            tool_names.contains(&"skills.exec".to_string()),
-            "Missing skills.exec"
-        );
-        assert!(
-            tool_names.contains(&"skills.create".to_string()),
-            "Missing skills.create"
-        );
-        assert!(
-            tool_names.contains(&"skills.get_content".to_string()),
-            "Missing skills.get_content"
-        );
-        assert!(
-            tool_names.contains(&"skills.update".to_string()),
-            "Missing skills.update"
-        );
-        assert!(
-            tool_names.contains(&"skills.delete".to_string()),
-            "Missing skills.delete"
-        );
+        assert!(tool_names.contains(&"update".to_string()), "Missing update");
+        assert!(tool_names.contains(&"delete".to_string()), "Missing delete");
 
         println!("✓ Server exposes exactly 3 tools: {:?}", tool_names);
     }
