@@ -106,6 +106,25 @@ fn json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Sche
     .unwrap()
 }
 
+/// Schema for bundled_files: array of [filename, content] tuples (or null).
+fn bundled_files_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "anyOf": [
+            {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 2,
+                    "maxItems": 2
+                }
+            },
+            { "type": "null" }
+        ]
+    }))
+    .unwrap()
+}
+
 /// Output schema for skills.search
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchOutput {
@@ -682,6 +701,7 @@ pub struct CreateSkillInput {
     /// MCP tools this skill uses
     pub uses_tools: Option<Vec<String>>,
     /// Bundled files as (filename, content) pairs
+    #[schemars(schema_with = "bundled_files_schema")]
     pub bundled_files: Option<Vec<(String, String)>>,
     /// Tags for categorization
     pub tags: Option<Vec<String>>,
@@ -723,6 +743,7 @@ pub struct UpdateSkillInput {
     /// New tool dependencies
     pub uses_tools: Option<Vec<String>>,
     /// New bundled files
+    #[schemars(schema_with = "bundled_files_schema")]
     pub bundled_files: Option<Vec<(String, String)>>,
     /// New tags
     pub tags: Option<Vec<String>>,
