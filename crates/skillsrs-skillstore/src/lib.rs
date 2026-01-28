@@ -305,14 +305,27 @@ impl SkillStore {
         // Discover bundled tools
         let bundled_tools = self.discover_bundled_tools(&skill_dir)?;
 
-        // Load manifest to get uses_tools
+        // Load manifest to get uses_tools - try skill.json first, fallback to YAML frontmatter
         let manifest_path = skill_dir.join("skill.json");
-        let manifest_content = std::fs::read_to_string(&manifest_path)?;
-        let manifest: SkillManifest = serde_json::from_str(&manifest_content)
-            .map_err(|e| SkillStoreError::Parse(e.to_string()))?;
-
-        // Extract uses_tools from tool_policy
-        let uses_tools = manifest.tool_policy.allow.clone();
+        let uses_tools = if manifest_path.exists() {
+            // New format: skill.json
+            let manifest_content = std::fs::read_to_string(&manifest_path)?;
+            let manifest: SkillManifest = serde_json::from_str(&manifest_content)
+                .map_err(|e| SkillStoreError::Parse(e.to_string()))?;
+            manifest.tool_policy.allow.clone()
+        } else {
+            // Old format: parse YAML frontmatter from SKILL.md
+            match crate::agent_skills::parse_frontmatter_public(&skill_md) {
+                Ok((frontmatter, _)) => {
+                    // Parse allowed_tools (supports both string and array formats)
+                    frontmatter
+                        .allowed_tools
+                        .map(|tools| tools.to_vec())
+                        .unwrap_or_default()
+                }
+                Err(_) => Vec::new(), // If no frontmatter or parse error, return empty vec
+            }
+        };
 
         Ok(SkillContent {
             skill_md,

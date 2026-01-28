@@ -74,17 +74,17 @@ async fn test_agent_skill_parsing() {
     assert_eq!(agent_skill.frontmatter.name, "test-skill");
     assert_eq!(
         agent_skill.frontmatter.description,
-        "Test skill for integration testing"
+        Some("Test skill for integration testing".to_string())
     );
     assert_eq!(agent_skill.frontmatter.license, Some("MIT".to_string()));
     assert_eq!(
         agent_skill.frontmatter.metadata.get("author"),
         Some(&"test-suite".to_string())
     );
-    assert_eq!(
-        agent_skill.frontmatter.allowed_tools,
-        Some("Bash Read Write".to_string())
-    );
+
+    // Check allowed_tools can be parsed
+    let tools = agent_skill.parse_allowed_tools();
+    assert_eq!(tools, vec!["Bash", "Read", "Write"]);
 
     assert!(agent_skill.content.contains("# Test Skill"));
     assert!(agent_skill.has_scripts());

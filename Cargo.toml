@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.5"
 edition = "2021"
 authors = ["skills.rs team"]
 license = "MIT OR Apache-2.0"
@@ -21,14 +21,14 @@ repository = "https://github.com/labiium/skills"
 
 [workspace.dependencies]
 # Internal crates
-skillsrs-core = { version = "0.1.0", path = "crates/skillsrs-core" }
-skillsrs-registry = { version = "0.1.0", path = "crates/skillsrs-registry" }
-skillsrs-index = { version = "0.1.0", path = "crates/skillsrs-index" }
-skillsrs-upstream = { version = "0.1.0", path = "crates/skillsrs-upstream" }
-skillsrs-skillstore = { version = "0.1.0", path = "crates/skillsrs-skillstore" }
-skillsrs-runtime = { version = "0.1.0", path = "crates/skillsrs-runtime" }
-skillsrs-policy = { version = "0.1.0", path = "crates/skillsrs-policy" }
-skillsrs-mcp = { version = "0.1.0", path = "crates/skillsrs-mcp" }
+skillsrs-core = { version = "0.1.5", path = "crates/skillsrs-core" }
+skillsrs-registry = { version = "0.1.5", path = "crates/skillsrs-registry" }
+skillsrs-index = { version = "0.1.5", path = "crates/skillsrs-index" }
+skillsrs-upstream = { version = "0.1.5", path = "crates/skillsrs-upstream" }
+skillsrs-skillstore = { version = "0.1.5", path = "crates/skillsrs-skillstore" }
+skillsrs-runtime = { version = "0.1.5", path = "crates/skillsrs-runtime" }
+skillsrs-policy = { version = "0.1.5", path = "crates/skillsrs-policy" }
+skillsrs-mcp = { version = "0.1.5", path = "crates/skillsrs-mcp" }
 
 # MCP SDK (official Rust implementation)
 rmcp = { version = "0.14.0", features = ["server"] }

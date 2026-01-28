@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-01-27
+
+### Fixed
+- **Backward compatibility for old-format skills** - Added fallback to parse YAML frontmatter from SKILL.md when skill.json is not present, allowing legacy skills to be loaded and used
+
+## [0.1.4] - 2026-01-27
+
+### Fixed
+- **MCP schema validation error** - Removed `skip_serializing_if` from SchemaOutput optional fields to ensure they serialize as `null` instead of being omitted, fixing "data must have required property 'output_schema'" error
+- **Skill ID parsing** - Added proper parsing of CallableId format (`skill:name@version`) in `get_content`, `update_skill`, and `delete_skill` tools, fixing "Skill not found" errors when using skill IDs from search results
+
+## [0.1.3] - Previous Release
+
 ### Added
 - **System-aware path management** - Platform-specific directories (XDG on Linux, standard paths on macOS/Windows)
 - **CLI mode** - Full mcp-cli replacement with `list`, `tool`, `exec`, `grep`, `paths` commands
@@ -58,5 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic CLI interface
 - Configuration via YAML files
 
-[Unreleased]: https://github.com/labiium/skills/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/labiium/skills/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/labiium/skills/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/labiium/skills/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/labiium/skills/compare/v0.1.0...v0.1.3
 [0.1.0]: https://github.com/labiium/skills/releases/tag/v0.1.0

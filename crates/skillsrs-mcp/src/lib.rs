@@ -198,13 +198,10 @@ fn default_max_bytes() -> usize {
 pub struct SchemaOutput {
     pub callable: CallableInfo,
     pub schema_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "json_value_schema")]
     pub input_schema: Option<JsonValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "json_value_schema")]
     pub output_schema: Option<JsonValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "json_value_schema")]
     pub signature: Option<JsonValue>,
 }
@@ -607,16 +604,30 @@ impl SkillsServer {
     ) -> Result<String, String> {
         debug!("get_content called for: {}", input.0.skill_id);
 
+        // Parse skill_id - it might be a full CallableId like "skill:name@version" or just "name"
+        let skill_name = if input.0.skill_id.starts_with("skill:") {
+            // Extract name from "skill:name@version" format
+            input
+                .0
+                .skill_id
+                .strip_prefix("skill:")
+                .and_then(|s| s.split('@').next())
+                .unwrap_or(&input.0.skill_id)
+        } else {
+            // Already just the name
+            &input.0.skill_id
+        };
+
         let content = self
             .skill_store
-            .load_skill_content(&input.0.skill_id)
+            .load_skill_content(skill_name)
             .map_err(|e| format!("Failed to load skill content: {}", e))?;
 
         // If a specific file is requested, return just that file
         if let Some(filename) = input.0.filename {
             let file_content = self
                 .skill_store
-                .load_skill_file(&input.0.skill_id, &filename)
+                .load_skill_file(skill_name, &filename)
                 .map_err(|e| format!("Failed to load file: {}", e))?;
             return Ok(file_content);
         }
@@ -659,6 +670,18 @@ impl SkillsServer {
     ) -> Result<Json<CreateSkillOutput>, String> {
         debug!("update called for: {}", input.0.skill_id);
 
+        // Parse skill_id - it might be a full CallableId like "skill:name@version" or just "name"
+        let skill_name = if input.0.skill_id.starts_with("skill:") {
+            input
+                .0
+                .skill_id
+                .strip_prefix("skill:")
+                .and_then(|s| s.split('@').next())
+                .unwrap_or(&input.0.skill_id)
+        } else {
+            &input.0.skill_id
+        };
+
         let request = CreateSkillRequest {
             name: input.0.name.clone(),
             version: input.0.version.unwrap_or_else(|| "1.0.0".to_string()),
@@ -671,7 +694,7 @@ impl SkillsServer {
 
         let id: skillsrs_core::CallableId = self
             .skill_store
-            .update_skill(&input.0.skill_id, request)
+            .update_skill(skill_name, request)
             .await
             .map_err(|e| format!("Failed to update skill: {}", e))?;
 
@@ -692,8 +715,20 @@ impl SkillsServer {
     ) -> Result<String, String> {
         debug!("delete called for: {}", input.0.skill_id);
 
+        // Parse skill_id - it might be a full CallableId like "skill:name@version" or just "name"
+        let skill_name = if input.0.skill_id.starts_with("skill:") {
+            input
+                .0
+                .skill_id
+                .strip_prefix("skill:")
+                .and_then(|s| s.split('@').next())
+                .unwrap_or(&input.0.skill_id)
+        } else {
+            &input.0.skill_id
+        };
+
         self.skill_store
-            .delete_skill(&input.0.skill_id)
+            .delete_skill(skill_name)
             .map_err(|e| format!("Failed to delete skill: {}", e))?;
 
         info!("Deleted skill: {}", input.0.skill_id);

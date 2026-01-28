@@ -35,14 +35,36 @@ pub enum AgentSkillsError {
 
 pub type Result<T> = std::result::Result<T, AgentSkillsError>;
 
+/// Flexible allowed-tools field that accepts both string and array formats
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AllowedTools {
+    /// Space-delimited string format: "Bash Read Write"
+    String(String),
+    /// Array format: ["Bash", "Read", "Write"]
+    Array(Vec<String>),
+}
+
+impl AllowedTools {
+    /// Convert to Vec<String> regardless of format
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            AllowedTools::String(s) => s.split_whitespace().map(|t| t.to_string()).collect(),
+            AllowedTools::Array(arr) => arr.clone(),
+        }
+    }
+}
+
 /// Agent Skills YAML frontmatter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSkillsFrontmatter {
     /// Skill name (required, must match directory name)
     pub name: String,
 
-    /// Description (required, max 1024 chars)
-    pub description: String,
+    /// Description (optional for command-only skills, max 1024 chars)
+    /// Some skills intentionally omit description to prevent auto-triggering
+    #[serde(default)]
+    pub description: Option<String>,
 
     /// License (optional)
     #[serde(default)]
@@ -56,9 +78,10 @@ pub struct AgentSkillsFrontmatter {
     #[serde(default)]
     pub metadata: HashMap<String, String>,
 
-    /// Pre-approved tools (experimental, space-delimited)
+    /// Pre-approved tools (experimental)
+    /// Accepts both string format ("Bash Read Write") and array format (["Bash", "Read", "Write"])
     #[serde(default, rename = "allowed-tools")]
-    pub allowed_tools: Option<String>,
+    pub allowed_tools: Option<AllowedTools>,
 }
 
 /// Parsed Agent Skill
@@ -117,7 +140,7 @@ impl AgentSkill {
         })
     }
 
-    /// Parse YAML frontmatter from SKILL.md
+    /// Parse YAML frontmatter from SKILL.md (private)
     fn parse_frontmatter(content: &str) -> Result<(AgentSkillsFrontmatter, String)> {
         // Normalize line endings to \n for consistent parsing
         let normalized = content.replace("\r\n", "\n");
@@ -147,9 +170,6 @@ impl AgentSkill {
         if frontmatter.name.is_empty() {
             return Err(AgentSkillsError::MissingField("name".to_string()));
         }
-        if frontmatter.description.is_empty() {
-            return Err(AgentSkillsError::MissingField("description".to_string()));
-        }
 
         // Validate field constraints
         if frontmatter.name.len() > 64 {
@@ -157,10 +177,12 @@ impl AgentSkill {
                 "name exceeds 64 characters".to_string(),
             ));
         }
-        if frontmatter.description.len() > 1024 {
-            return Err(AgentSkillsError::ValidationError(
-                "description exceeds 1024 characters".to_string(),
-            ));
+        if let Some(ref desc) = frontmatter.description {
+            if desc.len() > 1024 {
+                return Err(AgentSkillsError::ValidationError(
+                    "description exceeds 1024 characters".to_string(),
+                ));
+            }
         }
         if let Some(ref compat) = frontmatter.compatibility {
             if compat.len() > 500 {
@@ -227,12 +249,12 @@ impl AgentSkill {
         files
     }
 
-    /// Parse allowed-tools string into a Vec
+    /// Parse allowed-tools into a Vec (supports both string and array formats)
     pub fn parse_allowed_tools(&self) -> Vec<String> {
         self.frontmatter
             .allowed_tools
             .as_ref()
-            .map(|s| s.split_whitespace().map(|t| t.to_string()).collect())
+            .map(|tools| tools.to_vec())
             .unwrap_or_default()
     }
 
@@ -288,10 +310,15 @@ impl AgentSkill {
             required: vec![],
         };
 
-        // Extract hints from description (keywords for search)
-        let description_words: Vec<String> = self
+        // Get description (use empty string if not provided for command-only skills)
+        let description = self
             .frontmatter
             .description
+            .clone()
+            .unwrap_or_else(|| format!("Command-only skill: {}", self.frontmatter.name));
+
+        // Extract hints from description (keywords for search)
+        let description_words: Vec<String> = description
             .split_whitespace()
             .filter(|w| w.len() > 3)
             .take(10)
@@ -310,7 +337,7 @@ impl AgentSkill {
             "type": "object",
             "properties": {},
             "additionalProperties": true,
-            "description": self.frontmatter.description.clone()
+            "description": description.clone()
         });
 
         SkillManifest {
@@ -329,7 +356,7 @@ impl AgentSkill {
                 .collect::<Vec<_>>()
                 .join(" "),
             version: self.version(),
-            description: self.frontmatter.description.clone(),
+            description,
             inputs,
             outputs: None,
             entrypoint,
@@ -401,6 +428,11 @@ impl AgentSkill {
     }
 }
 
+/// Public wrapper to parse frontmatter for backward compatibility with old-format skills
+pub fn parse_frontmatter_public(content: &str) -> Result<(AgentSkillsFrontmatter, String)> {
+    AgentSkill::parse_frontmatter(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,14 +454,32 @@ This skill processes PDFs.
         assert_eq!(frontmatter.name, "pdf-processing");
         assert_eq!(
             frontmatter.description,
-            "Extract text and tables from PDF files."
+            Some("Extract text and tables from PDF files.".to_string())
         );
         assert_eq!(frontmatter.license, Some("Apache-2.0".to_string()));
         assert!(body.contains("# PDF Processing"));
     }
 
     #[test]
-    fn test_parse_frontmatter_with_metadata() {
+    fn test_parse_frontmatter_without_description() {
+        let content = r#"---
+name: command-only-skill
+# Internal tool - no description to prevent auto-triggering
+---
+
+# Command Only Skill
+
+This is triggered only by explicit commands.
+"#;
+
+        let (frontmatter, body) = AgentSkill::parse_frontmatter(content).unwrap();
+        assert_eq!(frontmatter.name, "command-only-skill");
+        assert_eq!(frontmatter.description, None);
+        assert!(body.contains("# Command Only Skill"));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_with_metadata_string_tools() {
         let content = r#"---
 name: test-skill
 description: A test skill
@@ -445,10 +495,25 @@ Content here.
         let (frontmatter, _) = AgentSkill::parse_frontmatter(content).unwrap();
         assert_eq!(frontmatter.metadata.get("author").unwrap(), "test-author");
         assert_eq!(frontmatter.metadata.get("version").unwrap(), "2.0.0");
-        assert_eq!(
-            frontmatter.allowed_tools.as_ref().unwrap(),
-            "Bash(git:*) Read"
-        );
+
+        let tools = frontmatter.allowed_tools.as_ref().unwrap().to_vec();
+        assert_eq!(tools, vec!["Bash(git:*)", "Read"]);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_with_array_tools() {
+        let content = r#"---
+name: test-skill
+description: A test skill with array tools
+allowed-tools: ["LSP", "Read", "Glob", "Grep"]
+---
+
+Content here.
+"#;
+
+        let (frontmatter, _) = AgentSkill::parse_frontmatter(content).unwrap();
+        let tools = frontmatter.allowed_tools.as_ref().unwrap().to_vec();
+        assert_eq!(tools, vec!["LSP", "Read", "Glob", "Grep"]);
     }
 
     #[test]
