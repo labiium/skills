@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-01-28
+
+### Fixed
+- **Vercel skills.sh compatibility** - Full compatibility with Vercel's Agent Skills format
+  - Support for both string (`"Bash Read Write"`) and array (`["Bash", "Read", "Write"]`) formats in `allowed-tools` field
+  - Made `description` field optional for command-only skills that shouldn't auto-trigger
+  - All 38 skills from `https://github.com/zhanghandong/rust-skills` now import successfully (was 26/38 with 12 errors)
+
+### Changed
+- Updated 71 dependencies to their latest compatible versions
+
+### Note on Dependencies
+- `generic-array` remains at v0.14.7 (v0.14.9 available but blocked by `crypto-common v0.1.7` exact version requirement)
+- `matchit` remains at v0.8.4 (v0.8.6 available but blocked by `axum v0.8.8` exact version requirement)
+- These will update automatically when upstream crates release new versions
+
 ## [0.1.5] - 2026-01-27
 
 ### Fixed

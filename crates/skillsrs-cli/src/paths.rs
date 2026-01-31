@@ -148,24 +148,30 @@ impl Default for SkillsPaths {
 }
 
 /// Configuration overrides for paths
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct PathsConfig {
     /// Override data directory
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
 
     /// Override config directory
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<PathBuf>,
 
     /// Override cache directory
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
 
     /// Override database path
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub database_path: Option<PathBuf>,
 
     /// Override skills root
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_root: Option<PathBuf>,
 
     /// Override logs directory
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logs_dir: Option<PathBuf>,
 }
 

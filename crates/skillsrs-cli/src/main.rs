@@ -19,6 +19,7 @@ use skillsrs_registry::Registry;
 use skillsrs_runtime::{sandbox::SandboxBackend, sandbox::SandboxConfig, Runtime};
 use skillsrs_skillstore::SkillStore;
 use skillsrs_upstream::UpstreamManager;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -216,33 +217,90 @@ enum ServerMode {
 }
 
 /// Server configuration
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_server_config")]
     #[allow(dead_code)]
     server: ServerConfig,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_policy_config")]
     policy: PolicyConfig,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     upstreams: Vec<skillsrs_upstream::UpstreamConfig>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_paths_config")]
     paths: PathsConfig,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_sandbox_config")]
     sandbox: SandboxConfig,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_use_global")]
     use_global: UseGlobalSettings,
 
     /// Agent Skills repositories to auto-sync
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     agent_skills_repos: Vec<skillsrs_skillstore::sync::AgentSkillsRepoConfig>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+impl Config {
+    /// Check if config is essentially empty (all default values)
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.upstreams.is_empty()
+            && self.agent_skills_repos.is_empty()
+            && is_default_server_config(&self.server)
+            && is_default_policy_config(&self.policy)
+            && is_default_paths_config(&self.paths)
+            && is_default_sandbox_config(&self.sandbox)
+            && is_default_use_global(&self.use_global)
+    }
+}
+
+// Helper functions for skip_serializing_if checks
+fn is_default_server_config(cfg: &ServerConfig) -> bool {
+    cfg.bind == default_bind()
+        && cfg.transport == default_transport()
+        && cfg.log_level == default_log_level()
+}
+
+fn is_default_policy_config(cfg: &PolicyConfig) -> bool {
+    let default = PolicyConfig::default();
+    cfg.default_risk == default.default_risk
+        && cfg.require_consent_for == default.require_consent_for
+        && cfg.trusted_servers == default.trusted_servers
+        && cfg.deny_tags == default.deny_tags
+        && cfg.max_calls_per_skill == default.max_calls_per_skill
+        && cfg.max_exec_ms == default.max_exec_ms
+        && cfg.allow_patterns == default.allow_patterns
+        && cfg.deny_patterns == default.deny_patterns
+}
+
+fn is_default_paths_config(cfg: &PathsConfig) -> bool {
+    cfg.data_dir.is_none()
+        && cfg.config_dir.is_none()
+        && cfg.cache_dir.is_none()
+        && cfg.database_path.is_none()
+        && cfg.skills_root.is_none()
+        && cfg.logs_dir.is_none()
+}
+
+fn is_default_sandbox_config(cfg: &SandboxConfig) -> bool {
+    let default = SandboxConfig::default();
+    cfg.backend == default.backend
+        && cfg.timeout_ms == default.timeout_ms
+        && cfg.allow_read == default.allow_read
+        && cfg.allow_write == default.allow_write
+        && cfg.allow_network == default.allow_network
+        && cfg.max_memory_bytes == default.max_memory_bytes
+        && cfg.max_cpu_seconds == default.max_cpu_seconds
+}
+
+fn is_default_use_global(cfg: &UseGlobalSettings) -> bool {
+    !cfg.enabled
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 struct UseGlobalSettings {
     /// If true, overlay the project config on top of global config.
     /// This allows using global upstreams/skills together with project ones.
@@ -250,7 +308,7 @@ struct UseGlobalSettings {
     enabled: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct ServerConfig {
     #[serde(default = "default_bind")]
     #[allow(dead_code)]
@@ -309,6 +367,77 @@ fn load_config(path: &std::path::Path) -> Result<Config> {
     let contents = std::fs::read_to_string(path)?;
     let config: Config = serde_yaml::from_str(&contents)?;
     Ok(config)
+}
+
+/// Ensure global configuration file exists, creating it with defaults if needed
+fn ensure_global_config(paths: &SkillsPaths) -> Result<PathBuf> {
+    let config_path = paths.default_config_file();
+
+    if !config_path.exists() {
+        info!(
+            "Creating default global config at: {}",
+            config_path.display()
+        );
+
+        // Ensure parent directory exists
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Create default config
+        let config = Config::default();
+        save_config(&config, &config_path)?;
+
+        info!("Global config created successfully");
+    }
+
+    Ok(config_path)
+}
+
+/// Save configuration to file
+fn save_config(config: &Config, path: &std::path::Path) -> Result<()> {
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let yaml = serde_yaml::to_string(config)?;
+    std::fs::write(path, yaml)?;
+    info!("Config saved to: {}", path.display());
+    Ok(())
+}
+
+/// Add a skill repository to the config
+fn add_repo_to_config(config: &mut Config, repo: &str, git_ref: Option<&str>, skills: Vec<String>) {
+    // Check if repo already exists
+    let existing_idx = config
+        .agent_skills_repos
+        .iter()
+        .position(|r| r.repo == repo);
+
+    if let Some(idx) = existing_idx {
+        // Update existing repo
+        let repo_config = &mut config.agent_skills_repos[idx];
+        if let Some(git_ref_val) = git_ref {
+            repo_config.git_ref = Some(git_ref_val.to_string());
+        }
+        if !skills.is_empty() {
+            repo_config.skills = Some(skills);
+        }
+    } else {
+        // Add new repo
+        let repo_config = skillsrs_skillstore::sync::AgentSkillsRepoConfig {
+            repo: repo.to_string(),
+            git_ref: git_ref.map(|s| s.to_string()),
+            skills: if skills.is_empty() {
+                None
+            } else {
+                Some(skills)
+            },
+            alias: None,
+        };
+        config.agent_skills_repos.push(repo_config);
+    }
 }
 
 fn merge_config(base: &mut Config, overlay: Config) {
@@ -513,7 +642,7 @@ async fn main() -> Result<()> {
 
     init_logging(&cli.log_level);
 
-    let (project_config_path, sys_config_path) = {
+    let (project_config_path, sys_config_path, _is_global_active) = {
         let sys_paths = SkillsPaths::new()?;
         let sys_config = sys_paths.default_config_file();
 
@@ -537,18 +666,27 @@ async fn main() -> Result<()> {
             found
         };
 
-        (project, sys_config)
+        let is_global = cli.global || (project.is_none() && cli.config.is_none());
+        (project, sys_config, is_global)
     };
 
-    let mut config = if let Some(ref config_file) = cli.config {
-        load_config(std::path::Path::new(config_file))?
-    } else if cli.global {
-        load_config(&sys_config_path)?
-    } else if let Some(ref p) = project_config_path {
-        load_config(p)?
-    } else {
-        load_config(&sys_config_path)?
-    };
+    // Ensure global config exists before loading (auto-init)
+    let sys_paths_for_ensure = SkillsPaths::new()?;
+    let _ = ensure_global_config(&sys_paths_for_ensure)?;
+
+    let (mut config, active_config_path): (Config, PathBuf) =
+        if let Some(ref config_file) = cli.config {
+            (
+                load_config(std::path::Path::new(config_file))?,
+                PathBuf::from(config_file),
+            )
+        } else if cli.global {
+            (load_config(&sys_config_path)?, sys_config_path.clone())
+        } else if let Some(ref p) = project_config_path {
+            (load_config(p)?, p.clone())
+        } else {
+            (load_config(&sys_config_path)?, sys_config_path.clone())
+        };
 
     if !cli.global
         && cli.config.is_none()
@@ -1283,6 +1421,25 @@ use_global:
             if imported > 0 {
                 eprintln!("\n✅ Skills imported successfully!");
                 eprintln!("   Run `skills list` to see all available skills");
+            }
+
+            // Add to config for tracking
+            let skills_list: Vec<String> = skills_to_import
+                .iter()
+                .filter_map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+
+            add_repo_to_config(&mut config, &repo, git_ref.as_deref(), skills_list);
+
+            // Save config back to the active config file
+            if let Err(e) = save_config(&config, &active_config_path) {
+                eprintln!("⚠️  Warning: Failed to save config: {}", e);
+            } else {
+                eprintln!("\n📝 Config updated: {}", active_config_path.display());
             }
         }
 
