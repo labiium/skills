@@ -84,7 +84,7 @@ async-trait = "0.1"
 bytes = "1.8"
 
 # WASM runtime (optional for script mode)
-wasmtime = "40.0"
+wasmtime = "41.0"
 
 # Config
 config = "0.15"
