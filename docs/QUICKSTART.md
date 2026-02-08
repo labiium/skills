@@ -136,18 +136,18 @@ EOF
 
 **Stdio mode (for MCP clients):**
 ```bash
-./target/release/skills stdio
+./target/release/skills server stdio
 ```
 
 **HTTP mode (for testing):**
 ```bash
-./target/release/skills http --bind 127.0.0.1:8000
+./target/release/skills server http --bind 127.0.0.1:8000
 ```
 
 The server will:
 - Load all skills from `./skills/`
 - Connect to upstream MCP servers
-- Expose 7 MCP tools
+- Expose 4 MCP tools
 
 ---
 
@@ -170,11 +170,12 @@ The server will:
 
 ### Get skill content
 
-**Tool:** `get_content`
+**Tool:** `manage`
 
 **Input:**
 ```json
 {
+  "operation": "get",
   "skill_id": "my-first-skill"
 }
 ```
@@ -264,7 +265,7 @@ cargo test --workspace --all-features
 ls -la ./skills
 
 # Run with debug logging
-RUST_LOG=debug ./target/release/skills stdio --config config.yaml
+RUST_LOG=debug ./target/release/skills server stdio --config config.yaml
 ```
 
 **Upstream connection failed?**

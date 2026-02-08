@@ -1,6 +1,6 @@
 # Skills.rs MCP Server Prompt
 
-You have access to skills.rs, a unified MCP server exposing 7 tools.
+You have access to skills.rs, a unified MCP server exposing 4 tools.
 
 ## Core Tools
 
@@ -9,7 +9,7 @@ You have access to skills.rs, a unified MCP server exposing 7 tools.
 | `search` | Find tools/skills by query |
 | `schema` | Get full schema (call before exec!) |
 | `exec` | Execute a tool or skill |
-| `get_content` | Load skill SKILL.md |
+| `manage` | Skill lifecycle management (create, get, update, delete) |
 
 ## Workflow
 
@@ -34,18 +34,49 @@ You have access to skills.rs, a unified MCP server exposing 7 tools.
 {"id": "tool://server/name@digest", "arguments": {...}}
 ```
 
-**get_content** (for skills only)
+**manage** (Skill lifecycle)
+
+Create a skill:
 ```json
-{"skill_id": "skill-name", "filename": null}
+{
+  "operation": "create",
+  "name": "skill-name",
+  "version": "1.0.0",
+  "description": "What this skill does",
+  "skill_md": "# Skill Name\n\nStep-by-step instructions...",
+  "uses_tools": ["server/tool"],
+  "bundled_files": [["script.py", "print('hello')"]]
+}
 ```
 
-## Skill Management
+Get skill content:
+```json
+{
+  "operation": "get",
+  "skill_id": "skill-name",
+  "filename": null
+}
+```
 
-| Tool | Purpose |
-|------|---------|
-| `create` | Create skill with SKILL.md |
-| `update` | Update existing skill |
-| `delete` | Delete a skill |
+Update a skill:
+```json
+{
+  "operation": "update",
+  "skill_id": "skill-name",
+  "name": "skill-name",
+  "version": "1.1.0",
+  "description": "Updated description",
+  "skill_md": "# Updated content..."
+}
+```
+
+Delete a skill:
+```json
+{
+  "operation": "delete",
+  "skill_id": "skill-name"
+}
+```
 
 ## Callable ID Format
 
@@ -57,5 +88,6 @@ Always use IDs from search results — never construct manually.
 ## Tips
 
 - Always call `schema` before `exec`
-- Use `get_content` for skill instructions
+- Use `manage` with `operation: "get"` to load skill instructions
 - Use `dry_run: true` to validate without executing
+- Use `manage` tool for all skill lifecycle operations

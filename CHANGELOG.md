@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-02-08
+
+### Changed
+- **Crate consolidation** - Consolidated 9 separate crates into a single unified crate for crates.io publication
+  - Simplified from `crates/*` structure to standard single-crate layout
+  - Tests moved to top-level `tests/` directory for separation of concerns
+  - No functional changes, purely structural
+
+### Fixed
+- **MCP tool count** - Consolidated 7 tools into 4 focused tools (search, schema, exec, manage)
+  - `manage` tool now handles skill lifecycle (create, get, update, delete) via `operation` field
+  - Reduces context bloat while preserving full functionality
+- **Registry removal bug** - Fixed `delete_skill` to correctly find and remove skills by name
+- **Sandbox restricted backend** - Now creates temp sandbox directory and enforces file/network restrictions
+- **CLI local skills loading** - List, Tool, Execute, Grep commands now load local skills from SkillStore
+
+### Added
+- **CLI skill management** - New `skills skill` subcommand with:
+  - `create` - Create skills from file or inline content
+  - `edit` - Edit skills with sed-like replace, append, prepend
+  - `delete` - Delete skills with confirmation
+  - `show` - Display skill content
+
 ## [0.1.6] - 2026-01-28
 
 ### Fixed

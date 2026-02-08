@@ -12,7 +12,7 @@
 
 ## 🎯 What is skills.rs?
 
-skills.rs is a **unified MCP server** that aggregates multiple upstream MCP servers and high-level Skills into a single, unified registry. It exposes **7 focused MCP tools** to prevent context-window bloat while enabling unbounded tool/skill discovery.
+skills.rs is a **unified MCP server** that aggregates multiple upstream MCP servers and high-level Skills into a single, unified registry. It exposes **4 focused MCP tools** to prevent context-window bloat while enabling unbounded tool/skill discovery and skill lifecycle management.
 
 ### Key Features
 
@@ -32,11 +32,13 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
    - Direct tool discovery and execution from command line
    - Compatible with mcp-cli workflows
    - `skills list`, `skills tool`, `skills exec`, `skills grep`
+   - `skills skill create`, `skills skill edit`, `skills skill delete`, `skills skill show`
 
 2. **Server Mode** (MCP Protocol)
    - Run as MCP server exposing meta-tools
-   - `search`, `schema`, `exec`
+   - `search`, `schema`, `exec`, `manage`
    - Aggregate multiple upstream MCP servers
+   - Create, update, delete skills via unified manage tool
 
 ---
 
@@ -215,6 +217,46 @@ skills tool filesystem/read_file '{"path": "./README.md"}' --json
 skills tool filesystem/read_file '{"path": "./README.md"}' --raw
 ```
 
+### Skill Management CLI
+
+```bash
+# Create a new skill from file
+skills skill create my-skill \
+  --description "My custom skill" \
+  --skill-md ./SKILL.md \
+  --uses-tools brave_search,grep
+
+# Create skill with inline content
+echo "# My Skill\n\nInstructions here" | skills skill create my-skill --content -
+
+# Or provide content directly
+skills skill create my-skill --content "# My Skill\n\nStep 1: Do this"
+
+# Edit a skill - sed-like replacement
+skills skill edit my-skill --replace "old text" --with "new text"
+
+# Append to SKILL.md
+skills skill edit my-skill --append "## Troubleshooting\n\nCommon issues..."
+
+# Replace entire content from file
+skills skill edit my-skill --skill-md ./updated-SKILL.md
+
+# Or from stdin
+cat ./updated-SKILL.md | skills skill edit my-skill --content -
+
+# Show skill content
+skills skill show my-skill
+
+# Show specific file from skill
+skills skill show my-skill --file helper.py
+
+# Delete a skill (with confirmation)
+skills skill delete my-skill
+
+# Force delete without confirmation
+skills skill delete my-skill --force
+```
+
 ### AI Agent System Prompt
 
 ```markdown
@@ -227,18 +269,21 @@ Commands:
 - `skills tool <server>/<tool>` - Get tool schema
 - `skills tool <server>/<tool> '<json>'` - Execute tool
 - `skills grep "<pattern>"` - Search by pattern
+- `skills skill create <name> --description "..."` - Create a skill
+- `skills skill edit <skill-id>` - Edit/update a skill
+- `skills skill delete <skill-id>` - Delete a skill
+- `skills skill show <skill-id>` - Display skill content
 
 Workflow:
 1. Discover: `skills list` or `skills grep "<pattern>"`
 2. Inspect: `skills tool <server>/<tool>` 
 3. Execute: `skills tool <server>/<tool> '<json>'`
+4. Manage: `skills skill create/edit/delete/show`
 ```
-
-See [MCP_CLI_REPLACEMENT.md](MCP_CLI_REPLACEMENT.md) for complete migration guide.
 
 ---
 
-## 🔧 The 7 MCP Tools
+## 🔧 The 4 MCP Tools
 
 ### Core Discovery & Execution
 
@@ -274,13 +319,15 @@ Execute a callable with validation and policy enforcement
 }
 ```
 
-### Skill Management
+### Skill Lifecycle Management
 
-#### 4. `create`
-Create a new skill with SKILL.md and bundled scripts
+#### 4. `manage`
+Unified skill lifecycle management: create, get, update, delete
 
+**Create a skill:**
 ```json
 {
+  "operation": "create",
   "name": "web-researcher",
   "version": "1.0.0",
   "description": "Research topics using web search",
@@ -290,33 +337,31 @@ Create a new skill with SKILL.md and bundled scripts
 }
 ```
 
-#### 5. `get_content`
-Progressive disclosure: load SKILL.md and files on demand
-
+**Get skill content (progressive disclosure):**
 ```json
 {
+  "operation": "get",
   "skill_id": "web-researcher",
-  "filename": "helper.py"  // optional
+  "filename": "helper.py"
 }
 ```
 
-#### 6. `update`
-Update an existing skill
-
+**Update a skill:**
 ```json
 {
+  "operation": "update",
   "skill_id": "web-researcher",
   "name": "web-researcher",
   "version": "1.1.0",
+  "description": "Updated description",
   "skill_md": "# Updated content..."
 }
 ```
 
-#### 7. `delete`
-Delete a skill from the store
-
+**Delete a skill:**
 ```json
 {
+  "operation": "delete",
   "skill_id": "web-researcher"
 }
 ```
@@ -546,7 +591,7 @@ skills.rs automatically detects skill format:
 - **Has `skill.json` + `SKILL.md`**: Traditional skills.rs format
 - **Has both**: Traditional format takes precedence
 
-Skills are seamlessly converted to the unified internal format and available through all 7 MCP tools.
+Skills are seamlessly converted to the unified internal format and available through all 4 MCP tools.
 
 ### Progressive Disclosure
 
@@ -620,7 +665,7 @@ skills.rs supports multiple sandboxing backends:
 |---------|---------------|----------|----------|
 | `none` | ⚠️ None | All | Development only |
 | `timeout` | 🟡 Basic | All | Basic timeout enforcement |
-| `restricted` | 🟠 Medium | Unix | Resource limits (CPU, memory, FDs) |
+| `restricted` | 🟠 Medium | Unix | Resource limits, temp dir isolation, proxy-based network blocking |
 | `bubblewrap` | 🟢 High | Linux | Container isolation (recommended) |
 | `wasm` | 🔵 High | All | Future: WASM runtime |
 
@@ -650,7 +695,7 @@ sandbox:
 ✅ **Path Traversal Protection** - Validates all file paths  
 ✅ **Circular Dependency Detection** - Prevents infinite loops  
 ✅ **Environment Sanitization** - Removes dangerous env vars  
-✅ **Network Isolation** - Optional network blocking  
+✅ **Network Blocking** - Proxy-based network blocking (use Bubblewrap for strong isolation)  
 ✅ **Execution Auditing** - All executions logged to database
 
 ---
@@ -772,9 +817,8 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
 ### Guides
 - **[QUICKSTART.md](./QUICKSTART.md)** - Step-by-step getting started guide
 - **[OPERATIONS.md](./OPERATIONS.md)** - Complete operations guide (deployment, configuration, CLI usage)
-- **[PRODUCTION_CHECKLIST.md](./PRODUCTION_CHECKLIST.md)** - Production readiness verification
 - **[CHANGELOG.md](./CHANGELOG.md)** - Version history and changes
-- **[config.example.yaml](./config.example.yaml)** - Full configuration reference
+- **[config.example.yaml](docs/config.example.yaml)** - Full configuration reference
 
 ---
 
@@ -786,7 +830,7 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
 └──────────────┬──────────────────────────┘
                │ MCP Protocol
 ┌──────────────▼──────────────────────────┐
-│      SkillsServer (7 MCP Tools)         │
+│      SkillsServer (4 MCP Tools)         │
 └──┬──────┬──────┬──────┬─────────────────┘
    │      │      │      │
 ┌──▼──┐ ┌─▼──┐ ┌▼───┐ ┌▼────────┐

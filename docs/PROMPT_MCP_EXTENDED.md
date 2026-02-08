@@ -77,7 +77,7 @@ Skills are different from tools. A skill is a **documented procedure** that tell
 1. search(q: "deploy", kind: "skills")
    → Find relevant skills
 
-2. get_content(skill_id: "deploy-staging")
+2. manage(operation: "get", skill_id: "deploy-staging")
    → Load the SKILL.md instructions
 
 3. Read the instructions, then for each tool mentioned:
@@ -88,7 +88,7 @@ Skills are different from tools. A skill is a **documented procedure** that tell
 4. Continue following the skill's steps until complete
 ```
 
-### What get_content returns
+### What manage get returns
 
 - The full SKILL.md with step-by-step instructions
 - List of tools the skill uses
@@ -126,7 +126,8 @@ Create a skill when you complete a useful multi-step workflow that could be repe
 After completing a reusable task:
 
 ```
-create(
+manage(
+  operation: "create",
   name: "task-name",           // kebab-case, action-oriented
   description: "Brief summary",
   skill_md: "...",             // Step-by-step instructions
@@ -174,8 +175,9 @@ What the user should see when complete.
 Improve skills when you find better approaches:
 
 ```
-1. get_content(skill_id: "existing-skill")  // Review current version
-2. update(
+1. manage(operation: "get", skill_id: "existing-skill")  // Review current version
+2. manage(
+     operation: "update",
      skill_id: "existing-skill",
      version: "1.1.0",    // Bump the version
      skill_md: "...",     // Improved instructions
@@ -248,15 +250,15 @@ Need to use a specific tool?
 
 Starting a multi-step task?
   → First: search(kind: "skills") for existing workflow
-  → If found: get_content, follow the steps
+  → If found: manage(operation: "get"), follow the steps
   → If not: complete task, consider creating skill
 
 Just finished a useful multi-step task?
   → Would this be useful again?
-  → If yes: create skill to save it
+  → If yes: manage(operation: "create") to save it
 
 Found a better approach for an existing skill?
-  → update the skill with improvements
+  → manage(operation: "update") the skill with improvements
 ```
 
 ---
@@ -265,7 +267,7 @@ Found a better approach for an existing skill?
 
 Some skills include executable scripts (Python, Bash, Node.js). When you exec these skills, the script runs directly and returns output. You don't need to follow SKILL.md steps—the script does the work.
 
-Check for bundled tools in the get_content response. If present, you can exec the skill directly with arguments.
+Check for bundled tools in the manage get response. If present, you can exec the skill directly with arguments.
 
 ---
 

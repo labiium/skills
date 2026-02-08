@@ -1,37 +1,27 @@
-[workspace]
-members = [
-    "crates/skillsrs-core",
-    "crates/skillsrs-registry",
-    "crates/skillsrs-index",
-    "crates/skillsrs-upstream",
-    "crates/skillsrs-skillstore",
-    "crates/skillsrs-runtime",
-    "crates/skillsrs-policy",
-    "crates/skillsrs-mcp",
-    "crates/skillsrs-cli", # This is the main binary crate (skillsrs)
-]
-resolver = "2"
-
-[workspace.package]
-version = "0.1.6"
+[package]
+name = "skillsrs"
+version = "0.1.7"
 edition = "2021"
 authors = ["skills.rs team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/labiium/skills"
+description = "Infinite Skills. Finite Context. - Unified MCP server aggregating tools and skills with 99% token reduction"
+readme = "README.md"
+keywords = ["mcp", "skills", "tools", "ai", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.80"
 
-[workspace.dependencies]
-# Internal crates
-skillsrs-core = { version = "0.1.6", path = "crates/skillsrs-core" }
-skillsrs-registry = { version = "0.1.6", path = "crates/skillsrs-registry" }
-skillsrs-index = { version = "0.1.6", path = "crates/skillsrs-index" }
-skillsrs-upstream = { version = "0.1.6", path = "crates/skillsrs-upstream" }
-skillsrs-skillstore = { version = "0.1.6", path = "crates/skillsrs-skillstore" }
-skillsrs-runtime = { version = "0.1.6", path = "crates/skillsrs-runtime" }
-skillsrs-policy = { version = "0.1.6", path = "crates/skillsrs-policy" }
-skillsrs-mcp = { version = "0.1.6", path = "crates/skillsrs-mcp" }
+[lib]
+name = "skillsrs"
+path = "src/lib.rs"
 
-# MCP SDK (official Rust implementation)
-rmcp = { version = "0.14.0", features = ["server"] }
+[[bin]]
+name = "skills"
+path = "src/main.rs"
+
+[dependencies]
+# MCP SDK
+rmcp = { version = "0.14.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
 rmcp-macros = "0.14.0"
 
 # Async runtime
@@ -42,36 +32,27 @@ tokio-util = { version = "0.7", features = ["codec"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+schemars = { version = "1.2", features = ["derive"] }
 
 # HTTP
 reqwest = { version = "0.13", features = ["json", "stream"] }
 
-# JSON Schema validation (using schemars which rmcp uses)
-jsonschema = "0.18"
-schemars = { version = "1.2", features = ["derive"] }
-
-# Hashing
-blake3 = "1.5"
-
-# Indexing/Search
-tantivy = "0.25"
-
-# Filesystem watching
-notify = "8.2"
-
 # Error handling
-anyhow = "1.0"
 thiserror = "2.0"
+anyhow = "1.0"
 
 # Logging & tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# CLI
+# CLI framework
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+
+# Hashing
+blake3 = "1.5"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
@@ -83,8 +64,8 @@ futures = "0.3"
 async-trait = "0.1"
 bytes = "1.8"
 
-# WASM runtime (optional for script mode)
-wasmtime = "40.0"
+# Filesystem watching
+notify = "8.2"
 
 # Config
 config = "0.15"
@@ -92,9 +73,24 @@ config = "0.15"
 # System directories
 directories = "6.0"
 
-# Axum for HTTP server
+# Server
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite"] }
+
+# Semver parsing
+semver = "1.0"
+
+# Temp directories for 'skills add' and sync
+tempfile = "3.24"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [profile.release]
 opt-level = 3

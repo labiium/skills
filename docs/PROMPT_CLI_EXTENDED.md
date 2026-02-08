@@ -15,11 +15,10 @@ skills tool <server>/<tool>              # Get schema
 skills tool <server>/<tool> '<json>'     # Execute
 
 # Skill Management
-skills skill list                        # List all skills
-skills skill show <skill-id>             # View skill details
-skills skill content <skill-id>          # Load SKILL.md content
-skills skill create '<json>'             # Create new skill
-skills skill update <skill-id> '<json>'  # Update skill
+skills skill show <skill-id>             # View skill content (SKILL.md)
+skills skill show <skill-id> --file <path>  # View specific file
+skills skill create <name> [options]     # Create new skill
+skills skill edit <skill-id> [options]   # Update skill
 skills skill delete <skill-id>           # Delete skill
 ```
 
@@ -69,21 +68,33 @@ skill-name/
 ### Via CLI
 
 ```bash
-skills skill create '{
-  "name": "skill-name",
-  "version": "1.0.0",
-  "description": "What this skill does",
-  "skill_md": "# Skill Name\n\n## Purpose\n...\n\n## Steps\n1. ...",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "param1": {"type": "string", "description": "..."}
-    },
-    "required": ["param1"]
-  },
-  "uses_tools": ["server/tool1", "server/tool2"],
-  "tags": ["category1", "category2"]
-}'
+# Create from file
+skills skill create skill-name \
+  --description "What this skill does" \
+  --skill-md ./SKILL.md \
+  --uses-tools server/tool1,server/tool2
+
+# Create with inline content
+skills skill create skill-name \
+  --description "Debug Node.js apps" \
+  --content "# Debug App\n\n1. Check logs\n2. Find errors" \
+  --uses-tools filesystem/read_file,grep
+
+# Create from stdin (useful for agents)
+echo "# Skill Name\n\nInstructions..." | skills skill create skill-name --content -
+
+# Or pipe a heredoc
+cat << 'EOF' | skills skill create skill-name --content -
+# Skill Name
+
+## Purpose
+Debug Node.js application issues
+
+## Steps
+1. Check logs
+2. Find error patterns
+3. Trace to source
+EOF
 ```
 
 ### Skill Manifest (skill.json)
@@ -183,7 +194,7 @@ Let me save it as a skill.
 <create skill with the steps you just performed>
 
 Skill "task-name" created. You can run it anytime with:
-  skills skill content task-name
+  skills skill show task-name
 ```
 
 ### Pattern 2: User Requests "Remember This"
@@ -221,7 +232,7 @@ skills grep "*deploy*"
 skills grep "*test*"
 
 # List all skills
-skills skill list
+skills list | grep skill
 
 # Get skill details
 skills skill show deploy-to-staging
@@ -231,7 +242,7 @@ skills skill show deploy-to-staging
 
 ```bash
 # Load skill instructions
-skills skill content deploy-to-staging
+skills skill show deploy-to-staging
 
 # Follow the SKILL.md steps using the tools specified
 ```
@@ -248,11 +259,39 @@ skills skill content deploy-to-staging
 
 Improve skills when you find better approaches:
 
+### Full Content Replacement
 ```bash
-skills skill update deploy-to-staging '{
-  "version": "1.1.0",
-  "skill_md": "# Deploy to Staging\n\n## Purpose\n...(improved steps)..."
-}'
+# Replace from file
+skills skill edit deploy-to-staging \
+  --version "1.1.0" \
+  --skill-md ./updated-SKILL.md
+
+# Replace from inline content
+skills skill edit deploy-to-staging \
+  --content "# Updated Skill\n\nNew instructions..."
+
+# Replace from stdin
+cat ./updated-SKILL.md | skills skill edit deploy-to-staging --content -
+```
+
+### Incremental Edits (sed-like)
+```bash
+# Replace text patterns
+skills skill edit deploy-to-staging \
+  --replace "old server name" --with "new server name"
+
+# Append to end of SKILL.md
+skills skill edit deploy-to-staging \
+  --append "## Troubleshooting\n\nCommon issues and solutions..."
+
+# Prepend to beginning
+skills skill edit deploy-to-staging \
+  --prepend "⚠️ DEPRECATED: Use new-deployment skill instead\n\n"
+
+# Combine operations (applied in order: replace, prepend, append)
+skills skill edit deploy-to-staging \
+  --replace "step 1" --with "step 1 (updated)" \
+  --append "## Notes\n\nAdditional context..."
 ```
 
 Version semantics:
@@ -264,20 +303,24 @@ Version semantics:
 
 ## Bundled Scripts
 
-For complex automation, include executable scripts:
+For complex automation with bundled scripts, create the skill first, then add scripts to the skill directory:
 
 ```bash
-skills skill create '{
-  "name": "analyze-logs",
-  "version": "1.0.0",
-  "description": "Parse and analyze application logs",
-  "skill_md": "# Analyze Logs\n\n...",
-  "bundled_files": [
-    ["analyze.py", "#!/usr/bin/env python3\nimport json\nimport sys\n..."],
-    ["patterns.json", "{\"error_patterns\": [...]}"]
-  ],
-  "uses_tools": []
-}'
+# Create the skill
+skills skill create analyze-logs \
+  --description "Parse and analyze application logs" \
+  --skill-md ./SKILL.md
+
+# Add bundled scripts directly to the skill directory
+cp analyze.py patterns.json ~/.local/share/skills/skills/analyze-logs/
+
+# Or create them inline
+cat > ~/.local/share/skills/skills/analyze-logs/analyze.py << 'EOF'
+#!/usr/bin/env python3
+import json
+import sys
+# Script logic here
+EOF
 ```
 
 Scripts receive input via `SKILL_ARGS_JSON` environment variable.
@@ -334,13 +377,31 @@ skills tool server/tool                  # Schema
 skills tool server/tool '{...}'          # Execute
 
 # Skills - Read
-skills skill list                        # All skills
-skills skill show <id>                   # Metadata
-skills skill content <id>                # SKILL.md
+skills list | grep skill                 # All skills
+skills skill show <id>                   # SKILL.md content
+skills skill show <id> --file <path>     # Specific file
 
-# Skills - Write
-skills skill create '{...}'              # Create
-skills skill update <id> '{...}'         # Update  
+# Skills - Create
+skills skill create <name> \
+  --description "..." \
+  --skill-md ./SKILL.md                  # From file
+skills skill create <name> \
+  --content "# Skill\n\n..."              # Inline
+skills skill create <name> --content -   # From stdin
+
+# Skills - Edit
+skills skill edit <id> \
+  --skill-md ./updated.md                # Replace from file
+skills skill edit <id> \
+  --content "# Updated\n\n..."            # Replace inline
+skills skill edit <id> \
+  --replace "old" --with "new"           # Sed-like replace
+skills skill edit <id> \
+  --append "## Notes..."                 # Append to end
+skills skill edit <id> \
+  --prepend "⚠️ Note..."                 # Prepend to start
+
+# Skills - Delete
 skills skill delete <id>                 # Delete
 ```
 
@@ -371,30 +432,54 @@ When creating:
 
 **Scenario**: You just helped debug a Node.js application by checking logs, finding the error, and fixing it.
 
+First, create a SKILL.md file:
+
+```markdown
+# Debug Node.js Application
+
+## Purpose
+Systematically debug a Node.js application by analyzing logs, identifying error patterns, and tracing to source.
+
+## Inputs
+- `log_path` (optional): Path to log file, defaults to ./logs/app.log
+- `error_pattern` (optional): Specific error to search for
+
+## Steps
+1. **Check recent logs**
+   - Tool: `filesystem/read_file` with `{"path": "<log_path>"}`
+   - Look for ERROR, WARN, stack traces
+
+2. **Identify error pattern**
+   - Search for recurring errors
+   - Note timestamps and frequency
+
+3. **Trace to source**
+   - Tool: `filesystem/read_file` on files mentioned in stack trace
+   - Identify the root cause
+
+4. **Propose fix**
+   - Explain the issue
+   - Suggest code changes
+
+## Tools Used
+- `filesystem/read_file` - Read logs and source files
+- `filesystem/list_directory` - Navigate project structure
+
+## Error Handling
+- If logs not found: Ask user for correct path
+- If error unclear: Suggest enabling debug logging
+
+## Expected Output
+Diagnosis of the error with specific file:line reference and proposed fix.
+```
+
+Then create the skill:
+
 ```bash
-skills skill create '{
-  "name": "debug-node-app",
-  "version": "1.0.0",
-  "description": "Debug Node.js application by analyzing logs and tracing errors",
-  "skill_md": "# Debug Node.js Application\n\n## Purpose\nSystematically debug a Node.js application by analyzing logs, identifying error patterns, and tracing to source.\n\n## Inputs\n- `log_path` (optional): Path to log file, defaults to ./logs/app.log\n- `error_pattern` (optional): Specific error to search for\n\n## Steps\n1. **Check recent logs**\n   - Tool: `filesystem/read_file` with `{\"path\": \"<log_path>\"}`\n   - Look for ERROR, WARN, stack traces\n\n2. **Identify error pattern**\n   - Search for recurring errors\n   - Note timestamps and frequency\n\n3. **Trace to source**\n   - Tool: `filesystem/read_file` on files mentioned in stack trace\n   - Identify the root cause\n\n4. **Propose fix**\n   - Explain the issue\n   - Suggest code changes\n\n## Tools Used\n- `filesystem/read_file` - Read logs and source files\n- `filesystem/list_directory` - Navigate project structure\n\n## Error Handling\n- If logs not found: Ask user for correct path\n- If error unclear: Suggest enabling debug logging\n\n## Expected Output\nDiagnosis of the error with specific file:line reference and proposed fix.",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "log_path": {
-        "type": "string",
-        "description": "Path to application log file",
-        "default": "./logs/app.log"
-      },
-      "error_pattern": {
-        "type": "string",
-        "description": "Specific error message to search for"
-      }
-    }
-  },
-  "uses_tools": ["filesystem/read_file", "filesystem/list_directory"],
-  "tags": ["debug", "nodejs", "logs"],
-  "risk_tier": "read_only"
-}'
+skills skill create debug-node-app \
+  --description "Debug Node.js application by analyzing logs and tracing errors" \
+  --skill-md ./debug-node-app-SKILL.md \
+  --uses-tools filesystem/read_file,filesystem/list_directory
 ```
 
 ---
