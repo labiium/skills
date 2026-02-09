@@ -89,9 +89,18 @@ This creates a `.skills/` folder containing:
 
 ---
 
-## Part 3: Adding Your First MCP Server
+## Part 3: Adding MCP Servers (External Tools)
 
 Let's connect to a real tool server. We'll use the official filesystem server, which lets your AI read and write files.
+
+> **What is an MCP Server?** A Model Context Protocol (MCP) server is a program that exposes tools your AI can use — like reading files, searching the web, or accessing databases. In skills.rs, we call these **"upstreams"** because your skills connect to them for capabilities.
+>
+> **What is an upstream?** Think of "upstreams" as external tool providers you plug into skills.rs. Each upstream is an MCP server that skills.rs connects to and aggregates. Your skills can then request permission to use tools from these upstreams.
+
+**Finding MCP Servers:**
+- Browse [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) for community servers
+- Search npm for `@modelcontextprotocol/server-*` (official servers)
+- Many AI tools and services now expose MCP endpoints
 
 ### Step 1: Edit your config
 
@@ -123,6 +132,21 @@ upstreams:
 
 > **Note:** You'll need Node.js installed for this to work. The `npx` command downloads and runs the filesystem server automatically.
 
+### Step 1b: Understanding the config
+
+Let's break down what each field means in the upstream config:
+
+```yaml
+upstreams:
+  - alias: filesystem          # A short name you choose for this server
+    transport: stdio           # How skills.rs talks to the server (stdio = standard input/output)
+    command: ["npx", ...]      # The command to start the MCP server
+```
+
+- **`alias`**: A friendly name you pick. This becomes the prefix for tools (e.g., `filesystem/read_file`).
+- **`transport`**: Usually `stdio` for local servers. Can also be `sse` for servers running over HTTP.
+- **`command`**: The shell command that starts the MCP server. For Node.js servers, we use `npx` to run them without installing.
+
 ### Step 2: Verify it works
 
 List all available tools:
@@ -131,16 +155,23 @@ List all available tools:
 skills list
 ```
 
-You should see something like:
+**Expected output:**
 
 ```
-filesystem/read_file
-filesystem/write_file
-filesystem/list_directory
+filesystem/read_file      Read complete contents of a file
+filesystem/write_file     Create a new file or overwrite existing
+filesystem/list_directory List files and directories in a folder
+filesystem/search_files   Recursively search for files
 ...
 ```
 
-Congratulations! Your AI now has access to file operations.
+If you see tools prefixed with `filesystem/`, congratulations! Your AI now has access to file operations.
+
+> **Troubleshooting:** If you see "connection refused" or no tools appear:
+> - Make sure Node.js is installed (`node --version`)
+> - Try running the command manually: `npx -y @modelcontextprotocol/server-filesystem .`
+> - Check the server starts without errors
+> - Run with debug logging: `RUST_LOG=debug skills list`
 
 ### Step 3: Try a tool manually
 
@@ -151,6 +182,73 @@ skills tool filesystem/read_file '{"path": "./README.md"}'
 ```
 
 If you have a README.md file, you'll see its contents printed.
+
+> **Tip:** Want to see what arguments a tool needs? Run `skills tool filesystem/read_file` (without the JSON) to see the schema.
+
+### Connecting MCP Tools to Skills
+
+Here's the important part: **MCP servers provide tools, and skills use those tools.**
+
+When you create a skill, you tell it which upstream tools it's allowed to use via the `tool_policy.allow` field in `skill.json`.
+
+**Example from Part 6 (Word Counter skill):**
+
+```json
+{
+  "id": "word-counter",
+  "tool_policy": {
+    "allow": ["filesystem/read_file"],
+    "deny": [],
+    "required": ["filesystem/read_file"]
+  }
+}
+```
+
+This skill is asking permission to use the `filesystem/read_file` tool from our `filesystem` upstream. The connection chain is:
+
+```
+MCP Server (filesystem) → Upstream → Tools (filesystem/read_file) → Skill (word-counter)
+```
+
+When you write a skill that needs to read files, you reference the tool as `filesystem/read_file` in both:
+- The `tool_policy.allow` array in `skill.json`
+- The instructions in `SKILL.md` (e.g., "Read the file using `filesystem/read_file`")
+
+### Common MCP Servers
+
+Here are some popular MCP servers you can add:
+
+**Filesystem** (the one we just set up):
+```yaml
+upstreams:
+  - alias: filesystem
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+```
+
+**Brave Search** (web search):
+```yaml
+upstreams:
+  - alias: brave-search
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
+    env:
+      BRAVE_API_KEY: "your-api-key-here"
+```
+> Requires a [Brave Search API key](https://brave.com/search/api/)
+
+**GitHub** (repository access):
+```yaml
+upstreams:
+  - alias: github
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "your-token-here"
+```
+> Requires a [GitHub Personal Access Token](https://github.com/settings/tokens)
+
+**More servers:** Check the [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) repository for databases, APIs, cloud services, and more!
 
 ---
 

@@ -110,6 +110,7 @@ use_global:
   enabled: false
 
 upstreams: []
+  # ^ Add MCP servers here (see "Adding MCP Servers" section above)
 ```
 
 To disable sandboxing entirely:
@@ -175,6 +176,65 @@ skills server  # stdio is the default mode
 ```bash
 skills server http --bind 127.0.0.1:8000
 ```
+
+---
+
+## 🔌 Adding MCP Servers (Tools)
+
+MCP servers provide tools that skills.rs can aggregate and make available through its unified interface. In the configuration, MCP servers are defined under the `upstreams` key.
+
+### Quick Example: Add Filesystem MCP
+
+Add this to your `.skills/config.yaml`:
+
+```yaml
+upstreams:
+  - alias: filesystem
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+```
+
+Then verify it's working:
+
+```bash
+# List all available tools from all MCP servers
+skills list
+
+# You should see filesystem tools like:
+# - filesystem/read_file
+# - filesystem/write_file
+# - filesystem/list_directory
+```
+
+### Key Points
+
+- **`upstreams`** is the configuration key for MCP servers
+- Each upstream needs an **`alias`** (how you'll reference it) and a **`command`** to start the server
+- **`transport: stdio`** is the most common transport (others: `sse`, `websocket`)
+- Multiple MCP servers can be added to the same `upstreams` list
+
+### Adding Multiple MCP Servers
+
+```yaml
+upstreams:
+  - alias: filesystem
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+  
+  - alias: brave-search
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
+    env:
+      BRAVE_API_KEY: "${BRAVE_API_KEY}"
+  
+  - alias: fetch
+    transport: stdio
+    command: ["uvx", "mcp-server-fetch"]
+```
+
+For detailed MCP configuration options (environment variables, SSE transport, health checks), see [OPERATIONS.md](./OPERATIONS.md).
+
+For a step-by-step tutorial, see [TUTORIAL.md](./TUTORIAL.md).
 
 ---
 
@@ -815,8 +875,10 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
 - **[PROMPT_MCP.md](./PROMPT_MCP.md)** - System prompt for AI agents using skills.rs as MCP server (~390 Tokens but may not be necessary)
 
 ### Guides
-- **[QUICKSTART.md](./QUICKSTART.md)** - Step-by-step getting started guide
+- **[TUTORIAL.md](./TUTORIAL.md)** - Step-by-step tutorial for getting started with skills.rs and MCP servers
+- **[QUICKSTART.md](./QUICKSTART.md)** - Quick getting started guide
 - **[OPERATIONS.md](./OPERATIONS.md)** - Complete operations guide (deployment, configuration, CLI usage)
+- **[MCP_GUIDE.md](./MCP_GUIDE.md)** - Detailed guide for configuring and using MCP servers
 - **[CHANGELOG.md](./CHANGELOG.md)** - Version history and changes
 - **[config.example.yaml](docs/config.example.yaml)** - Full configuration reference
 
@@ -861,23 +923,7 @@ Contributions welcome! Please:
 
 ## 📜 License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE](LICENSE))
-
-at your option.
-
----
-
-## 🎉 Status
-
-✅ **Production Ready**  
-✅ **30 Tests Passing**  
-✅ **Zero Known Blockers**  
-✅ **Comprehensive Documentation**  
-✅ **Security Hardened**
-
-**Ready for deployment.**
+Apache License, Version 2.0 ([LICENSE](LICENSE))
 
 ---
 

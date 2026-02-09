@@ -205,6 +205,71 @@ policy:
     - filesystem
 ```
 
+### MCP Server Configuration (Quick Reference)
+
+In Skills.rs, **upstreams** are MCP servers that provide tools to your application.
+
+#### Common MCP Server Patterns
+
+| Server Type | Transport | Example |
+|-------------|-----------|---------|
+| npm-based | stdio | filesystem, brave-search |
+| Local binary | stdio | custom tools |
+| Remote API | http | GitHub, custom APIs |
+
+#### Configuration Examples
+
+**npm-based MCP server (stdio):**
+```yaml
+upstreams:
+  - alias: filesystem
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+```
+
+**Local binary (stdio):**
+```yaml
+upstreams:
+  - alias: custom-tool
+    transport: stdio
+    command: ["/usr/local/bin/my-mcp-server"]
+```
+
+**HTTP with bearer token authentication:**
+```yaml
+upstreams:
+  - alias: github
+    transport: http
+    url: "https://api.github.com/mcp"
+    auth:
+      type: bearer
+      env: GITHUB_TOKEN
+```
+
+**HTTP with header authentication:**
+```yaml
+upstreams:
+  - alias: api-service
+    transport: http
+    url: "https://api.example.com/mcp"
+    auth:
+      type: header
+      header_name: X-API-Key
+      env: API_KEY
+```
+
+#### Security Note
+
+Configure per-server sandboxing for untrusted servers. See [Sandboxing and Security](#sandboxing-and-security) for details on:
+- Timeout limits
+- Memory restrictions
+- Network access control
+- Filesystem isolation
+
+#### Complete Reference
+
+For detailed configuration options, authentication methods, and advanced settings, see [MCP_GUIDE.md](MCP_GUIDE.md).
+
 ### Full Configuration Reference
 
 See [config.example.yaml](config.example.yaml) for all available options.
