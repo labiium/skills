@@ -9,15 +9,15 @@
 pub mod sandbox;
 pub mod upstream;
 
-use crate::core::{BundledTool, CallableId, CallableKind, ToolResult, ToolResultContent};
 use crate::core::registry::Registry;
+use crate::core::{BundledTool, CallableId, CallableKind, ToolResult, ToolResultContent};
 use serde::{Deserialize, Serialize};
-use upstream::UpstreamManager;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
+use upstream::UpstreamManager;
 use uuid::Uuid;
 
 #[derive(Error, Debug)]
@@ -587,5 +587,3 @@ impl WorkflowEngine {
         })
     }
 }
-
-

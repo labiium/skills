@@ -30,8 +30,8 @@ pub use storage::search::{
     IndexError, SearchEngine, SearchFilters, SearchMatch, SearchQuery, SearchResults,
 };
 pub use storage::{
-    agent_skills, sync, CreateSkillRequest, EntrypointType, Skill, SkillContent,
-    SkillHints, SkillManifest, SkillStore, SkillStoreError, ToolPolicy, ValidationResult,
+    agent_skills, sync, CreateSkillRequest, EntrypointType, Skill, SkillContent, SkillHints,
+    SkillManifest, SkillStore, SkillStoreError, ToolPolicy, ValidationResult,
 };
 
 // Re-export common dependencies that users might need

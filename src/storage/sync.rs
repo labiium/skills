@@ -258,9 +258,7 @@ impl AgentSkillsSync {
             let skill_name = skill_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Invalid skill name".to_string())
-                })?;
+                .ok_or_else(|| anyhow::anyhow!("Invalid skill name".to_string()))?;
 
             // Parse and validate the skill
             match AgentSkill::from_directory(skill_path).await {

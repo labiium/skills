@@ -2,10 +2,10 @@
 
 use skillsrs::core::registry::Registry;
 use skillsrs::core::{CallableKind, RiskTier};
+use skillsrs::storage::search::{SearchEngine, SearchQuery};
 use skillsrs::storage::{
     CreateSkillRequest, EntrypointType, SkillHints, SkillManifest, SkillStore, ToolPolicy,
 };
-use skillsrs::storage::search::{SearchEngine, SearchQuery};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -295,51 +295,55 @@ async fn test_search_with_filters() {
     let tool_id = skillsrs::core::CallableId::tool("server1", "tool1", digest.as_str());
     let skill_id = skillsrs::core::CallableId::skill("skill1", "1.0.0");
 
-    registry.register(skillsrs::core::CallableRecord {
-        id: tool_id,
-        kind: skillsrs::core::CallableKind::Tool,
-        fq_name: "server1.tool1".to_string(),
-        name: "tool1".to_string(),
-        title: Some("Tool One".to_string()),
-        description: Some("A test tool".to_string()),
-        tags: vec!["test".to_string()],
-        input_schema: schema.clone(),
-        output_schema: None,
-        schema_digest: digest.clone(),
-        server_alias: Some("server1".to_string()),
-        upstream_tool_name: Some("tool1".to_string()),
-        skill_version: None,
-        uses: vec![],
-        skill_directory: None,
-        bundled_tools: vec![],
-        additional_files: vec![],
-        cost_hints: skillsrs::core::CostHints::default(),
-        risk_tier: skillsrs::core::RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
-    }).unwrap();
+    registry
+        .register(skillsrs::core::CallableRecord {
+            id: tool_id,
+            kind: skillsrs::core::CallableKind::Tool,
+            fq_name: "server1.tool1".to_string(),
+            name: "tool1".to_string(),
+            title: Some("Tool One".to_string()),
+            description: Some("A test tool".to_string()),
+            tags: vec!["test".to_string()],
+            input_schema: schema.clone(),
+            output_schema: None,
+            schema_digest: digest.clone(),
+            server_alias: Some("server1".to_string()),
+            upstream_tool_name: Some("tool1".to_string()),
+            skill_version: None,
+            uses: vec![],
+            skill_directory: None,
+            bundled_tools: vec![],
+            additional_files: vec![],
+            cost_hints: skillsrs::core::CostHints::default(),
+            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+        })
+        .unwrap();
 
-    registry.register(skillsrs::core::CallableRecord {
-        id: skill_id,
-        kind: skillsrs::core::CallableKind::Skill,
-        fq_name: "skill.skill1".to_string(),
-        name: "skill1".to_string(),
-        title: Some("Skill One".to_string()),
-        description: Some("A test skill".to_string()),
-        tags: vec!["skill".to_string()],
-        input_schema: schema,
-        output_schema: None,
-        schema_digest: digest,
-        server_alias: None,
-        upstream_tool_name: None,
-        skill_version: Some("1.0.0".to_string()),
-        uses: vec![],
-        skill_directory: None,
-        bundled_tools: vec![],
-        additional_files: vec![],
-        cost_hints: skillsrs::core::CostHints::default(),
-        risk_tier: skillsrs::core::RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
-    }).unwrap();
+    registry
+        .register(skillsrs::core::CallableRecord {
+            id: skill_id,
+            kind: skillsrs::core::CallableKind::Skill,
+            fq_name: "skill.skill1".to_string(),
+            name: "skill1".to_string(),
+            title: Some("Skill One".to_string()),
+            description: Some("A test skill".to_string()),
+            tags: vec!["skill".to_string()],
+            input_schema: schema,
+            output_schema: None,
+            schema_digest: digest,
+            server_alias: None,
+            upstream_tool_name: None,
+            skill_version: Some("1.0.0".to_string()),
+            uses: vec![],
+            skill_directory: None,
+            bundled_tools: vec![],
+            additional_files: vec![],
+            cost_hints: skillsrs::core::CostHints::default(),
+            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+        })
+        .unwrap();
 
     search_engine.rebuild();
 

@@ -198,7 +198,7 @@ impl Sandbox {
     }
 
     /// Execute with restricted environment
-    /// 
+    ///
     /// Creates a sandboxed environment with:
     /// - Resource limits (CPU, memory, file descriptors)
     /// - Clean environment (no inherited env vars except PATH)
@@ -212,30 +212,39 @@ impl Sandbox {
         _env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
         use std::collections::HashSet;
-        
+
         // Create temp sandbox directory
         let sandbox_dir = tempfile::tempdir()
             .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create sandbox: {}", e)))?;
-        
+
         // Copy allowed read files into sandbox
         for allowed_path in &self.config.allow_read {
             if allowed_path.exists() {
-                let file_name = allowed_path.file_name()
-                    .ok_or_else(|| SandboxError::InvalidConfig(format!("Invalid path: {:?}", allowed_path)))?;
+                let file_name = allowed_path.file_name().ok_or_else(|| {
+                    SandboxError::InvalidConfig(format!("Invalid path: {:?}", allowed_path))
+                })?;
                 let dest = sandbox_dir.path().join(file_name);
-                
+
                 if allowed_path.is_file() {
                     if let Err(e) = std::fs::copy(allowed_path, &dest) {
-                        warn!("Failed to copy {} to sandbox: {}", allowed_path.display(), e);
+                        warn!(
+                            "Failed to copy {} to sandbox: {}",
+                            allowed_path.display(),
+                            e
+                        );
                     }
                 } else if allowed_path.is_dir() {
                     if let Err(e) = Self::copy_dir_recursive(allowed_path, &dest) {
-                        warn!("Failed to copy dir {} to sandbox: {}", allowed_path.display(), e);
+                        warn!(
+                            "Failed to copy dir {} to sandbox: {}",
+                            allowed_path.display(),
+                            e
+                        );
                     }
                 }
             }
         }
-        
+
         // On Unix, we can use ulimit-style restrictions
         #[cfg(unix)]
         {
@@ -248,26 +257,26 @@ impl Sandbox {
             // Build minimal environment
             let mut allowed_env = HashSet::new();
             allowed_env.insert("PATH");
-            
+
             // Add user-specified env vars
             for (key, value) in _env_vars {
                 cmd.env(key, value);
                 allowed_env.insert(key.as_str());
             }
-            
+
             // Clear all environment except allowed vars
             cmd.env_clear();
-            
+
             // Restore minimal safe environment
             if let Ok(path) = std::env::var("PATH") {
                 cmd.env("PATH", path);
             }
-            
+
             // Re-add user-specified env vars
             for (key, value) in _env_vars {
                 cmd.env(key, value);
             }
-            
+
             // Block network if not allowed (basic approach via env)
             if !self.config.allow_network {
                 cmd.env("HTTP_PROXY", "http://127.0.0.1:0");
@@ -348,7 +357,7 @@ impl Sandbox {
                 .await
         }
     }
-    
+
     /// Recursively copy directory
     fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dst)?;
@@ -356,7 +365,7 @@ impl Sandbox {
             let entry = entry?;
             let path = entry.path();
             let dest_path = dst.join(entry.file_name());
-            
+
             if path.is_dir() {
                 Self::copy_dir_recursive(&path, &dest_path)?;
             } else {
@@ -492,5 +501,3 @@ impl Sandbox {
             .unwrap_or(false)
     }
 }
-
-

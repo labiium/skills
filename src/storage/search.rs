@@ -6,12 +6,12 @@
 //! - Filters (kind, server, tags, requires)
 //! - Pagination support
 
+use crate::core::registry::Registry;
+use crate::core::{CallableId, CallableKind, CallableRecord, RiskTier};
 use parking_lot::RwLock;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use crate::core::{CallableId, CallableKind, CallableRecord, RiskTier};
-use crate::core::registry::Registry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;

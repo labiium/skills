@@ -6,7 +6,9 @@
 //! - Execution history
 //! - Server state
 
-use crate::core::{CallableId, CallableKind, CallableRecord, CoreError, CostHints, RiskTier, SchemaDigest};
+use crate::core::{
+    CallableId, CallableKind, CallableRecord, CoreError, CostHints, RiskTier, SchemaDigest,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -558,5 +560,3 @@ pub struct PersistenceStats {
     pub total_skills: usize,
     pub total_executions: usize,
 }
-
-

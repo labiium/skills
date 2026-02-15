@@ -10,8 +10,8 @@
 //! - Policy engine for access control
 
 pub mod persistence;
-pub mod registry;
 pub mod policy;
+pub mod registry;
 
 use blake3::Hash;
 use chrono::{DateTime, Utc};

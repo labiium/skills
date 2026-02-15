@@ -1,9 +1,7 @@
 //! Tests for execution module: runtime, sandbox, upstream
 
-use skillsrs::core::{
-    CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest,
-};
 use skillsrs::core::registry::Registry;
+use skillsrs::core::{CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest};
 use skillsrs::execution::upstream::{Transport, UpstreamConfig, UpstreamManager};
 use skillsrs::execution::{
     sandbox::{Sandbox, SandboxBackend, SandboxConfig},
@@ -94,7 +92,12 @@ async fn test_sandbox_basic() {
 
     // Test a simple command
     let result = sandbox
-        .execute("echo", &["hello".to_string()], std::path::Path::new("."), &[])
+        .execute(
+            "echo",
+            &["hello".to_string()],
+            std::path::Path::new("."),
+            &[],
+        )
         .await;
 
     assert!(result.is_ok());
@@ -108,10 +111,7 @@ async fn test_sandbox_env_vars() {
     let config = SandboxConfig::default();
     let sandbox = Sandbox::new(config);
 
-    let env_vars = vec![(
-        "TEST_VAR".to_string(),
-        "test_value".to_string(),
-    )];
+    let env_vars = vec![("TEST_VAR".to_string(), "test_value".to_string())];
 
     let result = sandbox
         .execute("env", &[], std::path::Path::new("."), &env_vars)

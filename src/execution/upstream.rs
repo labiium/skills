@@ -6,10 +6,10 @@
 //!
 //! Handles lifecycle, health monitoring, and automatic reconnection.
 
+use crate::core::registry::{Registry, ServerHealth, ServerInfo};
 use crate::core::{
     CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest, ToolDefinition,
 };
-use crate::core::registry::{Registry, ServerHealth, ServerInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -923,5 +923,3 @@ impl UpstreamManager {
         }
     }
 }
-
-

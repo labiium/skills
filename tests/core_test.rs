@@ -1,11 +1,9 @@
 //! Tests for core module: types, registry, policy, and persistence
 
-use skillsrs::core::{
-    CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest,
-};
+use skillsrs::core::persistence::PersistenceLayer;
 use skillsrs::core::policy::{ConsentLevel, PolicyConfig, PolicyEngine};
 use skillsrs::core::registry::{Registry, ServerHealth, ServerInfo};
-use skillsrs::core::persistence::PersistenceLayer;
+use skillsrs::core::{CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest};
 use tempfile::NamedTempFile;
 
 #[test]
@@ -41,7 +39,10 @@ fn test_risk_tier_requires_consent() {
 fn test_risk_tier_from_str() {
     assert_eq!("read_only".parse::<RiskTier>().unwrap(), RiskTier::ReadOnly);
     assert_eq!("writes".parse::<RiskTier>().unwrap(), RiskTier::Writes);
-    assert_eq!("destructive".parse::<RiskTier>().unwrap(), RiskTier::Destructive);
+    assert_eq!(
+        "destructive".parse::<RiskTier>().unwrap(),
+        RiskTier::Destructive
+    );
     assert_eq!("admin".parse::<RiskTier>().unwrap(), RiskTier::Admin);
     assert_eq!("unknown".parse::<RiskTier>().unwrap(), RiskTier::Unknown);
     assert!("invalid".parse::<RiskTier>().is_err());
@@ -134,7 +135,10 @@ async fn test_policy_engine_allow_readonly() {
     let engine = PolicyEngine::new(config).unwrap();
 
     let record = create_test_tool_record("readonly-tool", "server1");
-    let result = engine.authorize(&record, &serde_json::json!({}), ConsentLevel::None).await.unwrap();
+    let result = engine
+        .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
+        .await
+        .unwrap();
 
     assert!(result.allowed);
 }
@@ -150,7 +154,10 @@ async fn test_policy_engine_deny_by_tag() {
     let mut record = create_test_tool_record("dangerous-tool", "server1");
     record.tags = vec!["dangerous".to_string()];
 
-    let result = engine.authorize(&record, &serde_json::json!({}), ConsentLevel::None).await.unwrap();
+    let result = engine
+        .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
+        .await
+        .unwrap();
 
     assert!(!result.allowed);
     assert!(result.reason.contains("denied tag"));
@@ -165,12 +172,18 @@ async fn test_policy_engine_require_consent_for_writes() {
     record.risk_tier = RiskTier::Writes;
 
     // Without consent, should be denied
-    let result = engine.authorize(&record, &serde_json::json!({}), ConsentLevel::None).await.unwrap();
+    let result = engine
+        .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
+        .await
+        .unwrap();
     assert!(!result.allowed);
     assert!(result.required_consent.is_some());
 
     // With user consent, should be allowed
-    let result = engine.authorize(&record, &serde_json::json!({}), ConsentLevel::UserConfirmed).await.unwrap();
+    let result = engine
+        .authorize(&record, &serde_json::json!({}), ConsentLevel::UserConfirmed)
+        .await
+        .unwrap();
     assert!(result.allowed);
 }
 

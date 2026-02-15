@@ -13,13 +13,13 @@
 //! Supports filesystem watching for hot-reload during development.
 
 pub mod agent_skills;
-pub mod sync;
 pub mod search;
+pub mod sync;
 
+use crate::core::registry::Registry;
 use crate::core::{
     BundledTool, CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest,
 };
-use crate::core::registry::Registry;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -337,7 +337,7 @@ impl SkillStore {
     }
 
     /// Load a specific file from a skill directory
-    /// 
+    ///
     /// Allows accessing files in subdirectories (e.g., "references/guide.md")
     /// while preventing path traversal attacks.
     pub fn load_skill_file(&self, skill_id: &str, filename: &str) -> Result<String> {
@@ -927,8 +927,7 @@ impl SkillStore {
         }
 
         // Validate hints
-        if skill.manifest.hints.expected_calls.is_some() {
-            let calls = skill.manifest.hints.expected_calls.unwrap();
+        if let Some(calls) = skill.manifest.hints.expected_calls {
             if calls == 0 {
                 result.add_warning("Expected calls is 0".to_string());
             } else if calls > 100 {
@@ -1058,5 +1057,3 @@ impl SkillStore {
         Ok(vec![]) // No cycle found
     }
 }
-
-

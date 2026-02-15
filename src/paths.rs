@@ -221,5 +221,3 @@ pub fn paths_from_env() -> PathsConfig {
         logs_dir: std::env::var("SKILLS_LOGS_DIR").ok().map(PathBuf::from),
     }
 }
-
-

@@ -8,6 +8,10 @@
 
 mod paths;
 
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use paths::{paths_from_env, PathsConfig, SkillsPaths};
+use rmcp::{transport::stdio, ServiceExt};
 use skillsrs::core::policy::{PolicyConfig, PolicyEngine};
 use skillsrs::core::registry::Registry;
 use skillsrs::execution::upstream::UpstreamManager;
@@ -15,10 +19,6 @@ use skillsrs::execution::{sandbox::SandboxBackend, sandbox::SandboxConfig, Runti
 use skillsrs::mcp::SkillsServer;
 use skillsrs::storage::search::SearchEngine;
 use skillsrs::storage::SkillStore;
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-use paths::{paths_from_env, PathsConfig, SkillsPaths};
-use rmcp::{transport::stdio, ServiceExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -1743,7 +1743,10 @@ agent_skills_repos:
         }
 
         Commands::Skill(skill_cmd) => {
-            let skill_store = Arc::new(SkillStore::new(&paths.skills_root, Arc::new(Registry::new()))?);
+            let skill_store = Arc::new(SkillStore::new(
+                &paths.skills_root,
+                Arc::new(Registry::new()),
+            )?);
 
             match skill_cmd {
                 SkillCommands::Create {
@@ -1822,7 +1825,7 @@ agent_skills_repos:
 
                     // Load existing skill content
                     let current_content = skill_store.load_skill_content(&skill_name).ok();
-                    
+
                     // Determine new SKILL.md content
                     let skill_md_content = if let Some(content_str) = content {
                         // Inline content provided
@@ -1842,22 +1845,22 @@ agent_skills_repos:
                     } else if let Some(current) = current_content.as_ref() {
                         // Start with existing content for modifications
                         let mut md = current.skill_md.clone();
-                        
+
                         // Apply sed-like replace
                         if let (Some(pattern), Some(replacement)) = (&replace, &replace_with) {
                             md = md.replace(pattern, replacement);
                         }
-                        
+
                         // Apply prepend
                         if let Some(prefix) = prepend {
                             md = format!("{}\n{}", prefix, md);
                         }
-                        
+
                         // Apply append
                         if let Some(suffix) = append {
                             md = format!("{}\n{}", md, suffix);
                         }
-                        
+
                         md
                     } else {
                         return Err(anyhow::anyhow!("No SKILL.md content provided and skill not found. Use --content or --skill-md"));
@@ -1867,7 +1870,8 @@ agent_skills_repos:
                     let request = skillsrs::storage::CreateSkillRequest {
                         name: name.unwrap_or_else(|| skill_name.clone()),
                         version: version.unwrap_or_else(|| "1.0.0".to_string()),
-                        description: description.unwrap_or_else(|| format!("Skill: {}", skill_name)),
+                        description: description
+                            .unwrap_or_else(|| format!("Skill: {}", skill_name)),
                         skill_md_content,
                         uses_tools,
                         bundled_files: vec![],
@@ -1880,7 +1884,10 @@ agent_skills_repos:
 
                 SkillCommands::Delete { skill_id, force } => {
                     if !force {
-                        println!("Are you sure you want to delete skill '{}'? [y/N]", skill_id);
+                        println!(
+                            "Are you sure you want to delete skill '{}'? [y/N]",
+                            skill_id
+                        );
                         use std::io::Read;
                         let mut buffer = [0u8; 1];
                         std::io::stdin().read_exact(&mut buffer).ok();
@@ -1927,8 +1934,19 @@ agent_skills_repos:
                         println!("\n---\n");
                         println!("## Metadata");
                         println!("- Uses tools: {}", content.uses_tools.join(", "));
-                        println!("- Bundled tools: {}", content.bundled_tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(", "));
-                        println!("- Additional files: {}", content.additional_files.join(", "));
+                        println!(
+                            "- Bundled tools: {}",
+                            content
+                                .bundled_tools
+                                .iter()
+                                .map(|t| t.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        println!(
+                            "- Additional files: {}",
+                            content.additional_files.join(", ")
+                        );
                     }
                 }
             }

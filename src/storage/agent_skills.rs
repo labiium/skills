@@ -368,8 +368,8 @@ impl AgentSkill {
 
     /// Convert Agent Skill to SkillContent for progressive disclosure
     pub async fn to_skill_content(&self) -> crate::SkillContent {
-        use crate::SkillContent;
         use crate::core::BundledTool;
+        use crate::SkillContent;
 
         let mut bundled_tools = Vec::new();
         let mut additional_files = Vec::new();
@@ -432,5 +432,3 @@ impl AgentSkill {
 pub fn parse_frontmatter_public(content: &str) -> Result<(AgentSkillsFrontmatter, String)> {
     AgentSkill::parse_frontmatter(content)
 }
-
-

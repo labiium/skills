@@ -14,17 +14,19 @@
 //! - 1 management tool (manage) for skill lifecycle, keeping the context minimal while enabling full CRUD
 //! - This balance achieves "Infinite Skills. Finite Context." - agents can manage skills without tool bloat
 
-use rmcp::{
-    handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, Json, ServerHandler,
-};
-use crate::core::{CallableId, ToolResult};
 use crate::core::policy::{ConsentLevel, PolicyEngine};
 use crate::core::registry::Registry;
+use crate::core::{CallableId, ToolResult};
 use crate::execution::{ExecContext, Runtime};
 use crate::storage::search::{SearchEngine, SearchFilters, SearchQuery};
 use crate::storage::{CreateSkillRequest, SkillStore};
+use rmcp::{
+    handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    service::RequestContext,
+    tool, tool_router, Json, RoleServer, ServerHandler,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -346,17 +348,17 @@ impl SkillsServer {
     )]
     async fn search(
         &self,
-        input: rmcp::handler::server::wrapper::Parameters<SearchInput>,
+        Parameters(input): Parameters<SearchInput>,
     ) -> Result<Json<SearchOutput>, String> {
-        debug!("search called with query: {}", input.0.q);
+        debug!("search called with query: {}", input.q);
 
         let query = SearchQuery {
-            q: input.0.q,
-            kind: input.0.kind,
-            mode: input.0.mode,
-            limit: input.0.limit.clamp(1, 50),
-            filters: input.0.filters,
-            cursor: input.0.cursor,
+            q: input.q,
+            kind: input.kind,
+            mode: input.mode,
+            limit: input.limit.clamp(1, 50),
+            filters: input.filters,
+            cursor: input.cursor,
         };
 
         let results = self
@@ -396,18 +398,18 @@ impl SkillsServer {
     )]
     async fn schema(
         &self,
-        input: rmcp::handler::server::wrapper::Parameters<SchemaInput>,
+        Parameters(input): Parameters<SchemaInput>,
     ) -> Result<Json<SchemaOutput>, String> {
-        debug!("schema called for: {}", input.0.id);
+        debug!("schema called for: {}", input.id);
 
-        let callable_id: CallableId = input.0.id.into();
+        let callable_id: CallableId = input.id.into();
         let record = self
             .registry
             .get(&callable_id)
             .ok_or_else(|| format!("Callable not found: {}", callable_id))?;
 
-        let format = input.0.format.as_str();
-        let max_bytes = input.0.max_bytes;
+        let format = input.format.as_str();
+        let max_bytes = input.max_bytes;
 
         let mut output = SchemaOutput {
             callable: CallableInfo {
@@ -428,7 +430,7 @@ impl SkillsServer {
             let mut schema = record.input_schema.clone();
 
             // Apply JSON pointer if specified
-            if let Some(pointer) = input.0.json_pointer {
+            if let Some(pointer) = input.json_pointer {
                 if let Some(subtree) = schema.pointer(&pointer) {
                     schema = subtree.clone();
                 } else {
@@ -438,7 +440,7 @@ impl SkillsServer {
 
             output.input_schema = Some(schema);
 
-            if input.0.include_output_schema {
+            if input.include_output_schema {
                 output.output_schema = record.output_schema.clone();
             }
         }
@@ -468,14 +470,11 @@ impl SkillsServer {
         name = "exec",
         description = "Execute a callable with validation and policy enforcement. Always search and get schema first."
     )]
-    async fn exec(
-        &self,
-        input: rmcp::handler::server::wrapper::Parameters<ExecInput>,
-    ) -> Result<String, String> {
-        debug!("exec called for: {}", input.0.id);
+    async fn exec(&self, Parameters(input): Parameters<ExecInput>) -> Result<String, String> {
+        debug!("exec called for: {}", input.id);
 
-        let callable_id: CallableId = input.0.id.into();
-        let dry_run = input.0.dry_run;
+        let callable_id: CallableId = input.id.into();
+        let dry_run = input.dry_run;
 
         // Get callable record
         let record = self
@@ -485,7 +484,6 @@ impl SkillsServer {
 
         // Parse consent level
         let consent_level = input
-            .0
             .consent
             .as_ref()
             .and_then(|c| c.level.as_deref())
@@ -499,7 +497,7 @@ impl SkillsServer {
         // Check policy authorization
         let policy_result = self
             .policy_engine
-            .authorize(&record, &input.0.arguments, consent_level)
+            .authorize(&record, &input.arguments, consent_level)
             .await
             .map_err(|e| format!("Policy check failed: {}", e))?;
 
@@ -516,10 +514,9 @@ impl SkillsServer {
         // Execute
         let ctx = ExecContext {
             callable_id: callable_id.clone(),
-            arguments: input.0.arguments,
-            timeout_ms: input.0.timeout_ms,
+            arguments: input.arguments,
+            timeout_ms: input.timeout_ms,
             trace_enabled: input
-                .0
                 .trace
                 .as_ref()
                 .map(|t| t.include_route || t.include_timing || t.include_steps)
@@ -534,37 +531,22 @@ impl SkillsServer {
 
         info!("exec completed for {}", record.fq_name);
 
-        // Convert ToolResult to string representation
-        let text = if result.is_error {
-            format!(
-                "Error: {}",
-                result
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        crate::core::ToolResultContent::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        } else {
-            result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    crate::core::ToolResultContent::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        // Convert ToolResult to string representation (content is already JSON from runtime)
+        let text: String = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                crate::core::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         Ok(text)
     }
 
     /// Manage skills lifecycle: create, get, update, delete
-    /// 
+    ///
     /// This single tool consolidates all skill management operations to maintain
     /// the "Finite Context" principle while enabling full CRUD functionality.
     #[tool(
@@ -573,24 +555,28 @@ impl SkillsServer {
     )]
     async fn manage(
         &self,
-        input: rmcp::handler::server::wrapper::Parameters<ManageInput>,
+        Parameters(input): Parameters<ManageInput>,
     ) -> Result<Json<ManageOutput>, String> {
-        debug!("manage called with operation: {:?}", input.0.operation);
+        debug!("manage called with operation: {:?}", input.operation);
 
-        match input.0.operation {
+        match input.operation {
             ManageOperation::Create => {
-                let name = input.0.name.ok_or("name is required for create operation")?;
-                let description = input.0.description.ok_or("description is required for create operation")?;
-                let skill_md = input.0.skill_md.ok_or("skill_md is required for create operation")?;
+                let name = input.name.ok_or("name is required for create operation")?;
+                let description = input
+                    .description
+                    .ok_or("description is required for create operation")?;
+                let skill_md = input
+                    .skill_md
+                    .ok_or("skill_md is required for create operation")?;
 
                 let request = CreateSkillRequest {
                     name: name.clone(),
-                    version: input.0.version.unwrap_or_else(|| "1.0.0".to_string()),
+                    version: input.version.unwrap_or_else(|| "1.0.0".to_string()),
                     description,
                     skill_md_content: skill_md,
-                    uses_tools: input.0.uses_tools.unwrap_or_default(),
-                    bundled_files: input.0.bundled_files.unwrap_or_default(),
-                    tags: input.0.tags.unwrap_or_default(),
+                    uses_tools: input.uses_tools.unwrap_or_default(),
+                    bundled_files: input.bundled_files.unwrap_or_default(),
+                    tags: input.tags.unwrap_or_default(),
                 };
 
                 let id: crate::core::CallableId = self
@@ -611,8 +597,10 @@ impl SkillsServer {
             }
 
             ManageOperation::Get => {
-                let skill_id = input.0.skill_id.ok_or("skill_id is required for get operation")?;
-                
+                let skill_id = input
+                    .skill_id
+                    .ok_or("skill_id is required for get operation")?;
+
                 // Parse skill_id - it might be a full CallableId like "skill:name@version" or just "name"
                 let skill_name = if skill_id.starts_with("skill:") {
                     skill_id
@@ -625,7 +613,7 @@ impl SkillsServer {
                 };
 
                 // If a specific file is requested, return just that file
-                if let Some(filename) = input.0.filename {
+                if let Some(filename) = input.filename {
                     let file_content = self
                         .skill_store
                         .load_skill_file(&skill_name, &filename)
@@ -667,7 +655,7 @@ impl SkillsServer {
                 ));
 
                 info!("Returned content for skill: {}", skill_id);
-                
+
                 Ok(Json(ManageOutput {
                     operation: "get".to_string(),
                     skill_id: Some(skill_id.clone()),
@@ -682,10 +670,16 @@ impl SkillsServer {
             }
 
             ManageOperation::Update => {
-                let skill_id = input.0.skill_id.ok_or("skill_id is required for update operation")?;
-                let name = input.0.name.ok_or("name is required for update operation")?;
-                let description = input.0.description.ok_or("description is required for update operation")?;
-                let skill_md = input.0.skill_md.ok_or("skill_md is required for update operation")?;
+                let skill_id = input
+                    .skill_id
+                    .ok_or("skill_id is required for update operation")?;
+                let name = input.name.ok_or("name is required for update operation")?;
+                let description = input
+                    .description
+                    .ok_or("description is required for update operation")?;
+                let skill_md = input
+                    .skill_md
+                    .ok_or("skill_md is required for update operation")?;
 
                 // Parse skill_id
                 let skill_name = if skill_id.starts_with("skill:") {
@@ -700,12 +694,12 @@ impl SkillsServer {
 
                 let request = CreateSkillRequest {
                     name: name.clone(),
-                    version: input.0.version.unwrap_or_else(|| "1.0.0".to_string()),
+                    version: input.version.unwrap_or_else(|| "1.0.0".to_string()),
                     description,
                     skill_md_content: skill_md,
-                    uses_tools: input.0.uses_tools.unwrap_or_default(),
-                    bundled_files: input.0.bundled_files.unwrap_or_default(),
-                    tags: input.0.tags.unwrap_or_default(),
+                    uses_tools: input.uses_tools.unwrap_or_default(),
+                    bundled_files: input.bundled_files.unwrap_or_default(),
+                    tags: input.tags.unwrap_or_default(),
                 };
 
                 let id: crate::core::CallableId = self
@@ -726,7 +720,9 @@ impl SkillsServer {
             }
 
             ManageOperation::Delete => {
-                let skill_id = input.0.skill_id.ok_or("skill_id is required for delete operation")?;
+                let skill_id = input
+                    .skill_id
+                    .ok_or("skill_id is required for delete operation")?;
 
                 // Parse skill_id
                 let skill_name = if skill_id.starts_with("skill:") {
@@ -744,7 +740,7 @@ impl SkillsServer {
                     .map_err(|e| format!("Failed to delete skill: {}", e))?;
 
                 info!("Deleted skill: {}", skill_id);
-                
+
                 Ok(Json(ManageOutput {
                     operation: "delete".to_string(),
                     skill_id: Some(skill_id.clone()),
@@ -894,11 +890,10 @@ pub struct ManageOutput {
     pub data: Option<JsonValue>,
 }
 
-/// Implement ServerHandler to define server capabilities
-#[tool_handler]
 impl ServerHandler for SkillsServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            protocol_version: Default::default(),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
                 name: "skillsrs".to_string(),
@@ -914,9 +909,38 @@ impl ServerHandler for SkillsServer {
                 (2) schema to get parameters, (3) exec to execute, (4) manage to create/update/delete skills."
                     .to_string(),
             ),
-            ..Default::default()
         }
     }
+
+    async fn initialize(
+        &self,
+        _request: rmcp::model::InitializeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::InitializeResult, rmcp::model::ErrorData> {
+        Ok(self.get_info())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        let tools = self.tool_router.list_all();
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
+        use rmcp::handler::server::tool::ToolCallContext;
+
+        let tool_context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_context).await
+    }
 }
-
-
