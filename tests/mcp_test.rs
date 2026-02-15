@@ -85,6 +85,7 @@ async fn test_search_tool_through_server() {
             cost_hints: skillsrs::core::CostHints::default(),
             risk_tier: skillsrs::core::RiskTier::ReadOnly,
             last_seen: chrono::Utc::now(),
+            sandbox_config: None,
         })
         .unwrap();
 

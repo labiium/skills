@@ -10,6 +10,7 @@ use crate::core::registry::{Registry, ServerHealth, ServerInfo};
 use crate::core::{
     CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest, ToolDefinition,
 };
+use crate::execution::sandbox::SandboxConfigOverride;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -82,6 +83,10 @@ pub struct UpstreamConfig {
     pub roots: Option<Vec<String>>,
 
     pub tags: Vec<String>,
+
+    /// Sandbox configuration override for this upstream server
+    #[serde(default)]
+    pub sandbox_config: Option<SandboxConfigOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +531,7 @@ impl UpstreamManager {
                 cost_hints: CostHints::default(),
                 risk_tier: RiskTier::Unknown,
                 last_seen: chrono::Utc::now(),
+                sandbox_config: None,
             };
 
             self.registry
@@ -865,6 +871,12 @@ impl UpstreamManager {
         response_json
             .result
             .ok_or_else(|| UpstreamError::ProtocolError("No result in response".to_string()))
+    }
+
+    /// Get upstream config for a server
+    pub async fn get_server_config(&self, alias: &str) -> Option<UpstreamConfig> {
+        let sessions = self.sessions.read().await;
+        sessions.get(alias).map(|s| s.config.clone())
     }
 
     /// Get all connected servers

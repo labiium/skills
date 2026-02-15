@@ -20,7 +20,10 @@ pub use execution::upstream::{
     ConnectionState, Transport, UpstreamConfig, UpstreamError, UpstreamManager,
 };
 pub use execution::{
-    sandbox::{Sandbox, SandboxBackend, SandboxConfig, SandboxError, SandboxResult},
+    sandbox::{
+        Sandbox, SandboxBackend, SandboxConfig, SandboxConfigOverride, SandboxError, SandboxPreset,
+        SandboxResult,
+    },
     ExecContext, ExecutionTrace, Runtime, RuntimeError, TraceStep, WorkflowEngine,
 };
 

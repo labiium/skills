@@ -355,6 +355,7 @@ impl PersistenceLayer {
             risk_tier,
             last_seen: DateTime::from_timestamp(last_seen_ts, 0)
                 .ok_or_else(|| PersistenceError::InvalidData("Invalid timestamp".to_string()))?,
+            sandbox_config: None,
         })
     }
 

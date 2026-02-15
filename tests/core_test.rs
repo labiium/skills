@@ -216,6 +216,7 @@ async fn test_persistence_lifecycle() {
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
         last_seen: chrono::Utc::now(),
+        sandbox_config: None,
     };
 
     // Save it
@@ -263,6 +264,7 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
         last_seen: chrono::Utc::now(),
+        sandbox_config: None,
     }
 }
 
@@ -292,5 +294,6 @@ fn create_test_skill_record(name: &str) -> CallableRecord {
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
         last_seen: chrono::Utc::now(),
+        sandbox_config: None,
     }
 }

@@ -8,9 +8,11 @@
 
 pub mod sandbox;
 pub mod upstream;
+pub mod wasm;
 
 use crate::core::registry::Registry;
 use crate::core::{BundledTool, CallableId, CallableKind, ToolResult, ToolResultContent};
+use crate::execution::sandbox::SandboxConfigOverride;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -358,8 +360,16 @@ impl Runtime {
             // In a full implementation, SKILL.md would specify which tool to run
             if let Some(bundled_tool) = record.bundled_tools.first() {
                 info!("Executing bundled tool: {}", bundled_tool.name);
+
+                // Extract tool-level sandbox config from skill record
+                let tool_override = record.sandbox_config.as_ref();
                 let result = self
-                    .execute_bundled_tool(bundled_tool, &ctx.arguments, ctx.timeout_ms)
+                    .execute_bundled_tool(
+                        bundled_tool,
+                        &ctx.arguments,
+                        ctx.timeout_ms,
+                        tool_override,
+                    )
                     .await?;
 
                 // Record trace step
@@ -426,6 +436,7 @@ impl Runtime {
         tool: &BundledTool,
         arguments: &serde_json::Value,
         timeout_ms: Option<u64>,
+        tool_sandbox_override: Option<&SandboxConfigOverride>,
     ) -> Result<ToolResult> {
         if tool.command.is_empty() {
             return Err(RuntimeError::BundledToolError("Empty command".to_string()));
@@ -467,8 +478,15 @@ impl Runtime {
             ("SKILL_ARGS_JSON".to_string(), args_json),
         ];
 
-        // Create sandbox with configured timeout
-        let mut sandbox_config = self.sandbox_config.clone();
+        // Create sandbox with configuration merging
+        let sandbox_config = if let Some(override_config) = tool_sandbox_override {
+            self.sandbox_config.with_override(override_config)
+        } else {
+            self.sandbox_config.clone()
+        };
+
+        // Apply timeout override if provided
+        let mut sandbox_config = sandbox_config;
         if let Some(timeout) = timeout_ms {
             sandbox_config.timeout_ms = timeout;
         }

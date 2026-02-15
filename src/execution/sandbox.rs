@@ -5,8 +5,9 @@
 //! - Timeout: Basic timeout enforcement
 //! - Restricted: Limited filesystem/network access
 //! - Bubblewrap: Linux container-based sandboxing
-//! - WASM: WebAssembly-based sandboxing (future)
+//! - WASM: WebAssembly-based sandboxing (wasmtime runtime)
 
+use crate::execution::wasm::WasmSandbox;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,6 +15,181 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
 use tracing::{debug, warn};
+
+/// Sandbox configuration override for per-server and per-tool settings
+///
+/// This struct allows overriding sandbox settings at the server or tool level.
+/// All fields are optional - if a field is None, the global default is used.
+///
+/// Example YAML configuration:
+/// ```yaml
+/// upstreams:
+///   - alias: filesystem
+///     transport: stdio
+///     command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+///     sandbox_config:
+///       backend: restricted
+///       allow_read:
+///         - /home/user/projects
+///       allow_write:
+///         - /tmp
+///       timeout_ms: 60000
+///
+///   - alias: brave-search
+///     transport: stdio
+///     command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
+///     sandbox_config:
+///       backend: timeout
+///       allow_network: true
+///       timeout_ms: 30000
+/// ```
+/// Predefined sandbox configuration presets for common use cases
+///
+/// Use these to quickly configure sandboxing without specifying individual options.
+/// Presets can be further customized with specific overrides if needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPreset {
+    /// Zero configuration - uses global defaults (standard)
+    #[default]
+    Default,
+    /// Development mode - minimal sandboxing, maximum convenience
+    Development,
+    /// Standard mode - balanced security (recommended for production)
+    Standard,
+    /// Strict mode - maximum security for untrusted code
+    Strict,
+    /// Network-enabled mode - for API/web tools
+    Network,
+    /// Filesystem-enabled mode - for file manipulation tools
+    Filesystem,
+    /// WASM-optimized mode - for WebAssembly execution
+    Wasm,
+}
+
+impl SandboxPreset {
+    /// Convert preset to full configuration
+    pub fn to_config(&self) -> SandboxConfig {
+        match self {
+            SandboxPreset::Default => SandboxConfig::default(),
+            SandboxPreset::Development => SandboxConfig::development(),
+            SandboxPreset::Standard => SandboxConfig::standard(),
+            SandboxPreset::Strict => SandboxConfig::strict(),
+            SandboxPreset::Network => SandboxConfig::network(),
+            SandboxPreset::Filesystem => SandboxConfig::filesystem(vec![], vec![]),
+            SandboxPreset::Wasm => SandboxConfig::wasm_optimized(),
+        }
+    }
+}
+
+/// Sandbox configuration override for per-server and per-tool settings
+///
+/// This struct allows overriding sandbox settings at the server or tool level.
+/// All fields are optional - if a field is None, the global default is used.
+///
+/// For minimal configuration, use the `preset` field. For fine-grained control,
+/// use individual fields. You can combine both: preset + specific overrides.
+///
+/// Example YAML configuration:
+/// ```yaml
+/// # Simple: Just use a preset
+/// upstreams:
+///   - alias: filesystem
+///     transport: stdio
+///     command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+///     sandbox_config:
+///       preset: filesystem
+///       allow_read:
+///         - /home/user/projects
+///       allow_write:
+///         - /tmp
+///
+/// # Even simpler: No config needed for standard security!
+///   - alias: brave-search
+///     transport: stdio
+///     command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
+///     # Uses standard preset automatically (timeout, no network, 512MB RAM)
+///
+/// # Advanced: Full control
+///   - alias: untrusted-tool
+///     transport: stdio
+///     command: ["untrusted-mcp-server"]
+///     sandbox_config:
+///       preset: strict
+///       timeout_ms: 5000
+///       max_memory_bytes: 134217728
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SandboxConfigOverride {
+    /// Preset configuration to use as base
+    ///
+    /// If specified, this preset is applied first, then other fields override it.
+    /// If not specified, uses global defaults.
+    #[serde(default)]
+    pub preset: Option<SandboxPreset>,
+
+    /// Backend to use (overrides preset/global default)
+    pub backend: Option<SandboxBackend>,
+    /// Timeout in milliseconds (overrides preset/global default)
+    pub timeout_ms: Option<u64>,
+    /// Allow network access (overrides preset/global default)
+    #[serde(default)]
+    pub allow_network: Option<bool>,
+    /// Max memory in bytes (overrides preset/global default)
+    pub max_memory_bytes: Option<u64>,
+    /// Max CPU time in seconds (overrides preset/global default)
+    pub max_cpu_seconds: Option<u64>,
+    /// Additional allowed read paths (merged with preset/global)
+    #[serde(default)]
+    pub allow_read: Vec<PathBuf>,
+    /// Additional allowed write paths (merged with preset/global)
+    #[serde(default)]
+    pub allow_write: Vec<PathBuf>,
+}
+
+impl SandboxConfigOverride {
+    /// Create override from preset only
+    pub fn from_preset(preset: SandboxPreset) -> Self {
+        SandboxConfigOverride {
+            preset: Some(preset),
+            ..Default::default()
+        }
+    }
+
+    /// Resolve this override to a full configuration
+    ///
+    /// Uses preset if specified, otherwise uses base_config, then applies
+    /// individual field overrides.
+    pub fn resolve(&self, base_config: &SandboxConfig) -> SandboxConfig {
+        // Start with preset if specified, otherwise base config
+        let mut config = if let Some(preset) = self.preset {
+            preset.to_config()
+        } else {
+            base_config.clone()
+        };
+
+        // Apply individual overrides
+        if let Some(backend) = self.backend {
+            config.backend = backend;
+        }
+        if let Some(timeout_ms) = self.timeout_ms {
+            config.timeout_ms = timeout_ms;
+        }
+        if let Some(allow_network) = self.allow_network {
+            config.allow_network = allow_network;
+        }
+        if let Some(max_memory_bytes) = self.max_memory_bytes {
+            config.max_memory_bytes = max_memory_bytes;
+        }
+        if let Some(max_cpu_seconds) = self.max_cpu_seconds {
+            config.max_cpu_seconds = max_cpu_seconds;
+        }
+        config.allow_read.extend(self.allow_read.clone());
+        config.allow_write.extend(self.allow_write.clone());
+
+        config
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum SandboxError {
@@ -86,6 +262,135 @@ impl Default for SandboxConfig {
     }
 }
 
+impl SandboxConfig {
+    /// Development configuration - minimal sandboxing (use with caution!)
+    ///
+    /// Only enables timeout protection. No filesystem or network restrictions.
+    /// Suitable for: Local development, trusted environments only.
+    pub fn development() -> Self {
+        SandboxConfig {
+            backend: SandboxBackend::Timeout,
+            timeout_ms: 60000,                    // 60 seconds
+            allow_read: vec![],                   // No restrictions via sandbox
+            allow_write: vec![],                  // No restrictions via sandbox
+            allow_network: true,                  // Network allowed
+            max_memory_bytes: 1024 * 1024 * 1024, // 1 GB
+            max_cpu_seconds: 60,                  // 60 seconds
+        }
+    }
+
+    /// Standard configuration - balanced security (recommended default)
+    ///
+    /// Uses timeout + restricted backend with safe defaults.
+    /// Suitable for: Production use with bundled tools and skills.
+    pub fn standard() -> Self {
+        SandboxConfig::default()
+    }
+
+    /// Strict configuration - maximum security
+    ///
+    /// Uses bubblewrap containerization with minimal permissions.
+    /// Suitable for: Running untrusted code, production WASM execution.
+    pub fn strict() -> Self {
+        SandboxConfig {
+            backend: SandboxBackend::Bubblewrap,
+            timeout_ms: 10000,                   // 10 seconds
+            allow_read: vec![],                  // No filesystem access by default
+            allow_write: vec![],                 // No write access
+            allow_network: false,                // No network
+            max_memory_bytes: 256 * 1024 * 1024, // 256 MB
+            max_cpu_seconds: 10,                 // 10 seconds
+        }
+    }
+
+    /// Network-enabled configuration
+    ///
+    /// Allows network access with other restrictions in place.
+    /// Suitable for: Web search, API clients, fetch tools.
+    pub fn network() -> Self {
+        SandboxConfig {
+            backend: SandboxBackend::Restricted,
+            timeout_ms: 30000,                   // 30 seconds
+            allow_read: vec![],                  // Minimal read access
+            allow_write: vec![],                 // No write access
+            allow_network: true,                 // Network enabled
+            max_memory_bytes: 512 * 1024 * 1024, // 512 MB
+            max_cpu_seconds: 30,                 // 30 seconds
+        }
+    }
+
+    /// Filesystem-enabled configuration
+    ///
+    /// Allows controlled filesystem access with other restrictions.
+    /// Suitable for: File editors, code generators, data processors.
+    pub fn filesystem(read_paths: Vec<PathBuf>, write_paths: Vec<PathBuf>) -> Self {
+        SandboxConfig {
+            backend: SandboxBackend::Restricted,
+            timeout_ms: 30000,                   // 30 seconds
+            allow_read: read_paths,              // Specified read paths
+            allow_write: write_paths,            // Specified write paths
+            allow_network: false,                // No network
+            max_memory_bytes: 512 * 1024 * 1024, // 512 MB
+            max_cpu_seconds: 30,                 // 30 seconds
+        }
+    }
+
+    /// WASM-optimized configuration
+    ///
+    /// Optimized for WebAssembly module execution.
+    /// Suitable for: Running .wasm bundled tools with resource limits.
+    pub fn wasm_optimized() -> Self {
+        SandboxConfig {
+            backend: SandboxBackend::Wasm,
+            timeout_ms: 30000,                   // 30 seconds
+            allow_read: vec![],                  // Controlled by WASI preopens
+            allow_write: vec![],                 // Controlled by WASI preopens
+            allow_network: false,                // No WASI network
+            max_memory_bytes: 256 * 1024 * 1024, // 256 MB
+            max_cpu_seconds: 30,                 // 30 seconds
+        }
+    }
+
+    /// Merge with override configuration
+    ///
+    /// Returns a new SandboxConfig with overrides applied.
+    /// Override values take precedence over base configuration.
+    ///
+    /// This method handles presets - if the override specifies a preset,
+    /// it starts from the preset configuration and applies individual overrides.
+    pub fn with_override(&self, override_config: &SandboxConfigOverride) -> Self {
+        override_config.resolve(self)
+    }
+
+    /// Create config for specific tool from base + overrides
+    ///
+    /// Applies overrides in order of precedence:
+    /// 1. Global default (self)
+    /// 2. Server override (if provided)
+    /// 3. Tool override (if provided)
+    ///
+    /// Each override can specify a preset and/or individual field overrides.
+    pub fn for_tool(
+        &self,
+        tool_override: Option<&SandboxConfigOverride>,
+        server_override: Option<&SandboxConfigOverride>,
+    ) -> Self {
+        let mut config = self.clone();
+
+        // Apply server override first
+        if let Some(server_config) = server_override {
+            config = server_config.resolve(&config);
+        }
+
+        // Apply tool override second (takes precedence)
+        if let Some(tool_config) = tool_override {
+            config = tool_config.resolve(&config);
+        }
+
+        config
+    }
+}
+
 /// Execution result from sandbox
 #[derive(Debug)]
 pub struct SandboxResult {
@@ -132,9 +437,10 @@ impl Sandbox {
                 self.execute_bubblewrap(program, args, working_dir, env_vars)
                     .await
             }
-            SandboxBackend::Wasm => Err(SandboxError::NotAvailable(
-                "WASM backend not yet implemented".to_string(),
-            )),
+            SandboxBackend::Wasm => {
+                self.execute_wasm(program, args, working_dir, env_vars)
+                    .await
+            }
         }
     }
 
@@ -499,5 +805,71 @@ impl Sandbox {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// Execute a WASM module using wasmtime
+    ///
+    /// The program path should point to a .wasm file.
+    /// Arguments are passed as JSON via environment variables or stdin.
+    async fn execute_wasm(
+        &self,
+        program: &str,
+        _args: &[String],
+        _working_dir: &Path,
+        _env_vars: &[(String, String)],
+    ) -> Result<SandboxResult> {
+        let wasm_path = Path::new(program);
+
+        // Check if file exists and has .wasm extension
+        if !wasm_path.exists() {
+            return Err(SandboxError::ExecutionFailed(format!(
+                "WASM file not found: {}",
+                program
+            )));
+        }
+
+        if wasm_path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+            return Err(SandboxError::ExecutionFailed(format!(
+                "Not a WASM file: {}",
+                program
+            )));
+        }
+
+        // Prepare input JSON from environment variables
+        // First, try to read from SKILL_ARGS_JSON or SKILL_ARGS_FILE
+        let input_json = _env_vars
+            .iter()
+            .find(|(k, _)| k == "SKILL_ARGS_JSON")
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                _env_vars
+                    .iter()
+                    .find(|(k, _)| k == "SKILL_ARGS_FILE")
+                    .and_then(|(_, path)| std::fs::read_to_string(path).ok())
+            })
+            .unwrap_or_else(|| "{}".to_string());
+
+        // Create WASM sandbox and execute
+        let wasm_sandbox = WasmSandbox::new(self.config.clone());
+
+        // Execute with timeout
+        let timeout_duration = Duration::from_millis(self.config.timeout_ms);
+        let result = tokio::time::timeout(
+            timeout_duration,
+            wasm_sandbox.execute(wasm_path, &input_json),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(sandbox_result)) => Ok(sandbox_result),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(SandboxResult {
+                stdout: String::new(),
+                stderr: "WASM execution timed out".to_string(),
+                exit_code: None,
+                duration_ms: self.config.timeout_ms,
+                timed_out: true,
+            }),
+        }
     }
 }

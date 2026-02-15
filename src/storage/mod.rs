@@ -601,6 +601,7 @@ impl SkillStore {
             },
             risk_tier,
             last_seen: chrono::Utc::now(),
+            sandbox_config: None,
         };
 
         self.registry

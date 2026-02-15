@@ -20,10 +20,11 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
 - 📦 **Progressive Disclosure** - Load skill content on-demand to save tokens (99% token reduction)
 - 🤖 **AI Agent CLI** - Drop-in replacement for mcp-cli with enhanced features
 - 🌐 **Agent Skills Compatible** - Import skills from Vercel skills.sh ecosystem (`skills add owner/repo`)
-- 🛡️ **Sandboxed Execution** - Safe execution of bundled scripts with resource limits
+- 🛡️ **Sandboxed Execution** - Safe execution with presets (dev, standard, strict, network, filesystem, wasm)
+- 🔷 **WebAssembly Support** - Run WASM bundled tools with memory/CPU limits
 - 💾 **Persistence** - SQLite-based storage for registry and execution history
 - ✅ **Validation** - Comprehensive skill validation and dependency checking
-- 🔒 **Security** - Multi-backend sandboxing (timeout, rlimits, containers)
+- 🔒 **Security** - Multi-backend sandboxing with per-tool/server configuration
 - 🚀 **Production-Ready** - Fully tested, documented, and hardened
 
 ### Two Modes of Operation
@@ -97,6 +98,9 @@ paths:
   skills_root: ".skills/skills"
   database_path: ".skills/skills.db"
 
+# Global sandbox defaults - all fields are optional!
+# Sensible defaults are applied automatically:
+#   backend: timeout, timeout_ms: 30000, memory: 512MB, network: false
 sandbox:
   backend: timeout
   timeout_ms: 30000
@@ -118,6 +122,70 @@ To disable sandboxing entirely:
 ```yaml
 sandbox:
   backend: none
+```
+
+#### Per-Server/Tool Sandboxing (Optional)
+
+You can override sandbox settings for specific MCP servers or tools using **presets** or fine-grained options:
+
+```yaml
+upstreams:
+  # Uses default sandbox (timeout, 512MB, no network)
+  - alias: filesystem
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+
+  # Network-enabled preset for web tools
+  - alias: brave-search
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
+    sandbox_config:
+      preset: network  # One-liner configuration!
+
+  # Filesystem access with custom paths
+  - alias: custom-files
+    transport: stdio
+    command: ["./my-file-server"]
+    sandbox_config:
+      preset: filesystem
+      allow_read:
+        - /home/user/projects
+        - /tmp
+      allow_write:
+        - /tmp
+
+  # Untrusted tool - strict isolation
+  - alias: untrusted
+    transport: stdio
+    command: ["./untrusted-mcp"]
+    sandbox_config:
+      preset: strict
+      timeout_ms: 5000  # Override preset default
+
+  # WASM tool execution
+  - alias: wasm-tool
+    transport: stdio
+    command: ["wasm-mcp-runtime"]
+    sandbox_config:
+      preset: wasm
+      max_memory_bytes: 134217728  # 128MB for WASM
+```
+
+**Available Presets:**
+
+| Preset | Backend | Timeout | Memory | Network | Use Case |
+|--------|---------|---------|--------|---------|----------|
+| `default` | timeout | 30s | 512MB | ❌ | Balanced (applied automatically) |
+| `development` | timeout | 60s | 1GB | ✅ | Local dev, trusted code |
+| `standard` | timeout | 30s | 512MB | ❌ | Production (same as default) |
+| `strict` | bubblewrap | 10s | 256MB | ❌ | Untrusted code, maximum security |
+| `network` | restricted | 30s | 512MB | ✅ | API clients, web search |
+| `filesystem` | restricted | 30s | 512MB | ❌ | File editors, with path controls |
+| `wasm` | wasm | 30s | 256MB | ❌ | WebAssembly execution |
+
+**Configuration Precedence:**
+```
+Global Defaults → Server Override → Tool Override
 ```
 
 #### Global configuration
@@ -250,6 +318,9 @@ Skills.rs can replace mcp-cli while adding production features. Same workflow, b
 | CLI Interface | ✓ | ✓ |
 | Persistence | ✗ | ✓ |
 | Sandboxing | ✗ | ✓ |
+| Per-Tool/Server Sandboxing | ✗ | ✓ |
+| Sandbox Presets | ✗ | ✓ |
+| WebAssembly Support | ✗ | ✓ |
 | Skills | ✗ | ✓ |
 | MCP Server Mode | ✗ | ✓ |
 
@@ -683,6 +754,9 @@ While fully compatible, skills.rs adds enterprise features:
 | Auto cleanup | ❌ | ✅ |
 | MCP server mode | ❌ | ✅ |
 | Sandboxing | ❌ | ✅ |
+| Per-Tool/Server Sandboxing | ❌ | ✅ |
+| Sandbox Presets | ❌ | ✅ |
+| WebAssembly Support | ❌ | ✅ |
 | SQLite persistence | ❌ | ✅ |
 | Tool validation | ❌ | ✅ |
 | Risk assessment | ❌ | ✅ |
@@ -725,37 +799,100 @@ skills.rs supports multiple sandboxing backends:
 |---------|---------------|----------|----------|
 | `none` | ⚠️ None | All | Development only |
 | `timeout` | 🟡 Basic | All | Basic timeout enforcement |
-| `restricted` | 🟠 Medium | Unix | Resource limits, temp dir isolation, proxy-based network blocking |
+| `restricted` | 🟠 Medium | Unix | Resource limits, temp dir isolation |
 | `bubblewrap` | 🟢 High | Linux | Container isolation (recommended) |
-| `wasm` | 🔵 High | All | Future: WASM runtime |
+| `wasm` | 🔵 High | All | WebAssembly runtime with WASI |
 
 ### Configuration Examples
+
+**Zero-config (uses defaults):**
+```yaml
+upstreams:
+  - alias: my-server
+    transport: stdio
+    command: ["./my-mcp-server"]
+    # No sandbox_config needed - uses secure defaults!
+```
 
 **Development:**
 ```yaml
 sandbox:
-  backend: timeout
-  timeout_ms: 60000
+  preset: development  # 60s timeout, 1GB RAM, network enabled
 ```
 
 **Production (Linux):**
 ```yaml
 sandbox:
-  backend: bubblewrap
-  timeout_ms: 30000
-  max_memory_bytes: 536870912  # 512MB
-  max_cpu_seconds: 30
-  allow_network: false
+  preset: strict  # bubblewrap, 10s timeout, 256MB, no network
 ```
+
+**WebAssembly bundled tool:**
+```yaml
+skills/my-skill/
+  skill.json
+  SKILL.md
+  tool.wasm  # WASM bundled tool
+```
+
+The WASM module should export:
+- `fn run(input_ptr: i32, input_len: i32) -> i32` - Execute with JSON input
+- `memory` export - For data transfer
+
+Arguments and results are passed as JSON strings via WASM linear memory.
+
+### Sandbox Presets Quick Reference
+
+Choose the right preset for your use case:
+
+```yaml
+# Development - minimal restrictions
+sandbox_config:
+  preset: development
+
+# Production - balanced security (default)
+sandbox_config:
+  preset: standard
+
+# High security - untrusted code
+sandbox_config:
+  preset: strict
+
+# Network tools - web search, APIs
+sandbox_config:
+  preset: network
+
+# File tools - with path restrictions
+sandbox_config:
+  preset: filesystem
+  allow_read:
+    - /home/user/projects
+  allow_write:
+    - /tmp
+
+# WASM execution - memory-safe
+sandbox_config:
+  preset: wasm
+  max_memory_bytes: 134217728  # 128MB
+```
+
+**No configuration = secure defaults automatically applied:**
+- Backend: `timeout`
+- Timeout: 30 seconds
+- Memory: 512 MB
+- Network: Disabled
+- CPU: 30 seconds
 
 ### Security Features
 
 ✅ **Resource Limits** - CPU, memory, file descriptors  
 ✅ **Timeout Enforcement** - Prevents runaway scripts  
+✅ **Per-Tool/Server Sandboxing** - Different security levels per component  
+✅ **Preset-Based Configuration** - Easy security profiles (dev, standard, strict)  
 ✅ **Path Traversal Protection** - Validates all file paths  
 ✅ **Circular Dependency Detection** - Prevents infinite loops  
 ✅ **Environment Sanitization** - Removes dangerous env vars  
-✅ **Network Blocking** - Proxy-based network blocking (use Bubblewrap for strong isolation)  
+✅ **Network Blocking** - Per-server network access controls  
+✅ **WASM Isolation** - Memory-safe WebAssembly execution  
 ✅ **Execution Auditing** - All executions logged to database
 
 ---
@@ -787,7 +924,7 @@ let history = persistence.get_execution_history(&callable_id, 100).await?;
 ### Run Tests
 
 ```bash
-# All tests (30 passing)
+# All tests (70+ passing)
 cargo test --workspace --all-features
 
 # Unit tests only
@@ -796,16 +933,20 @@ cargo test --workspace --lib
 # Integration tests
 cargo test --test integration_test
 
+# WASM and sandbox tests
+cargo test --test wasm_sandbox_test
+
 # Specific crate
 cargo test -p skillsrs-skillstore
 ```
 
 ### Test Coverage
 
-- ✅ **30 tests passing**
+- ✅ **70+ tests passing**
 - ✅ Unit tests for all core functionality
 - ✅ 7 integration tests for full lifecycle
-- ✅ Sandbox backend tests
+- ✅ 33 WASM and sandbox configuration tests
+- ✅ Sandbox backend tests (all 5 backends)
 - ✅ Validation tests
 - ✅ Persistence tests
 
@@ -865,6 +1006,7 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
   - Python 3.8+ (for .py bundled tools)
   - Bash 4.0+ (for .sh bundled tools)
   - bubblewrap (for container sandboxing on Linux)
+  - wasmtime compatible system (for WASM backend)
 
 ---
 

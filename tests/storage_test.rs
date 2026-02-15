@@ -263,6 +263,7 @@ async fn test_search_engine() {
         cost_hints: skillsrs::core::CostHints::default(),
         risk_tier: skillsrs::core::RiskTier::ReadOnly,
         last_seen: chrono::Utc::now(),
+        sandbox_config: None,
     };
 
     registry.register(record).unwrap();
@@ -317,6 +318,7 @@ async fn test_search_with_filters() {
             cost_hints: skillsrs::core::CostHints::default(),
             risk_tier: skillsrs::core::RiskTier::ReadOnly,
             last_seen: chrono::Utc::now(),
+            sandbox_config: None,
         })
         .unwrap();
 
@@ -342,6 +344,7 @@ async fn test_search_with_filters() {
             cost_hints: skillsrs::core::CostHints::default(),
             risk_tier: skillsrs::core::RiskTier::ReadOnly,
             last_seen: chrono::Utc::now(),
+            sandbox_config: None,
         })
         .unwrap();
 

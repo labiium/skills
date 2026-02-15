@@ -13,6 +13,7 @@ pub mod persistence;
 pub mod policy;
 pub mod registry;
 
+use crate::execution::sandbox::SandboxConfigOverride;
 use blake3::Hash;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -316,6 +317,10 @@ pub struct CallableRecord {
     pub cost_hints: CostHints,
     pub risk_tier: RiskTier,
     pub last_seen: DateTime<Utc>,
+
+    /// Per-tool sandbox configuration override
+    #[serde(default)]
+    pub sandbox_config: Option<SandboxConfigOverride>,
 }
 
 impl CallableRecord {

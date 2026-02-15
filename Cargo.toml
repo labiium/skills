@@ -86,6 +86,12 @@ semver = "1.0"
 # Temp directories for 'skills add' and sync
 tempfile = "3.24"
 
+# WASM runtime
+wasmtime = { version = "26.0", features = ["cranelift"] }
+wasmtime-wasi = "26.0"
+wasi-common = "26.0"
+cap-std = "3.0"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

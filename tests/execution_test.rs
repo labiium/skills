@@ -41,6 +41,7 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
         last_seen: chrono::Utc::now(),
+        sandbox_config: None,
     }
 }
 
@@ -69,6 +70,7 @@ async fn test_add_upstream_stdio() {
         skills: None,
         roots: None,
         tags: vec!["test".to_string()],
+        sandbox_config: None,
     };
 
     // This will fail because echo is not a valid MCP server
