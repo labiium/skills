@@ -62,7 +62,7 @@ regex = "1.11"
 glob = "0.3"
 futures = "0.3"
 async-trait = "0.1"
-bytes = "1.8"
+bytes = "1.11"
 
 # Filesystem watching
 notify = "8.2"
