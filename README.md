@@ -20,7 +20,7 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
 - 📦 **Progressive Disclosure** - Load skill content on-demand to save tokens (99% token reduction)
 - 🤖 **AI Agent CLI** - Drop-in replacement for mcp-cli with enhanced features
 - 🌐 **Agent Skills Compatible** - Import skills from Vercel skills.sh ecosystem (`skills add owner/repo`)
-- 🛡️ **Sandboxed Execution** - Safe execution with presets (dev, standard, strict, network, filesystem, wasm)
+- 🛡️ **Sandboxed Execution** - Safe execution with presets (dev, standard, strict, isolated, network, filesystem, wasm)
 - 🔷 **WebAssembly Support** - Run WASM bundled tools with memory/CPU limits
 - 💾 **Persistence** - SQLite-based storage for registry and execution history
 - ✅ **Validation** - Comprehensive skill validation and dependency checking
@@ -154,13 +154,25 @@ upstreams:
       allow_write:
         - /tmp
 
-  # Untrusted tool - strict isolation
+  # Untrusted tool - strict isolation (Linux bubblewrap)
   - alias: untrusted
     transport: stdio
     command: ["./untrusted-mcp"]
     sandbox_config:
       preset: strict
       timeout_ms: 5000  # Override preset default
+
+  # Least trusted tool - maximum Docker isolation
+  - alias: external-plugin
+    transport: stdio
+    command: ["./third-party-plugin"]
+    sandbox_config:
+      preset: isolated
+      docker:
+        image: "alpine:latest"
+        memory_limit: 134217728  # 128MB
+        cpu_quota: 0.25          # Quarter CPU
+        network_mode: "none"     # Complete isolation
 
   # WASM tool execution
   - alias: wasm-tool
@@ -178,7 +190,8 @@ upstreams:
 | `default` | timeout | 30s | 512MB | ❌ | Balanced (applied automatically) |
 | `development` | timeout | 60s | 1GB | ✅ | Local dev, trusted code |
 | `standard` | timeout | 30s | 512MB | ❌ | Production (same as default) |
-| `strict` | bubblewrap | 10s | 256MB | ❌ | Untrusted code, maximum security |
+| `strict` | bubblewrap | 10s | 256MB | ❌ | Untrusted code, maximum security (Linux) |
+| `isolated` | docker | 10s | 256MB | ❌ | Least trusted code, container isolation |
 | `network` | restricted | 30s | 512MB | ✅ | API clients, web search |
 | `filesystem` | restricted | 30s | 512MB | ❌ | File editors, with path controls |
 | `wasm` | wasm | 30s | 256MB | ❌ | WebAssembly execution |
@@ -800,7 +813,8 @@ skills.rs supports multiple sandboxing backends:
 | `none` | ⚠️ None | All | Development only |
 | `timeout` | 🟡 Basic | All | Basic timeout enforcement |
 | `restricted` | 🟠 Medium | Unix | Resource limits, temp dir isolation |
-| `bubblewrap` | 🟢 High | Linux | Container isolation (recommended) |
+| `bubblewrap` | 🟢 High | Linux | Container isolation (recommended for Linux) |
+| `docker` | 🟢 High | All (requires Docker) | Container isolation (cross-platform) |
 | `wasm` | 🔵 High | All | WebAssembly runtime with WASI |
 
 ### Configuration Examples
@@ -820,10 +834,32 @@ sandbox:
   preset: development  # 60s timeout, 1GB RAM, network enabled
 ```
 
-**Production (Linux):**
+**Production (Linux with bubblewrap):**
 ```yaml
 sandbox:
   preset: strict  # bubblewrap, 10s timeout, 256MB, no network
+```
+
+**Maximum isolation (Docker, cross-platform):**
+```yaml
+sandbox:
+  preset: isolated  # Docker container, 10s timeout, 256MB, no network
+```
+
+**Least trusted tools (explicit Docker config):**
+```yaml
+upstreams:
+  - alias: untrusted-external-tool
+    transport: stdio
+    command: ["./potentially-risky-mcp-server"]
+    sandbox_config:
+      preset: isolated
+      docker:
+        image: "alpine:latest"      # Minimal attack surface
+        memory_limit: 134217728     # 128MB
+        cpu_quota: 0.25             # Quarter CPU
+        network_mode: "none"        # Complete network isolation
+        auto_remove: true           # Clean up after execution
 ```
 
 **WebAssembly bundled tool:**
@@ -853,9 +889,13 @@ sandbox_config:
 sandbox_config:
   preset: standard
 
-# High security - untrusted code
+# High security - untrusted code (Linux bubblewrap)
 sandbox_config:
   preset: strict
+
+# Maximum isolation - least trusted code (Docker, cross-platform)
+sandbox_config:
+  preset: isolated
 
 # Network tools - web search, APIs
 sandbox_config:
@@ -887,7 +927,8 @@ sandbox_config:
 ✅ **Resource Limits** - CPU, memory, file descriptors  
 ✅ **Timeout Enforcement** - Prevents runaway scripts  
 ✅ **Per-Tool/Server Sandboxing** - Different security levels per component  
-✅ **Preset-Based Configuration** - Easy security profiles (dev, standard, strict)  
+✅ **Preset-Based Configuration** - Easy security profiles (dev, standard, strict, isolated)  
+✅ **Docker Sandboxing** - Cross-platform container isolation  
 ✅ **Path Traversal Protection** - Validates all file paths  
 ✅ **Circular Dependency Detection** - Prevents infinite loops  
 ✅ **Environment Sanitization** - Removes dangerous env vars  
@@ -1006,6 +1047,7 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
   - Python 3.8+ (for .py bundled tools)
   - Bash 4.0+ (for .sh bundled tools)
   - bubblewrap (for container sandboxing on Linux)
+  - Docker (for Docker sandboxing backend)
   - wasmtime compatible system (for WASM backend)
 
 ---

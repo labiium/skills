@@ -5,16 +5,25 @@
 //! - Timeout: Basic timeout enforcement
 //! - Restricted: Limited filesystem/network access
 //! - Bubblewrap: Linux container-based sandboxing
+//! - Docker: Docker container-based sandboxing
 //! - WASM: WebAssembly-based sandboxing (wasmtime runtime)
 
 use crate::execution::wasm::WasmSandbox;
+use bollard::container::{
+    Config, CreateContainerOptions, KillContainerOptions, LogOutput, LogsOptions,
+    StartContainerOptions, WaitContainerOptions,
+};
+use bollard::models::{HostConfig, Mount, MountTypeEnum};
+use bollard::Docker;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 /// Sandbox configuration override for per-server and per-tool settings
 ///
@@ -57,8 +66,11 @@ pub enum SandboxPreset {
     Development,
     /// Standard mode - balanced security (recommended for production)
     Standard,
-    /// Strict mode - maximum security for untrusted code
+    /// Strict mode - maximum security for untrusted code (Linux bubblewrap)
     Strict,
+    /// Isolated mode - maximum security using Docker containers (cross-platform)
+    /// Use this for least trusted tools that require strong isolation
+    Isolated,
     /// Network-enabled mode - for API/web tools
     Network,
     /// Filesystem-enabled mode - for file manipulation tools
@@ -75,6 +87,7 @@ impl SandboxPreset {
             SandboxPreset::Development => SandboxConfig::development(),
             SandboxPreset::Standard => SandboxConfig::standard(),
             SandboxPreset::Strict => SandboxConfig::strict(),
+            SandboxPreset::Isolated => SandboxConfig::isolated(),
             SandboxPreset::Network => SandboxConfig::network(),
             SandboxPreset::Filesystem => SandboxConfig::filesystem(vec![], vec![]),
             SandboxPreset::Wasm => SandboxConfig::wasm_optimized(),
@@ -224,9 +237,73 @@ pub enum SandboxBackend {
     Restricted,
     /// Bubblewrap (Linux container)
     Bubblewrap,
+    /// Docker container-based sandboxing
+    Docker,
     /// WASM runtime (future)
     #[allow(dead_code)]
     Wasm,
+}
+
+/// Docker container configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerConfig {
+    /// Docker image to use
+    pub image: String,
+    /// Container memory limit in bytes (0 = unlimited)
+    pub memory_limit: i64,
+    /// CPU quota (number of CPUs, e.g., 0.5 for half a CPU)
+    pub cpu_quota: f64,
+    /// Environment variables for the container
+    pub env_vars: HashMap<String, String>,
+    /// Working directory inside the container
+    pub working_dir: String,
+    /// Auto-remove container after execution
+    #[serde(default = "default_auto_remove")]
+    pub auto_remove: bool,
+    /// Network mode ("none", "bridge", "host", or custom network name)
+    #[serde(default = "default_network_mode")]
+    pub network_mode: String,
+    /// Container entrypoint override
+    pub entrypoint: Option<Vec<String>>,
+    /// Additional mount points
+    #[serde(default)]
+    pub mounts: Vec<DockerMount>,
+}
+
+fn default_auto_remove() -> bool {
+    true
+}
+
+fn default_network_mode() -> String {
+    "none".to_string()
+}
+
+/// Docker mount configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerMount {
+    /// Source path on host
+    pub source: PathBuf,
+    /// Target path in container
+    pub target: String,
+    /// Mount read-only
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        DockerConfig {
+            image: "alpine:latest".to_string(),
+            memory_limit: 256 * 1024 * 1024, // 256 MB
+            cpu_quota: 1.0,
+            env_vars: HashMap::new(),
+            working_dir: "/workspace".to_string(),
+            auto_remove: true,
+            network_mode: "none".to_string(),
+            entrypoint: None,
+            mounts: Vec::new(),
+        }
+    }
 }
 
 /// Sandbox configuration
@@ -246,6 +323,9 @@ pub struct SandboxConfig {
     pub max_memory_bytes: u64,
     /// Maximum CPU time (seconds, 0 = unlimited)
     pub max_cpu_seconds: u64,
+    /// Docker-specific configuration (only used when backend is Docker)
+    #[serde(default)]
+    pub docker: DockerConfig,
 }
 
 impl Default for SandboxConfig {
@@ -258,6 +338,7 @@ impl Default for SandboxConfig {
             allow_network: false,
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
             max_cpu_seconds: 30,
+            docker: DockerConfig::default(),
         }
     }
 }
@@ -276,6 +357,11 @@ impl SandboxConfig {
             allow_network: true,                  // Network allowed
             max_memory_bytes: 1024 * 1024 * 1024, // 1 GB
             max_cpu_seconds: 60,                  // 60 seconds
+            docker: DockerConfig {
+                network_mode: "bridge".to_string(),
+                memory_limit: 1024 * 1024 * 1024, // 1 GB
+                ..Default::default()
+            },
         }
     }
 
@@ -292,6 +378,8 @@ impl SandboxConfig {
     /// Uses bubblewrap containerization with minimal permissions.
     /// Suitable for: Running untrusted code, production WASM execution.
     pub fn strict() -> Self {
+        let docker_config = DockerConfig::default();
+
         SandboxConfig {
             backend: SandboxBackend::Bubblewrap,
             timeout_ms: 10000,                   // 10 seconds
@@ -300,6 +388,33 @@ impl SandboxConfig {
             allow_network: false,                // No network
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_seconds: 10,                 // 10 seconds
+            docker: docker_config,
+        }
+    }
+
+    /// Isolated configuration - maximum security using Docker
+    ///
+    /// Uses Docker containerization for strong isolation across all platforms.
+    /// This is the most secure option for least trusted tools.
+    /// Suitable for: Running untrusted code, code from unknown sources,
+    /// or when bubblewrap is not available.
+    pub fn isolated() -> Self {
+        SandboxConfig {
+            backend: SandboxBackend::Docker,
+            timeout_ms: 10000,                   // 10 seconds
+            allow_read: vec![],                  // No filesystem access by default
+            allow_write: vec![],                 // No write access
+            allow_network: false,                // No network
+            max_memory_bytes: 256 * 1024 * 1024, // 256 MB
+            max_cpu_seconds: 10,                 // 10 seconds
+            docker: DockerConfig {
+                image: "alpine:latest".to_string(),
+                memory_limit: 256 * 1024 * 1024,  // 256 MB
+                cpu_quota: 0.5,                   // Half a CPU
+                network_mode: "none".to_string(), // No network
+                auto_remove: true,
+                ..Default::default()
+            },
         }
     }
 
@@ -316,6 +431,10 @@ impl SandboxConfig {
             allow_network: true,                 // Network enabled
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
             max_cpu_seconds: 30,                 // 30 seconds
+            docker: DockerConfig {
+                network_mode: "bridge".to_string(),
+                ..Default::default()
+            },
         }
     }
 
@@ -324,6 +443,8 @@ impl SandboxConfig {
     /// Allows controlled filesystem access with other restrictions.
     /// Suitable for: File editors, code generators, data processors.
     pub fn filesystem(read_paths: Vec<PathBuf>, write_paths: Vec<PathBuf>) -> Self {
+        let docker_config = DockerConfig::default();
+
         SandboxConfig {
             backend: SandboxBackend::Restricted,
             timeout_ms: 30000,                   // 30 seconds
@@ -332,6 +453,7 @@ impl SandboxConfig {
             allow_network: false,                // No network
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
             max_cpu_seconds: 30,                 // 30 seconds
+            docker: docker_config,
         }
     }
 
@@ -340,6 +462,8 @@ impl SandboxConfig {
     /// Optimized for WebAssembly module execution.
     /// Suitable for: Running .wasm bundled tools with resource limits.
     pub fn wasm_optimized() -> Self {
+        let docker_config = DockerConfig::default();
+
         SandboxConfig {
             backend: SandboxBackend::Wasm,
             timeout_ms: 30000,                   // 30 seconds
@@ -348,6 +472,7 @@ impl SandboxConfig {
             allow_network: false,                // No WASI network
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_seconds: 30,                 // 30 seconds
+            docker: docker_config,
         }
     }
 
@@ -435,6 +560,10 @@ impl Sandbox {
             }
             SandboxBackend::Bubblewrap => {
                 self.execute_bubblewrap(program, args, working_dir, env_vars)
+                    .await
+            }
+            SandboxBackend::Docker => {
+                self.execute_docker(program, args, working_dir, env_vars)
                     .await
             }
             SandboxBackend::Wasm => {
@@ -870,6 +999,294 @@ impl Sandbox {
                 duration_ms: self.config.timeout_ms,
                 timed_out: true,
             }),
+        }
+    }
+
+    /// Execute using Docker container
+    ///
+    /// Creates a Docker container with the configured image and executes the command.
+    /// Supports resource limits, network isolation, and volume mounts.
+    async fn execute_docker(
+        &self,
+        program: &str,
+        args: &[String],
+        working_dir: &Path,
+        env_vars: &[(String, String)],
+    ) -> Result<SandboxResult> {
+        // Connect to Docker daemon
+        let docker = Docker::connect_with_local_defaults().map_err(|e| {
+            SandboxError::NotAvailable(format!("Failed to connect to Docker: {}", e))
+        })?;
+
+        info!(
+            "Executing with Docker: {} {} (image: {})",
+            program,
+            args.join(" "),
+            self.config.docker.image
+        );
+
+        // Build the command to execute
+        let mut cmd_parts = vec![program.to_string()];
+        cmd_parts.extend(args.iter().cloned());
+        let cmd_json = serde_json::to_string(&cmd_parts).map_err(|e| {
+            SandboxError::InvalidConfig(format!("Failed to serialize command: {}", e))
+        })?;
+
+        // Prepare environment variables for the container
+        let mut container_env = self.config.docker.env_vars.clone();
+
+        // Add user-provided env vars
+        for (key, value) in env_vars {
+            container_env.insert(key.clone(), value.clone());
+        }
+
+        // Serialize container arguments as env var for the wrapper script
+        container_env.insert("SKILL_CMD_JSON".to_string(), cmd_json);
+
+        // Convert env vars to Docker format: "KEY=VALUE"
+        let env_list: Vec<String> = container_env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+
+        // Build volume mounts from allow_read and allow_write
+        let mut mounts = Vec::new();
+
+        // Add working directory as a mount
+        mounts.push(Mount {
+            target: Some(self.config.docker.working_dir.clone()),
+            source: Some(working_dir.to_string_lossy().to_string()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        });
+
+        // Add configured read paths
+        for path in &self.config.allow_read {
+            if path.exists() {
+                mounts.push(Mount {
+                    target: Some(format!(
+                        "{}/{}",
+                        self.config.docker.working_dir,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                    source: Some(path.to_string_lossy().to_string()),
+                    typ: Some(MountTypeEnum::BIND),
+                    read_only: Some(true),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // Add configured write paths
+        for path in &self.config.allow_write {
+            if path.exists() {
+                mounts.push(Mount {
+                    target: Some(format!(
+                        "{}/{}",
+                        self.config.docker.working_dir,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                    source: Some(path.to_string_lossy().to_string()),
+                    typ: Some(MountTypeEnum::BIND),
+                    read_only: Some(false),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // Add custom mounts from docker config
+        for mount in &self.config.docker.mounts {
+            mounts.push(Mount {
+                target: Some(mount.target.clone()),
+                source: Some(mount.source.to_string_lossy().to_string()),
+                typ: Some(MountTypeEnum::BIND),
+                read_only: Some(mount.read_only),
+                ..Default::default()
+            });
+        }
+
+        // Determine network mode based on config
+        let network_mode = if self.config.allow_network {
+            self.config.docker.network_mode.clone()
+        } else {
+            "none".to_string()
+        };
+
+        // Convert timeout to nanoseconds for Docker
+        let nano_cpus = if self.config.docker.cpu_quota > 0.0 {
+            Some((self.config.docker.cpu_quota * 1_000_000_000.0) as i64)
+        } else {
+            None
+        };
+
+        let memory = if self.config.docker.memory_limit > 0 {
+            Some(self.config.docker.memory_limit)
+        } else {
+            None
+        };
+
+        // Create host config
+        let host_config = HostConfig {
+            mounts: if mounts.is_empty() {
+                None
+            } else {
+                Some(mounts)
+            },
+            network_mode: Some(network_mode),
+            nano_cpus,
+            memory,
+            auto_remove: Some(self.config.docker.auto_remove),
+            ..Default::default()
+        };
+
+        // Create container configuration using Config struct
+        let config = Config::<String> {
+            image: Some(self.config.docker.image.clone()),
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                program.to_string(),
+            ]),
+            working_dir: Some(self.config.docker.working_dir.clone()),
+            env: if env_list.is_empty() {
+                None
+            } else {
+                Some(env_list)
+            },
+            host_config: Some(host_config),
+            entrypoint: self.config.docker.entrypoint.clone(),
+            ..Default::default()
+        };
+
+        // Create the container
+        let create_opts = CreateContainerOptions {
+            name: format!("skills-sandbox-{}", uuid::Uuid::new_v4()),
+            platform: None,
+        };
+
+        let container = docker
+            .create_container(Some(create_opts), config)
+            .await
+            .map_err(|e| {
+                SandboxError::ExecutionFailed(format!("Failed to create container: {}", e))
+            })?;
+
+        let container_id = container.id;
+        info!("Created Docker container: {}", container_id);
+
+        // Start the container
+        docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await
+            .map_err(|e| {
+                SandboxError::ExecutionFailed(format!("Failed to start container: {}", e))
+            })?;
+
+        let start = std::time::Instant::now();
+        let timeout_duration = Duration::from_millis(self.config.timeout_ms);
+
+        // Wait for container with timeout - wait_container returns a stream, collect it
+        let wait_result = tokio::time::timeout(timeout_duration, async {
+            let mut stream = docker.wait_container(
+                &container_id,
+                Some(WaitContainerOptions {
+                    condition: "not-running",
+                }),
+            );
+            stream.next().await
+        })
+        .await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Check if timed out
+        let timed_out = wait_result.is_err();
+
+        if timed_out {
+            // Kill the container if timed out
+            let _ = docker
+                .kill_container(
+                    &container_id,
+                    Some(KillContainerOptions { signal: "SIGKILL" }),
+                )
+                .await;
+            warn!(
+                "Docker container {} timed out after {}ms",
+                container_id, duration_ms
+            );
+        }
+
+        // Fetch logs
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+
+        let logs_options = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            timestamps: false,
+            follow: false,
+            ..Default::default()
+        };
+
+        let mut logs_stream = docker.logs(&container_id, Some(logs_options));
+
+        while let Some(log_result) = logs_stream.next().await {
+            match log_result {
+                Ok(log_output) => match log_output {
+                    LogOutput::StdOut { message, .. } => {
+                        stdout.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    LogOutput::StdErr { message, .. } => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    _ => {}
+                },
+                Err(e) => {
+                    error!("Error fetching logs: {}", e);
+                }
+            }
+        }
+
+        // Get container exit code
+        let exit_code = if timed_out {
+            None
+        } else {
+            // Inspect container to get exit code
+            match docker.inspect_container(&container_id, None).await {
+                Ok(inspect) => inspect
+                    .state
+                    .and_then(|s| s.exit_code)
+                    .map(|code| code as i32),
+                Err(e) => {
+                    error!("Failed to inspect container: {}", e);
+                    None
+                }
+            }
+        };
+
+        info!(
+            "Docker container {} finished in {}ms with exit code: {:?}",
+            container_id, duration_ms, exit_code
+        );
+
+        Ok(SandboxResult {
+            stdout,
+            stderr,
+            exit_code,
+            duration_ms,
+            timed_out,
+        })
+    }
+
+    /// Check if Docker is available
+    pub fn is_docker_available() -> bool {
+        match Docker::connect_with_local_defaults() {
+            Ok(docker) => {
+                // Try to ping Docker to verify connection
+                futures::executor::block_on(async { docker.ping().await.is_ok() })
+            }
+            Err(_) => false,
         }
     }
 }

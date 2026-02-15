@@ -21,8 +21,8 @@ pub use execution::upstream::{
 };
 pub use execution::{
     sandbox::{
-        Sandbox, SandboxBackend, SandboxConfig, SandboxConfigOverride, SandboxError, SandboxPreset,
-        SandboxResult,
+        DockerConfig, DockerMount, Sandbox, SandboxBackend, SandboxConfig, SandboxConfigOverride,
+        SandboxError, SandboxPreset, SandboxResult,
     },
     ExecContext, ExecutionTrace, Runtime, RuntimeError, TraceStep, WorkflowEngine,
 };
