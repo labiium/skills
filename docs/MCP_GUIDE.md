@@ -153,35 +153,15 @@ Create a skill that uses the filesystem tool:
 ```bash
 mkdir -p .skills/skills/file-analyzer
 
-# Create skill.json
-cat > .skills/skills/file-analyzer/skill.json << 'EOF'
-{
-  "id": "file-analyzer",
-  "title": "File Analyzer",
-  "version": "1.0.0",
-  "description": "Reads and analyzes file contents",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "file_path": {
-        "type": "string",
-        "description": "Path to the file to analyze"
-      }
-    },
-    "required": ["file_path"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["filesystem/read_file"],
-    "deny": [],
-    "required": ["filesystem/read_file"]
-  },
-  "risk_tier": "read_only"
-}
-EOF
-
-# Create SKILL.md
+# Create SKILL.md with YAML frontmatter
 cat > .skills/skills/file-analyzer/SKILL.md << 'EOF'
+---
+name: file-analyzer
+description: Reads and analyzes file contents
+version: 1.0.0
+allowed-tools: ["filesystem/read_file"]
+---
+
 # File Analyzer
 
 ## Purpose
@@ -487,85 +467,56 @@ npm search mcp-server
 
 ### How Skills Reference MCP Tools
 
-Skills declare which tools they can use via the `tool_policy` field in `skill.json`:
+Skills declare which tools they can use via the `allowed-tools` field in the YAML frontmatter of `SKILL.md`:
 
-```json
-{
-  "id": "web-researcher",
-  "title": "Web Researcher",
-  "version": "1.0.0",
-  "description": "Research topics using web search",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "query": {
-        "type": "string",
-        "description": "Topic to research"
-      }
-    },
-    "required": ["query"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["brave_search"],
-    "deny": [],
-    "required": ["brave_search"]
-  },
-  "risk_tier": "read_only"
-}
+```markdown
+---
+name: web-researcher
+description: Research topics using web search
+version: 1.0.0
+allowed-tools: ["brave_search"]
+---
+
+# Web Researcher
+
+## Purpose
+Research topics using web search.
+
+## Instructions
+1. Take the user's query
+2. Search the web using brave_search
+3. Summarize findings
 ```
 
 ### Tool Policy Configuration
 
-The `tool_policy` object has three fields:
+The `allowed-tools` field in the YAML frontmatter controls tool access:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `allow` | string[] | Tool patterns this skill can use (glob-style) |
-| `deny` | string[] | Tool patterns explicitly forbidden |
-| `required` | string[] | Tools the skill must have access to |
+| `allowed-tools` | string[] | Tool patterns this skill can use (glob-style) |
 
 **Pattern matching:**
 - `"*"` - All tools
 - `"brave_search"` - Specific tool name
+- `"filesystem/*"` - All filesystem tools
+- `"github/delete_*"` - Specific patterns
 - `"filesystem/*"` - All tools from filesystem upstream
 - `"*search*"` - Any tool containing "search"
 
 ### Example: Skill Using Web Search + Filesystem
 
-**skill.json:**
-```json
-{
-  "id": "research-writer",
-  "title": "Research Writer",
-  "version": "1.0.0",
-  "description": "Research a topic and write findings to a file",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "topic": {
-        "type": "string",
-        "description": "Topic to research"
-      },
-      "output_file": {
-        "type": "string",
-        "description": "Path to write the report"
-      }
-    },
-    "required": ["topic", "output_file"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["brave_search", "filesystem/*"],
-    "deny": ["filesystem/delete_file"],
-    "required": ["brave_search", "filesystem/write_file"]
-  },
-  "risk_tier": "limited_write"
-}
-```
-
 **SKILL.md:**
 ```markdown
+---
+name: research-writer
+description: Research a topic and write findings to a file
+version: 1.0.0
+allowed-tools:
+  - brave_search
+  - filesystem/*
+---
+
 # Research Writer
 
 ## Purpose
@@ -592,45 +543,17 @@ A markdown file containing the research report.
 mkdir -p .skills/skills/project-setup
 ```
 
-**skill.json:**
-```json
-{
-  "id": "project-setup",
-  "title": "Project Setup Assistant",
-  "version": "1.0.0",
-  "description": "Sets up a new project with README, license, and initial structure",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "project_name": {
-        "type": "string",
-        "description": "Name of the project"
-      },
-      "project_type": {
-        "type": "string",
-        "enum": ["python", "node", "rust"],
-        "description": "Type of project"
-      },
-      "license": {
-        "type": "string",
-        "enum": ["MIT", "Apache-2.0", "GPL-3.0"],
-        "default": "MIT"
-      }
-    },
-    "required": ["project_name", "project_type"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["filesystem/*", "github/*"],
-    "deny": ["filesystem/delete_file", "github/delete_repository"],
-    "required": ["filesystem/create_directory", "filesystem/write_file"]
-  },
-  "risk_tier": "limited_write"
-}
-```
-
 **SKILL.md:**
 ```markdown
+---
+name: project-setup
+description: Sets up a new project with README, license, and initial structure
+version: 1.0.0
+allowed-tools:
+  - filesystem/*
+  - github/*
+---
+
 # Project Setup Assistant
 
 ## Purpose

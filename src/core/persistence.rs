@@ -536,6 +536,54 @@ impl PersistenceLayer {
         self.pool.close().await;
         info!("Persistence layer closed");
     }
+    /// Search callables using FTS5
+    pub async fn search_callables(
+        &self,
+        query: &str,
+        kind_filter: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        // Build the FTS query
+        let fts_query = query.split_whitespace().collect::<Vec<_>>().join(" OR ");
+
+        let rows = if let Some(kind) = kind_filter {
+            sqlx::query(
+                r#"
+                SELECT c.id FROM callables c
+                JOIN callables_fts fts ON c.rowid = fts.rowid
+                WHERE callables_fts MATCH ?1 AND c.kind = ?2
+                ORDER BY rank
+                LIMIT ?3
+                "#,
+            )
+            .bind(&fts_query)
+            .bind(kind)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT c.id FROM callables c
+                JOIN callables_fts fts ON c.rowid = fts.rowid
+                WHERE callables_fts MATCH ?1
+                ORDER BY rank
+                LIMIT ?2
+                "#,
+            )
+            .bind(&fts_query)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.get("id");
+                Ok(id)
+            })
+            .collect()
+    }
 }
 
 /// Execution history record

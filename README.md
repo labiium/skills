@@ -226,16 +226,15 @@ use_global:
 
 This overlays project settings on top of the global config and appends project `upstreams` to the global list.
 
-**Environment Variable Overrides:**
+**Environment Variable:**
 ```bash
-export SKILLS_ROOT=/custom/skills
-export SKILLS_DATABASE_PATH=/custom/skills.db
+export SKILLS_PATH=/custom/skills
 skills server
 ```
 
-**Command-Line Overrides:**
+**Command-Line Override:**
 ```bash
-skills server --skills-root /custom/skills --database /custom/db/skills.db
+skills server --path /custom/skills
 ```
 
 To see the directories in use on your machine, run:
@@ -526,51 +525,34 @@ A **skill** is a package of agent instructions and optional bundled tools. Skill
 ### Skill Directory Structure
 
 ```
-skills/
-  my-skill/
-    skill.json          # Manifest (required)
-    SKILL.md            # Instructions for agent (required)
-    script.py           # Bundled tool (optional)
-    script.py.schema.json  # Tool schema (optional)
-    data.json           # Support file (optional)
-    README.md           # Documentation (optional)
-```
-
-### Example: skill.json
-
-```json
-{
-  "id": "web-researcher",
-  "title": "Web Researcher",
-  "version": "1.0.0",
-  "description": "Research topics using web search and summarization",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "query": {
-        "type": "string",
-        "description": "Topic to research"
-      }
-    },
-    "required": ["query"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["brave_search", "filesystem_read"],
-    "deny": [],
-    "required": []
-  },
-  "hints": {
-    "domain": ["web", "research"],
-    "expected_calls": 3
-  },
-  "risk_tier": "read_only"
-}
+.skills/
+  config.yaml         # Project configuration
+  skills/             # Skills directory
+    my-skill/
+      SKILL.md        # Instructions with YAML frontmatter (required)
+      scripts/        # Executable scripts (optional)
+      references/     # Reference docs (optional)
+      assets/           # Binary assets (optional)
+  skills.db           # SQLite database
+  cache/              # Cache files
+  logs/               # Log files
 ```
 
 ### Example: SKILL.md
 
 ```markdown
+---
+name: web-researcher
+description: Research topics using web search and summarization
+version: 1.0.0
+allowed-tools:
+  - brave_search
+  - filesystem_read
+tags:
+  - web
+  - research
+---
+
 # Web Researcher
 
 ## Purpose
@@ -731,9 +713,8 @@ skills.rs supports all Agent Skills features:
 
 skills.rs automatically detects skill format:
 
-- **Has `SKILL.md` only**: Agent Skills format
-- **Has `skill.json` + `SKILL.md`**: Traditional skills.rs format
-- **Has both**: Traditional format takes precedence
+- **Has `SKILL.md`**: Agent Skills format (YAML frontmatter + markdown)
+- **No `SKILL.md`**: Not a valid skill
 
 Skills are seamlessly converted to the unified internal format and available through all 4 MCP tools.
 
@@ -865,7 +846,6 @@ upstreams:
 **WebAssembly bundled tool:**
 ```yaml
 skills/my-skill/
-  skill.json
   SKILL.md
   tool.wasm  # WASM bundled tool
 ```

@@ -56,9 +56,10 @@ Every skill needs:
 
 ```
 skill-name/
-  skill.json    # Manifest with metadata and input schema
-  SKILL.md      # Step-by-step instructions for execution
-  script.py     # (Optional) Bundled automation script
+  SKILL.md      # Instructions with YAML frontmatter (required)
+  scripts/      # Bundled scripts (optional)
+  references/   # Reference docs (optional)
+  assets/       # Binary assets (optional)
 ```
 
 ---
@@ -97,44 +98,30 @@ Debug Node.js application issues
 EOF
 ```
 
-### Skill Manifest (skill.json)
+### Skill Format (SKILL.md)
 
-```json
-{
-  "id": "deploy-to-staging",
-  "title": "Deploy to Staging",
-  "version": "1.0.0",
-  "description": "Build, test, and deploy application to staging environment",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "branch": {
-        "type": "string",
-        "description": "Git branch to deploy",
-        "default": "main"
-      },
-      "skip_tests": {
-        "type": "boolean",
-        "description": "Skip test suite",
-        "default": false
-      }
-    },
-    "required": []
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["filesystem/*", "git/*", "docker/*"],
-    "deny": ["filesystem/delete_recursive"],
-    "required": ["git/status"]
-  },
-  "hints": {
-    "intent": ["deploy", "release"],
-    "domain": ["devops", "ci-cd"],
-    "outcomes": ["deployed application"],
-    "expected_calls": 5
-  },
-  "risk_tier": "write"
-}
+```markdown
+---
+name: deploy-to-staging
+description: Build, test, and deploy application to staging environment
+version: 1.0.0
+allowed-tools: ["filesystem/*", "git/*", "docker/*"]
+---
+
+# Deploy to Staging
+
+## Purpose
+Build, test, and deploy application to staging environment.
+
+## Parameters
+- branch: Git branch to deploy (default: "main")
+- skip_tests: Skip test suite (default: false)
+
+## Instructions
+1. Check git status
+2. Run tests (unless skip_tests is true)
+3. Build the application
+4. Deploy to staging
 ```
 
 ### SKILL.md Template

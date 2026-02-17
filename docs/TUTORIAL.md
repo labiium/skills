@@ -189,19 +189,27 @@ If you have a README.md file, you'll see its contents printed.
 
 Here's the important part: **MCP servers provide tools, and skills use those tools.**
 
-When you create a skill, you tell it which upstream tools it's allowed to use via the `tool_policy.allow` field in `skill.json`.
+When you create a skill, you tell it which upstream tools it's allowed to use via the `allowed-tools` field in the YAML frontmatter of `SKILL.md`.
 
 **Example from Part 6 (Word Counter skill):**
 
-```json
-{
-  "id": "word-counter",
-  "tool_policy": {
-    "allow": ["filesystem/read_file"],
-    "deny": [],
-    "required": ["filesystem/read_file"]
-  }
-}
+```markdown
+---
+name: word-counter
+description: Count words in a file
+version: 1.0.0
+allowed-tools: ["filesystem/read_file"]
+---
+
+# Word Counter
+
+## Purpose
+Count the number of words in a text file.
+
+## Instructions
+1. Read the file using `filesystem/read_file`
+2. Count the words in the content
+3. Return the word count
 ```
 
 This skill is asking permission to use the `filesystem/read_file` tool from our `filesystem` upstream. The connection chain is:
@@ -210,9 +218,9 @@ This skill is asking permission to use the `filesystem/read_file` tool from our 
 MCP Server (filesystem) → Upstream → Tools (filesystem/read_file) → Skill (word-counter)
 ```
 
-When you write a skill that needs to read files, you reference the tool as `filesystem/read_file` in both:
-- The `tool_policy.allow` array in `skill.json`
-- The instructions in `SKILL.md` (e.g., "Read the file using `filesystem/read_file`")
+When you write a skill that needs to read files, you:
+1. Add the tool to `allowed-tools` in the YAML frontmatter
+2. Reference the tool in `SKILL.md` instructions (e.g., "Read the file using `filesystem/read_file`")
 
 ### Common MCP Servers
 
@@ -287,38 +295,32 @@ Let's create a simple skill that helps your AI greet users in a fun way.
 mkdir -p .skills/skills/greeter
 ```
 
-### Step 2: Create the manifest
+### Step 2: Create the SKILL.md
 
-Create `.skills/skills/greeter/skill.json`:
+Create `.skills/skills/greeter/SKILL.md`:
 
-```json
-{
-  "id": "greeter",
-  "title": "Friendly Greeter",
-  "version": "1.0.0",
-  "description": "Generates fun, personalized greetings",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "name": {
-        "type": "string",
-        "description": "The name of the person to greet"
-      }
-    },
-    "required": ["name"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": [],
-    "deny": [],
-    "required": []
-  },
-  "hints": {
-    "domain": ["greeting", "fun"],
-    "expected_calls": 0
-  },
-  "risk_tier": "read_only"
-}
+```markdown
+---
+name: greeter
+description: Generates fun, personalized greetings
+version: 1.0.0
+---
+
+# Friendly Greeter
+
+## Purpose
+Generates fun, personalized greetings for users.
+
+## Inputs
+- name (required): The name of the person to greet
+
+## Instructions
+1. Take the user's name from the input
+2. Generate a fun, personalized greeting
+3. Return the greeting message
+
+## Example Output
+"Hello, Alice! Welcome to skills.rs! 🎉"
 ```
 
 ### Step 3: Create the instructions
@@ -371,49 +373,27 @@ Here's where it gets really fun. You can ask your AI to create new tools for you
 
 *The AI would then:*
 1. Create a new folder in `.skills/skills/word-counter/`
-2. Write a `skill.json` manifest
-3. Write a `SKILL.md` with instructions
+2. Write a `SKILL.md` with YAML frontmatter and instructions
 4. Optionally create a Python script for the actual counting
 
 ### Here's what the AI might create:
 
-**`.skills/skills/word-counter/skill.json`:**
-```json
-{
-  "id": "word-counter",
-  "title": "Word Counter",
-  "version": "1.0.0",
-  "description": "Counts words in a text file",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "file_path": {
-        "type": "string",
-        "description": "Path to the file to count words in"
-      }
-    },
-    "required": ["file_path"]
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["filesystem/read_file"],
-    "deny": [],
-    "required": ["filesystem/read_file"]
-  },
-  "hints": {
-    "domain": ["text", "analysis"],
-    "expected_calls": 1
-  },
-  "risk_tier": "read_only"
-}
-```
-
-**`.skills/skills/word-counter/SKILL.md`:**
+**.skills/skills/word-counter/SKILL.md:**
 ```markdown
+---
+name: word-counter
+description: Counts words in a text file
+version: 1.0.0
+allowed-tools: ["filesystem/read_file"]
+---
+
 # Word Counter
 
 ## Purpose
 Count the number of words in a text file.
+
+## Parameters
+- file_path: Path to the file to count words in (required)
 
 ## Instructions
 1. Read the file using `filesystem/read_file`

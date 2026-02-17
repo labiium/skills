@@ -7,9 +7,8 @@
 //! - Pagination support
 
 use crate::core::registry::Registry;
-use crate::core::{CallableId, CallableKind, CallableRecord, RiskTier};
+use crate::core::{CallableId, CallableKind, CallableRecord};
 use parking_lot::RwLock;
-use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -52,7 +51,6 @@ pub struct SearchFilters {
 pub struct SearchQuery {
     pub q: String,
     pub kind: String, // "any", "tools", "skills"
-    pub mode: String, // "literal", "regex", "fuzzy"
     pub limit: usize,
     pub filters: Option<SearchFilters>,
     pub cursor: Option<String>,
@@ -86,14 +84,6 @@ pub struct SearchResults {
     pub matches: Vec<SearchMatch>,
     pub total_matches: usize,
     pub next_cursor: Option<String>,
-}
-
-/// Query intent detection
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum QueryIntent {
-    OutcomeBased, // "calibrate", "generate report", "measure"
-    ApiBased,     // "path", "cursor", "bytes", technical params
-    Neutral,
 }
 
 /// In-memory search engine
@@ -147,7 +137,6 @@ impl SearchEngine {
         debug!("Search query: {:?}", query.q);
 
         // Detect query intent
-        let intent = detect_intent(&query.q);
 
         // Get all callables from registry
         let mut candidates = self.registry.all();
@@ -173,15 +162,11 @@ impl SearchEngine {
         }
 
         // Score and rank matches
+        // Score and rank matches using ripgrep-style substring matching
         let mut scored: Vec<(CallableRecord, f64)> = candidates
             .into_iter()
             .filter_map(|record| {
-                let score = match query.mode.as_str() {
-                    "literal" => score_literal(&query.q, &record, intent),
-                    "regex" => score_regex(&query.q, &record).ok()?,
-                    "fuzzy" => score_fuzzy(&query.q, &record),
-                    _ => return None,
-                };
+                let score = score_ripgrep(&query.q, &record);
 
                 if score > 0.0 {
                     Some((record, score))
@@ -353,168 +338,8 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Detect query intent
-fn detect_intent(query: &str) -> QueryIntent {
-    let lower = query.to_lowercase();
-
-    // Outcome-based indicators
-    let outcome_keywords = [
-        "calibrate",
-        "characterize",
-        "measure",
-        "generate",
-        "report",
-        "analyze",
-        "plot",
-        "sweep",
-        "tune",
-        "optimize",
-        "workflow",
-        "procedure",
-        "sop",
-        "end-to-end",
-        "test",
-        "verify",
-    ];
-
-    let api_keywords = [
-        "path", "cursor", "bytes", "json", "schema", "id", "regex", "pattern", "list", "get",
-        "read", "write",
-    ];
-
-    let outcome_score = outcome_keywords
-        .iter()
-        .filter(|kw| lower.contains(*kw))
-        .count();
-
-    let api_score = api_keywords.iter().filter(|kw| lower.contains(*kw)).count();
-
-    if outcome_score > api_score {
-        QueryIntent::OutcomeBased
-    } else if api_score > outcome_score {
-        QueryIntent::ApiBased
-    } else {
-        QueryIntent::Neutral
-    }
-}
-
-/// Score using literal token matching
-fn score_literal(query: &str, record: &CallableRecord, intent: QueryIntent) -> f64 {
-    let query_tokens: HashSet<String> = tokenize(query).into_iter().collect();
-    let mut score = 0.0;
-
-    // Name exact match (highest weight)
-    if record.name.to_lowercase() == query.to_lowercase() {
-        score += 100.0;
-    }
-
-    // FQ name exact match
-    if record.fq_name.to_lowercase() == query.to_lowercase() {
-        score += 90.0;
-    }
-
-    // Token matches in name
-    let name_tokens = tokenize(&record.name);
-    for token in &query_tokens {
-        if name_tokens.contains(token) {
-            score += 20.0;
-        }
-    }
-
-    // Token matches in title
-    if let Some(title) = &record.title {
-        let title_tokens = tokenize(title);
-        for token in &query_tokens {
-            if title_tokens.contains(token) {
-                score += 10.0;
-            }
-        }
-    }
-
-    // Token matches in description
-    if let Some(desc) = &record.description {
-        let desc_tokens = tokenize(desc);
-        for token in &query_tokens {
-            if desc_tokens.contains(token) {
-                score += 5.0;
-            }
-        }
-    }
-
-    // Schema key matches
-    let schema_keys = extract_input_keys(&record.input_schema);
-    for token in &query_tokens {
-        if schema_keys.iter().any(|k| k.to_lowercase().contains(token)) {
-            score += 8.0;
-        }
-    }
-
-    // Tag matches
-    for token in &query_tokens {
-        if record.tags.iter().any(|t| t.to_lowercase().contains(token)) {
-            score += 12.0;
-        }
-    }
-
-    // Intent-based adjustments
-    match intent {
-        QueryIntent::OutcomeBased => {
-            if record.kind == CallableKind::Skill {
-                score *= 1.3; // Boost skills for outcome queries
-            }
-        }
-        QueryIntent::ApiBased => {
-            if record.kind == CallableKind::Tool {
-                score *= 1.3; // Boost tools for API queries
-            }
-        }
-        QueryIntent::Neutral => {}
-    }
-
-    // Risk tier penalty for high-risk operations (unless query indicates intent)
-    if record.risk_tier >= RiskTier::Destructive {
-        let destructive_keywords = ["delete", "remove", "destroy", "drop", "clear"];
-        if !destructive_keywords
-            .iter()
-            .any(|kw| query.to_lowercase().contains(kw))
-        {
-            score *= 0.7;
-        }
-    }
-
-    score
-}
-
-/// Score using regex matching
-fn score_regex(pattern: &str, record: &CallableRecord) -> Result<f64> {
-    let re = Regex::new(pattern)?;
-    let mut score = 0.0;
-
-    if re.is_match(&record.name) {
-        score += 50.0;
-    }
-
-    if re.is_match(&record.fq_name) {
-        score += 40.0;
-    }
-
-    if let Some(title) = &record.title {
-        if re.is_match(title) {
-            score += 20.0;
-        }
-    }
-
-    if let Some(desc) = &record.description {
-        if re.is_match(desc) {
-            score += 10.0;
-        }
-    }
-
-    Ok(score)
-}
-
 /// Score using fuzzy matching (simple edit distance)
-fn score_fuzzy(query: &str, record: &CallableRecord) -> f64 {
+fn score_ripgrep(query: &str, record: &CallableRecord) -> f64 {
     let query_lower = query.to_lowercase();
     let mut score = 0.0;
 

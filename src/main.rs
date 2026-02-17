@@ -8,12 +8,14 @@
 
 mod paths;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use paths::{paths_from_env, PathsConfig, SkillsPaths};
 use rmcp::{transport::stdio, ServiceExt};
+use skillsrs::core::persistence::PersistenceLayer;
 use skillsrs::core::policy::{PolicyConfig, PolicyEngine};
 use skillsrs::core::registry::Registry;
+use skillsrs::core::CallableKind;
 use skillsrs::execution::upstream::UpstreamManager;
 use skillsrs::execution::{sandbox::SandboxBackend, sandbox::SandboxConfig, Runtime};
 use skillsrs::mcp::SkillsServer;
@@ -47,17 +49,9 @@ struct Cli {
     #[arg(long)]
     global: bool,
 
-    /// Data directory (overrides config and system default)
-    #[arg(long, env = "SKILLS_DATA_DIR")]
-    data_dir: Option<String>,
-
-    /// Skills root directory (overrides config)
-    #[arg(long, env = "SKILLS_ROOT")]
-    skills_root: Option<String>,
-
-    /// Database path (overrides config)
-    #[arg(long, env = "SKILLS_DATABASE_PATH")]
-    database: Option<String>,
+    /// Root path for skills data (overrides config)
+    #[arg(long, env = "SKILLS_PATH")]
+    path: Option<String>,
 
     /// Disable sandboxing (allows full system access - use with caution)
     #[arg(long, env = "SKILLS_NO_SANDBOX")]
@@ -384,7 +378,6 @@ fn is_default_paths_config(cfg: &PathsConfig) -> bool {
         && cfg.config_dir.is_none()
         && cfg.cache_dir.is_none()
         && cfg.database_path.is_none()
-        && cfg.skills_root.is_none()
         && cfg.logs_dir.is_none()
 }
 
@@ -555,7 +548,6 @@ fn merge_config(base: &mut Config, overlay: Config) {
         || overlay.paths.config_dir.is_some()
         || overlay.paths.cache_dir.is_some()
         || overlay.paths.database_path.is_some()
-        || overlay.paths.skills_root.is_some()
         || overlay.paths.logs_dir.is_some()
     {
         base.paths = overlay.paths;
@@ -603,15 +595,14 @@ fn resolve_paths(cli: &Cli, config: &Config) -> Result<SkillsPaths> {
     // Apply environment variable overrides
     paths = paths_from_env().apply_to(paths);
 
-    // Apply CLI argument overrides (highest priority)
-    if let Some(ref data_dir) = cli.data_dir {
-        paths.data_dir = data_dir.into();
-    }
-    if let Some(ref skills_root) = cli.skills_root {
-        paths.skills_root = skills_root.into();
-    }
-    if let Some(ref database) = cli.database {
-        paths.database_path = database.into();
+    // Apply CLI argument override (highest priority)
+    if let Some(ref path) = cli.path {
+        let base = PathBuf::from(path);
+        paths.data_dir = base.clone();
+        paths.cache_dir = base.join("cache");
+        paths.database_path = base.join("skills.db");
+        paths.skills_root = base.join("skills");
+        paths.logs_dir = base.join("logs");
     }
 
     // Ensure all directories exist
@@ -629,6 +620,13 @@ async fn init_server(
     info!("Initializing skills.rs server");
     info!("Using skills root: {}", paths.skills_root.display());
     info!("Using database: {}", paths.database_path.display());
+
+    // Initialize persistence layer for FTS search
+    let _persistence = Arc::new(
+        PersistenceLayer::new(&paths.database_path)
+            .await
+            .context("Failed to initialize persistence")?,
+    );
 
     if no_sandbox {
         info!("⚠️  Sandboxing DISABLED - tools have full system access");
@@ -706,13 +704,78 @@ async fn init_server(
         }
     }
 
-    // Create skill store with resolved paths
-    let skill_store = Arc::new(SkillStore::new(&paths.skills_root, registry.clone())?);
+    // Create skill store with search engine so incremental updates can touch index.
+    let mut skill_store = SkillStore::with_search_engine(
+        &paths.skills_root,
+        registry.clone(),
+        search_engine.clone(),
+    )?;
 
     // Load and register skills
     if let Err(e) = skill_store.load_and_register_all().await {
         error!("Failed to load skills: {}", e);
     }
+
+    // Start filesystem watcher to keep registry/search in sync with direct file edits.
+    match skill_store.start_watch() {
+        Ok(mut reload_rx) => {
+            let watch_registry = registry.clone();
+            let watch_search = search_engine.clone();
+            let watch_root = paths.skills_root.clone();
+            tokio::spawn(async move {
+                while let Some(skill_path) = reload_rx.recv().await {
+                    let hot_store = match SkillStore::with_search_engine(
+                        &watch_root,
+                        watch_registry.clone(),
+                        watch_search.clone(),
+                    ) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            error!("Hot-reload: failed to create skill store: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let skill_md = skill_path.join("SKILL.md");
+                    if skill_md.exists() {
+                        match hot_store.load_skill(&skill_path).await {
+                            Ok(skill) => {
+                                if let Err(e) = hot_store.register_skill(&skill) {
+                                    error!(
+                                        "Hot-reload: failed to register skill at {:?}: {}",
+                                        skill_path, e
+                                    );
+                                } else {
+                                    info!("Hot-reload: registered skill from {:?}", skill_path);
+                                }
+                            }
+                            Err(e) => warn!(
+                                "Hot-reload: failed to load changed skill at {:?}: {}",
+                                skill_path, e
+                            ),
+                        }
+                        continue;
+                    }
+
+                    // If SKILL.md disappeared, remove corresponding skill from registry/index.
+                    let Some(skill_name) = skill_path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let skills = watch_registry.by_kind(CallableKind::Skill);
+                    for callable in skills {
+                        if callable.id.skill_name().as_deref() == Some(skill_name) {
+                            watch_search.remove_record(&callable.id);
+                            watch_registry.remove(&callable.id);
+                            info!("Hot-reload: removed skill {}", callable.id.as_str());
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => warn!("Failed to start skill watcher: {}", e),
+    }
+
+    let skill_store = Arc::new(skill_store);
 
     // Create MCP server
     let server = SkillsServer::new(registry, search_engine, policy_engine, runtime, skill_store);
@@ -1676,13 +1739,17 @@ agent_skills_repos:
             eprintln!("skills.rs - System Paths\n");
             eprintln!("{}", paths.display());
             eprintln!("\n✓ All directories exist and are accessible");
-            eprintln!("\nEnvironment variables for overrides:");
-            eprintln!("  SKILLS_DATA_DIR       - Override data directory");
-            eprintln!("  SKILLS_CONFIG_DIR     - Override config directory");
-            eprintln!("  SKILLS_CACHE_DIR      - Override cache directory");
-            eprintln!("  SKILLS_DATABASE_PATH  - Override database path");
-            eprintln!("  SKILLS_ROOT           - Override skills directory");
-            eprintln!("  SKILLS_LOGS_DIR       - Override logs directory");
+            eprintln!("\nEnvironment variable for override:");
+            eprintln!(
+                "  SKILLS_PATH  - Set root path for all skills data (default: platform-specific)"
+            );
+            eprintln!("\nDirectory structure:");
+            eprintln!("  {{SKILLS_PATH}}/");
+            eprintln!("  ├── config.yaml       # Configuration file");
+            eprintln!("  ├── skills/           # Skills directory");
+            eprintln!("  ├── skills.db         # SQLite database");
+            eprintln!("  ├── cache/            # Cache files");
+            eprintln!("  └── logs/             # Log files");
         }
 
         Commands::Search { query, kind } => {
@@ -1709,7 +1776,6 @@ agent_skills_repos:
             let search_query = skillsrs::storage::search::SearchQuery {
                 q: query.clone(),
                 kind: kind.unwrap_or_else(|| "any".to_string()),
-                mode: "literal".to_string(),
                 limit: 10,
                 filters: None,
                 cursor: None,
@@ -1790,8 +1856,10 @@ agent_skills_repos:
                         description: desc,
                         skill_md_content,
                         uses_tools,
-                        bundled_files: vec![],
                         tags: vec!["cli-created".to_string()],
+                        scripts: vec![],
+                        references: vec![],
+                        assets: vec![],
                     };
 
                     let id = skill_store.create_skill(request).await?;
@@ -1874,8 +1942,10 @@ agent_skills_repos:
                             .unwrap_or_else(|| format!("Skill: {}", skill_name)),
                         skill_md_content,
                         uses_tools,
-                        bundled_files: vec![],
                         tags: vec!["cli-updated".to_string()],
+                        scripts: vec![],
+                        references: vec![],
+                        assets: vec![],
                     };
 
                     let id = skill_store.update_skill(&skill_name, request).await?;

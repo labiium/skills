@@ -55,11 +55,6 @@ pub struct SearchInput {
     #[schemars(description = "Filter by callable kind: any, tools, or skills")]
     pub kind: String,
 
-    /// Query matching mode
-    #[serde(default = "default_mode")]
-    #[schemars(description = "Query matching mode: literal, regex, or fuzzy")]
-    pub mode: String,
-
     /// Maximum results to return
     #[serde(default = "default_limit")]
     #[schemars(description = "Maximum results to return (1-50)")]
@@ -91,10 +86,6 @@ pub struct IncludeOptions {
 
 fn default_kind() -> String {
     "any".to_string()
-}
-
-fn default_mode() -> String {
-    "literal".to_string()
 }
 
 fn default_limit() -> usize {
@@ -355,7 +346,6 @@ impl SkillsServer {
         let query = SearchQuery {
             q: input.q,
             kind: input.kind,
-            mode: input.mode,
             limit: input.limit.clamp(1, 50),
             filters: input.filters,
             cursor: input.cursor,
@@ -575,8 +565,10 @@ impl SkillsServer {
                     description,
                     skill_md_content: skill_md,
                     uses_tools: input.uses_tools.unwrap_or_default(),
-                    bundled_files: input.bundled_files.unwrap_or_default(),
                     tags: input.tags.unwrap_or_default(),
+                    scripts: input.scripts.unwrap_or_default(),
+                    references: input.references.unwrap_or_default(),
+                    assets: input.assets.unwrap_or_default(),
                 };
 
                 let id: crate::core::CallableId = self
@@ -698,8 +690,10 @@ impl SkillsServer {
                     description,
                     skill_md_content: skill_md,
                     uses_tools: input.uses_tools.unwrap_or_default(),
-                    bundled_files: input.bundled_files.unwrap_or_default(),
                     tags: input.tags.unwrap_or_default(),
+                    scripts: input.scripts.unwrap_or_default(),
+                    references: input.references.unwrap_or_default(),
+                    assets: input.assets.unwrap_or_default(),
                 };
 
                 let id: crate::core::CallableId = self
@@ -859,10 +853,18 @@ pub struct ManageInput {
     /// MCP tools this skill uses (optional)
     #[serde(default)]
     pub uses_tools: Option<Vec<String>>,
-    /// Bundled files as (filename, content) pairs (optional)
+    /// Scripts as (filename, content) pairs to place in scripts/ subdirectory
     #[schemars(schema_with = "bundled_files_schema")]
     #[serde(default)]
-    pub bundled_files: Option<Vec<(String, String)>>,
+    pub scripts: Option<Vec<(String, String)>>,
+    /// Reference files as (filename, content) pairs to place in references/ subdirectory
+    #[schemars(schema_with = "bundled_files_schema")]
+    #[serde(default)]
+    pub references: Option<Vec<(String, String)>>,
+    /// Asset files as (filename, content) pairs to place in assets/ subdirectory
+    #[schemars(schema_with = "bundled_files_schema")]
+    #[serde(default)]
+    pub assets: Option<Vec<(String, String)>>,
     /// Tags for categorization (optional)
     #[serde(default)]
     pub tags: Option<Vec<String>>,

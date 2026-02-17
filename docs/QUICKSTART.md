@@ -39,7 +39,6 @@ Edit `.skills/config.yaml` as needed. Example:
 ```yaml
 paths:
   data_dir: ".skills"
-  skills_root: ".skills/skills"
   database_path: ".skills/skills.db"
 
 sandbox:
@@ -73,49 +72,23 @@ sandbox:
 ## 3. Create Your First Skill
 
 ```bash
-# Create skills directory (matches paths.skills_root in .skills/config.yaml)
+# Create skills directory
 mkdir -p .skills/skills/my-first-skill
 
-# Create skill manifest
-cat > .skills/skills/my-first-skill/skill.json << 'EOF'
-{
-  "id": "my-first-skill",
-  "title": "My First Skill",
-  "version": "1.0.0",
-  "description": "A simple test skill",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "message": {
-        "type": "string",
-        "description": "Message to process"
-      }
-    },
-    "required": ["message"]
-  },
-  "outputs": null,
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["brave_search"],
-    "deny": [],
-    "required": []
-  },
-  "hints": {
-    "intent": ["test"],
-    "domain": ["demo"],
-    "outcomes": ["message"],
-    "expected_calls": 1
-  },
-  "risk_tier": "read_only"
-}
-EOF
-
-# Create skill instructions
+# Create SKILL.md with YAML frontmatter
 cat > .skills/skills/my-first-skill/SKILL.md << 'EOF'
+---
+name: my-first-skill
+description: A simple test skill
+version: 1.0.0
+allowed-tools: ["brave_search"]
+tags: ["demo", "test"]
+---
+
 # My First Skill
 
 ## Purpose
-A simple test skill that demonstrates the basic structure.
+A simple test skill that demonstrates the SKILL.md format.
 
 ## Instructions
 1. Read the input message

@@ -48,15 +48,16 @@ fn test_ensure_directories() {
 #[test]
 fn test_path_overrides() {
     let temp_dir = TempDir::new().unwrap();
-    let custom_skills = temp_dir.path().join("custom_skills");
+    let custom_root = temp_dir.path().join("custom_skills");
 
     let config = PathsConfig {
-        skills_root: Some(custom_skills.clone()),
+        data_dir: Some(custom_root.clone()),
         ..Default::default()
     };
 
     let paths = config.apply_to(SkillsPaths::new().unwrap());
-    assert_eq!(paths.skills_root, custom_skills);
+    // skills_root is derived from data_dir/skills/
+    assert_eq!(paths.skills_root, custom_root.join("skills"));
 }
 
 #[test]

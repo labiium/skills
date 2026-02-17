@@ -119,25 +119,26 @@ skills --skills-root /custom/skills list
 skills --database /custom/db/skills.db server
 ```
 
-**Environment variables:**
+**Environment variable:**
 ```bash
-export SKILLS_DATA_DIR=/custom/data
-export SKILLS_ROOT=/custom/skills
-export SKILLS_DATABASE_PATH=/custom/db/skills.db
-export SKILLS_CONFIG_DIR=/etc/skills
-export SKILLS_CACHE_DIR=/var/cache/skills
-export SKILLS_LOGS_DIR=/var/log/skills
+export SKILLS_PATH=/var/lib/skills
 ```
+
+All paths are derived from `SKILLS_PATH`:
+- Config: `{SKILLS_PATH}/config.yaml`
+- Skills: `{SKILLS_PATH}/skills/`
+- Database: `{SKILLS_PATH}/skills.db`
+- Cache: `{SKILLS_PATH}/cache/`
+- Logs: `{SKILLS_PATH}/logs/`
 
 **Configuration file (`config.yaml`):**
 ```yaml
 paths:
   data_dir: "/var/lib/skills"
-  config_dir: "/etc/skills"
-  cache_dir: "/var/cache/skills"
-  database_path: "/var/lib/skills/skills.db"
-  skills_root: "/var/lib/skills/skills"
-  logs_dir: "/var/log/skills"
+
+sandbox:
+  backend: timeout
+  timeout_ms: 30000
 ```
 
 ### Configuration Priority
@@ -334,8 +335,7 @@ After=network.target
 [Service]
 Type=simple
 User=skills
-Environment=SKILLS_DATA_DIR=/var/lib/skills
-Environment=SKILLS_CONFIG_DIR=/etc/skills
+Environment=SKILLS_PATH=/var/lib/skills
 ExecStart=/usr/local/bin/skills server stdio
 Restart=on-failure
 RestartSec=10
@@ -649,8 +649,7 @@ services:
       - skills-config:/etc/skills
       - ./skills:/data/skills:ro
     environment:
-      - SKILLS_DATA_DIR=/data
-      - SKILLS_CONFIG_DIR=/etc/skills
+      - SKILLS_PATH=/data
       - RUST_LOG=info
     command: server http --bind 0.0.0.0:8000
 
@@ -801,7 +800,7 @@ Error: Failed to create directory: /var/lib/skills
 **Solution:**
 ```bash
 # Use user-owned directory
-export SKILLS_DATA_DIR=$HOME/.local/share/skills
+export SKILLS_PATH=$HOME/.local/share/skills
 skills server
 
 # Or fix permissions (system-wide)
@@ -985,12 +984,8 @@ sudo chown -R 1000:1000 ./skills-data
 
 ### Environment Variables
 
-- `SKILLS_DATA_DIR` - Override data directory
-- `SKILLS_CONFIG_DIR` - Override config directory
-- `SKILLS_CACHE_DIR` - Override cache directory
-- `SKILLS_DATABASE_PATH` - Override database path
-- `SKILLS_ROOT` - Override skills directory
-- `SKILLS_LOGS_DIR` - Override logs directory
+- `SKILLS_PATH` - Set root path for all skills data (default: platform-specific)
+
 - `SKILLS_NO_SANDBOX` - Disable sandboxing (`1` or `true`)
 - `RUST_LOG` - Set log level (`error`, `warn`, `info`, `debug`, `trace`)
 

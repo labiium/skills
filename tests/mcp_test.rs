@@ -20,7 +20,10 @@ fn test_server_exposes_core_tools() {
     let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
     let runtime = Arc::new(Runtime::new(registry.clone(), upstream_manager));
     let temp_dir = TempDir::new().unwrap();
-    let skill_store = Arc::new(SkillStore::new(temp_dir.path(), registry.clone()).unwrap());
+    let skill_store = Arc::new(
+        SkillStore::with_search_engine(temp_dir.path(), registry.clone(), search_engine.clone())
+            .unwrap(),
+    );
 
     let _server = SkillsServer::new(registry, search_engine, policy_engine, runtime, skill_store);
 
@@ -41,7 +44,10 @@ fn test_server_creation() {
     let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
     let runtime = Arc::new(Runtime::new(registry.clone(), upstream_manager));
     let temp_dir = TempDir::new().unwrap();
-    let skill_store = Arc::new(SkillStore::new(temp_dir.path(), registry.clone()).unwrap());
+    let skill_store = Arc::new(
+        SkillStore::with_search_engine(temp_dir.path(), registry.clone(), search_engine.clone())
+            .unwrap(),
+    );
 
     // This should not panic
     let _server = SkillsServer::new(registry, search_engine, policy_engine, runtime, skill_store);
@@ -56,7 +62,10 @@ async fn test_search_tool_through_server() {
     let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
     let runtime = Arc::new(Runtime::new(registry.clone(), upstream_manager));
     let temp_dir = TempDir::new().unwrap();
-    let skill_store = Arc::new(SkillStore::new(temp_dir.path(), registry.clone()).unwrap());
+    let skill_store = Arc::new(
+        SkillStore::with_search_engine(temp_dir.path(), registry.clone(), search_engine.clone())
+            .unwrap(),
+    );
 
     // Register a test record
     let schema = serde_json::json!({"type": "object"});

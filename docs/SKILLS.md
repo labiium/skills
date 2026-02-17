@@ -157,42 +157,30 @@ Beyond tool aggregation, skills.rs introduces a **skills system** — reusable p
 
 A skill is a directory containing:
 
-- **skill.json** - Manifest with inputs, outputs, and metadata
-- **SKILL.md** - Natural language instructions for the agent
-- **Optional bundled scripts** - Python, Bash, or other executables
-- **Support files** - Data, schemas, documentation
+- **SKILL.md** - Instructions with YAML frontmatter (required)
+- **scripts/** - Bundled executables (optional)
+- **references/** - Reference documentation (optional)
+- **assets/** - Binary assets (optional)
 
 ### Example: Web Researcher Skill
 
 ```
-skills/web-researcher/
-├── skill.json             # Metadata and schema
-├── SKILL.md               # Instructions for agent
-├── search.py              # Bundled Python tool
-└── search.py.schema.json  # Tool schema
-```
-
-**skill.json:**
-```json
-{
-  "id": "web-researcher",
-  "version": "1.0.0",
-  "description": "Research topics using web search",
-  "inputs": {
-    "type": "object",
-    "properties": {
-      "query": {"type": "string"}
-    }
-  },
-  "entrypoint": "prompted",
-  "tool_policy": {
-    "allow": ["brave_search"]
-  }
-}
+.skills/skills/web-researcher/
+├── SKILL.md               # Instructions with YAML frontmatter
+├── scripts/               # Bundled scripts
+│   └── search.py
+└── references/            # Reference docs
 ```
 
 **SKILL.md:**
 ```markdown
+---
+name: web-researcher
+description: Research topics using web search
+version: 1.0.0
+allowed-tools: ["brave_search"]
+---
+
 # Web Researcher
 
 ## Purpose

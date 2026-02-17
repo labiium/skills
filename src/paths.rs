@@ -166,10 +166,6 @@ pub struct PathsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_path: Option<PathBuf>,
 
-    /// Override skills root
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skills_root: Option<PathBuf>,
-
     /// Override logs directory
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logs_dir: Option<PathBuf>,
@@ -177,6 +173,9 @@ pub struct PathsConfig {
 
 impl PathsConfig {
     /// Apply overrides to default paths
+    ///
+    /// Note: skills_root is always derived from data_dir/skills/ to enforce
+    /// the nested directory structure regardless of configuration.
     pub fn apply_to(&self, mut paths: SkillsPaths) -> SkillsPaths {
         if let Some(ref data_dir) = self.data_dir {
             paths.data_dir = data_dir.clone();
@@ -190,9 +189,9 @@ impl PathsConfig {
         if let Some(ref database_path) = self.database_path {
             paths.database_path = database_path.clone();
         }
-        if let Some(ref skills_root) = self.skills_root {
-            paths.skills_root = skills_root.clone();
-        }
+        // Always derive skills_root from data_dir/skills/
+        // This enforces the nested structure: .skills/skills/
+        paths.skills_root = paths.data_dir.join("skills");
         if let Some(ref logs_dir) = self.logs_dir {
             paths.logs_dir = logs_dir.clone();
         }
@@ -200,24 +199,24 @@ impl PathsConfig {
     }
 }
 
-/// Get paths from environment variables or config
+/// Get paths from environment variable
 ///
-/// Environment variables take precedence:
-/// - SKILLS_DATA_DIR
-/// - SKILLS_CONFIG_DIR
-/// - SKILLS_CACHE_DIR
-/// - SKILLS_DATABASE_PATH
-/// - SKILLS_ROOT
-/// - SKILLS_LOGS_DIR
+/// Only SKILLS_PATH is supported. All other paths are derived from it:
+/// - Skills: {SKILLS_PATH}/skills/
+/// - Database: {SKILLS_PATH}/skills.db
+/// - Cache: {SKILLS_PATH}/cache/
+/// - Logs: {SKILLS_PATH}/logs/
 pub fn paths_from_env() -> PathsConfig {
-    PathsConfig {
-        data_dir: std::env::var("SKILLS_DATA_DIR").ok().map(PathBuf::from),
-        config_dir: std::env::var("SKILLS_CONFIG_DIR").ok().map(PathBuf::from),
-        cache_dir: std::env::var("SKILLS_CACHE_DIR").ok().map(PathBuf::from),
-        database_path: std::env::var("SKILLS_DATABASE_PATH")
-            .ok()
-            .map(PathBuf::from),
-        skills_root: std::env::var("SKILLS_ROOT").ok().map(PathBuf::from),
-        logs_dir: std::env::var("SKILLS_LOGS_DIR").ok().map(PathBuf::from),
+    if let Ok(path) = std::env::var("SKILLS_PATH") {
+        let base = PathBuf::from(path);
+        PathsConfig {
+            data_dir: Some(base.clone()),
+            config_dir: None,
+            cache_dir: Some(base.join("cache")),
+            database_path: Some(base.join("skills.db")),
+            logs_dir: Some(base.join("logs")),
+        }
+    } else {
+        PathsConfig::default()
     }
 }

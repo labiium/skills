@@ -66,6 +66,10 @@ pub struct AgentSkillsFrontmatter {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// Version (optional, defaults to "1.0.0")
+    #[serde(default = "default_version")]
+    pub version: String,
+
     /// License (optional)
     #[serde(default)]
     pub license: Option<String>,
@@ -82,6 +86,11 @@ pub struct AgentSkillsFrontmatter {
     /// Accepts both string format ("Bash Read Write") and array format (["Bash", "Read", "Write"])
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Option<AllowedTools>,
+}
+
+/// Default version for Agent Skills
+fn default_version() -> String {
+    "1.0.0".to_string()
 }
 
 /// Parsed Agent Skill
@@ -258,13 +267,9 @@ impl AgentSkill {
             .unwrap_or_default()
     }
 
-    /// Extract version from metadata or default to "1.0.0"
+    /// Extract version from frontmatter
     pub fn version(&self) -> String {
-        self.frontmatter
-            .metadata
-            .get("version")
-            .cloned()
-            .unwrap_or_else(|| "1.0.0".to_string())
+        self.frontmatter.version.clone()
     }
 
     /// Extract author from metadata
