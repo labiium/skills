@@ -41,6 +41,7 @@ pub struct SkillsServer {
     policy_engine: Arc<PolicyEngine>,
     runtime: Arc<Runtime>,
     skill_store: Arc<SkillStore>,
+    upstream_manager: Option<Arc<crate::execution::upstream::UpstreamManager>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -289,8 +290,14 @@ impl SkillsServer {
             policy_engine,
             runtime,
             skill_store,
+            upstream_manager: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    pub fn with_upstream_manager(mut self, upstream_manager: Arc<crate::execution::upstream::UpstreamManager>) -> Self {
+        self.upstream_manager = Some(upstream_manager);
+        self
     }
 
     /// Convert ToolResult to CallToolResult
@@ -541,7 +548,7 @@ impl SkillsServer {
     /// the "Finite Context" principle while enabling full CRUD functionality.
     #[tool(
         name = "manage",
-        description = "Manage skill lifecycle: create, get, update, delete skills. Operations: create (requires name, description, skill_md), get (requires skill_id), update (requires skill_id, name, description, skill_md), delete (requires skill_id)."
+        description = "Manage skill and upstream lifecycle. Operations: create/get/update/delete skills, add_upstream/remove_upstream/list_upstreams. For add_upstream: requires upstream_alias, transport, url|command, optional description and tags."
     )]
     async fn manage(
         &self,
@@ -718,7 +725,6 @@ impl SkillsServer {
                     .skill_id
                     .ok_or("skill_id is required for delete operation")?;
 
-                // Parse skill_id
                 let skill_name = if skill_id.starts_with("skill:") {
                     skill_id
                         .strip_prefix("skill:")
@@ -741,6 +747,146 @@ impl SkillsServer {
                     name: Some(skill_name),
                     message: format!("Skill {} deleted successfully", skill_id),
                     data: None,
+                }))
+            }
+
+            ManageOperation::AddUpstream => {
+                let alias = input.upstream_alias.ok_or("upstream_alias is required for add_upstream operation")?;
+                let transport_str = input.transport.ok_or("transport is required for add_upstream operation")?;
+                
+                let transport = match transport_str.as_str() {
+                    "stdio" => crate::execution::upstream::Transport::Stdio,
+                    "http" => crate::execution::upstream::Transport::Http,
+                    "http_sse" | "http+sse" => crate::execution::upstream::Transport::HttpSse,
+                    _ => return Err(format!("Invalid transport type: {}", transport_str)),
+                };
+
+                let config = crate::execution::upstream::UpstreamConfig {
+                    alias: alias.clone(),
+                    transport,
+                    command: input.command,
+                    url: input.url,
+                    auth: None,
+                    repo: None,
+                    git_ref: None,
+                    skills: None,
+                    roots: None,
+                    tags: input.tags.unwrap_or_default(),
+                    sandbox_config: None,
+                    description: input.upstream_description,
+                };
+
+                let message = if let Some(ref upstream_manager) = self.upstream_manager {
+                    upstream_manager.add_upstream(config).await
+                        .map_err(|e| format!("Failed to add upstream: {}", e))?;
+                    
+                    if input.test_connection {
+                        format!("Upstream MCP server '{}' added and connected successfully", alias)
+                    } else {
+                        format!("Upstream MCP server '{}' added (connection test skipped)", alias)
+                    }
+                } else {
+                    return Err("Upstream manager not available".to_string());
+                };
+
+                info!("Added upstream: {}", alias);
+                
+                Ok(Json(ManageOutput {
+                    operation: "add_upstream".to_string(),
+                    skill_id: None,
+                    name: Some(alias.clone()),
+                    message,
+                    data: Some(serde_json::json!({ "alias": alias, "transport": transport_str })),
+                }))
+            }
+
+            ManageOperation::RemoveUpstream => {
+                let alias = input.upstream_alias.ok_or("upstream_alias is required for remove_upstream operation")?;
+
+                if let Some(ref upstream_manager) = self.upstream_manager {
+                    upstream_manager.disconnect(&alias).await
+                        .map_err(|e| format!("Failed to remove upstream: {}", e))?;
+                } else {
+                    return Err("Upstream manager not available".to_string());
+                }
+
+                info!("Removed upstream: {}", alias);
+                
+                Ok(Json(ManageOutput {
+                    operation: "remove_upstream".to_string(),
+                    skill_id: None,
+                    name: Some(alias.clone()),
+                    message: format!("Upstream MCP server '{}' removed successfully", alias),
+                    data: None,
+                }))
+            }
+
+            ManageOperation::ListUpstreams => {
+                let servers = if let Some(ref upstream_manager) = self.upstream_manager {
+                    upstream_manager.list_servers().await
+                } else {
+                    return Err("Upstream manager not available".to_string());
+                };
+
+                let message = if servers.is_empty() {
+                    "No upstream MCP servers configured".to_string()
+                } else {
+                    format!("Found {} upstream server(s): {}", servers.len(), servers.join(", "))
+                };
+
+                info!("Listed {} upstream servers", servers.len());
+                
+                Ok(Json(ManageOutput {
+                    operation: "list_upstreams".to_string(),
+                    skill_id: None,
+                    name: None,
+                    message,
+                    data: Some(serde_json::json!({ "servers": servers, "count": servers.len() })),
+                }))
+            }
+
+            ManageOperation::UpdateUpstream => {
+                let alias = input.upstream_alias.ok_or("upstream_alias is required for update_upstream operation")?;
+                
+                let updates = if let Some(ref upstream_manager) = self.upstream_manager {
+                    let current = upstream_manager.get_config(&alias).await
+                        .ok_or(format!("Upstream '{}' not found", alias))?;
+                    
+                    crate::execution::upstream::UpstreamConfig {
+                        alias: alias.clone(),
+                        transport: current.transport,
+                        command: input.command.or(current.command),
+                        url: input.url.or(current.url),
+                        auth: current.auth,
+                        repo: current.repo,
+                        git_ref: current.git_ref,
+                        skills: current.skills,
+                        roots: current.roots,
+                        tags: if let Some(tags) = input.tags {
+                            if tags.is_empty() { current.tags } else { tags }
+                        } else {
+                            current.tags
+                        },
+                        sandbox_config: current.sandbox_config,
+                        description: input.upstream_description.or(current.description),
+                    }
+                } else {
+                    return Err("Upstream manager not available".to_string());
+                };
+
+                if let Some(ref upstream_manager) = self.upstream_manager {
+                    upstream_manager.update_upstream(&alias, updates).await
+                        .map_err(|e| format!("Failed to update upstream: {}", e))?;
+                }
+
+                info!("Updated upstream: {}", alias);
+                
+                Ok(Json(ManageOutput {
+                    operation: "update_upstream".to_string(),
+                    skill_id: None,
+                    name: Some(alias.clone()),
+                    message: format!("Upstream MCP server '{}' updated successfully", alias),
+                    data: Some(serde_json::json!({ "alias": alias })),
                 }))
             }
         }
@@ -828,12 +974,20 @@ pub enum ManageOperation {
     Update,
     /// Delete a skill
     Delete,
+    /// Add an upstream MCP server
+    AddUpstream,
+    /// Remove an upstream MCP server
+    RemoveUpstream,
+    /// List all upstream MCP servers
+    ListUpstreams,
+    /// Update an upstream MCP server configuration
+    UpdateUpstream,
 }
 
 /// Unified input for skill management operations
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ManageInput {
-    /// Operation to perform: create, get, update, delete
+    /// Operation to perform: create, get, update, delete, add_upstream, remove_upstream, list_upstreams
     pub operation: ManageOperation,
     /// Skill ID (required for get, update, delete; optional for create)
     #[serde(default)]
@@ -871,6 +1025,24 @@ pub struct ManageInput {
     /// Specific filename to load when getting content (optional)
     #[serde(default)]
     pub filename: Option<String>,
+    /// Upstream alias (required for add_upstream, remove_upstream)
+    #[serde(default)]
+    pub upstream_alias: Option<String>,
+    /// Transport type for upstream: stdio, http, http_sse (required for add_upstream)
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// URL for HTTP transport (required for http transport)
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Command for stdio transport as array of strings (required for stdio transport)
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Test connection after adding (optional, defaults to true)
+    #[serde(default = "default_true")]
+    pub test_connection: bool,
+    /// Description of the upstream MCP server (optional, helps LLMs discover tools)
+    #[serde(default)]
+    pub upstream_description: Option<String>,
 }
 
 /// Output from management operations

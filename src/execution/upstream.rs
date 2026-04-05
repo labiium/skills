@@ -87,6 +87,8 @@ pub struct UpstreamConfig {
     /// Sandbox configuration override for this upstream server
     #[serde(default)]
     pub sandbox_config: Option<SandboxConfigOverride>,
+
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -889,6 +891,52 @@ impl UpstreamManager {
     pub async fn get_state(&self, alias: &str) -> Option<ConnectionState> {
         let sessions = self.sessions.read().await;
         sessions.get(alias).map(|s| s.state)
+    }
+
+    pub async fn get_config(&self, alias: &str) -> Option<UpstreamConfig> {
+        let sessions = self.sessions.read().await;
+        sessions.get(alias).map(|s| s.config.clone())
+    }
+
+    pub async fn update_upstream(&self, alias: &str, updates: UpstreamConfig) -> Result<()> {
+        info!("Updating upstream server: {}", alias);
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(alias)
+            .ok_or_else(|| UpstreamError::ServerNotFound(alias.to_string()))?;
+
+        if let Some(desc) = updates.description {
+            session.config.description = Some(desc);
+        }
+        if !updates.tags.is_empty() {
+            session.config.tags = updates.tags;
+        }
+        
+        if updates.url.is_some() {
+            session.config.url = updates.url;
+        }
+        if updates.command.is_some() {
+            session.config.command = updates.command;
+        }
+
+        let health = match session.state {
+            ConnectionState::Connected => ServerHealth::Connected,
+            ConnectionState::Degraded => ServerHealth::Degraded,
+            ConnectionState::Disconnected | ConnectionState::Failed => ServerHealth::Down,
+            ConnectionState::Connecting => ServerHealth::Connected,
+        };
+
+        self.registry.update_server(ServerInfo {
+            alias: alias.to_string(),
+            health,
+            tool_count: session.tools.len(),
+            last_refresh: chrono::Utc::now(),
+            tags: session.config.tags.clone(),
+        });
+
+        info!("Updated upstream server: {}", alias);
+        Ok(())
     }
 
     /// Disconnect from a server

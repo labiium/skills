@@ -71,6 +71,7 @@ async fn test_add_upstream_stdio() {
         roots: None,
         tags: vec!["test".to_string()],
         sandbox_config: None,
+        description: None,
     };
 
     // This will fail because echo is not a valid MCP server

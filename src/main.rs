@@ -199,6 +199,66 @@ enum Commands {
     /// Manage skills (create, edit, delete, show)
     #[command(subcommand)]
     Skill(SkillCommands),
+
+    /// Add an MCP server to the configuration
+    ///
+    /// Usage:
+    ///   skills add-mcp http <alias> <url>                 # Add HTTP MCP server
+    ///   skills add-mcp stdio <alias> <command>            # Add stdio MCP server
+    ///   skills add-mcp http deepwiki https://mcp.deepwiki.com/mcp
+    ///   skills add-mcp stdio filesystem "npx -y @modelcontextprotocol/server-filesystem ."
+    ///
+    /// The server will be added to your config.yaml and can be used immediately.
+    AddMcp {
+        /// Transport type: http or stdio
+        #[arg(value_enum)]
+        transport: TransportType,
+
+        /// Alias/name for the MCP server
+        alias: String,
+
+        /// URL (for http) or command (for stdio)
+        endpoint: String,
+
+        /// Tags for categorization (comma-separated)
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Test connection after adding
+        #[arg(short, long, default_value = "true")]
+        test: bool,
+
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+
+    /// Edit/update an existing upstream MCP server
+    EditMcp {
+        /// Alias of the upstream server to edit
+        alias: String,
+
+        /// New description
+        #[arg(short, long)]
+        description: Option<String>,
+
+        /// New tags (comma-separated, replaces existing)
+        #[arg(short, long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// New URL (for http transport)
+        #[arg(short, long)]
+        url: Option<String>,
+
+        /// New command (for stdio transport)
+        #[arg(short, long)]
+        command: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum TransportType {
+    Http,
+    Stdio,
 }
 
 #[derive(Subcommand)]
@@ -663,7 +723,7 @@ async fn init_server(
     }
     let runtime = Arc::new(Runtime::with_sandbox_config(
         registry.clone(),
-        upstream_manager,
+        upstream_manager.clone(),
         sandbox_config,
     ));
 
@@ -778,7 +838,8 @@ async fn init_server(
     let skill_store = Arc::new(skill_store);
 
     // Create MCP server
-    let server = SkillsServer::new(registry, search_engine, policy_engine, runtime, skill_store);
+    let server = SkillsServer::new(registry, search_engine, policy_engine, runtime, skill_store)
+        .with_upstream_manager(upstream_manager);
 
     info!("Server initialized successfully");
     Ok(server)
@@ -1983,7 +2044,6 @@ agent_skills_repos:
                 }
 
                 SkillCommands::Show { skill_id, file } => {
-                    // Parse skill_id to get skill name
                     let skill_name = if skill_id.starts_with("skill:") {
                         skill_id
                             .strip_prefix("skill:")
@@ -2020,6 +2080,122 @@ agent_skills_repos:
                     }
                 }
             }
+        }
+
+        Commands::AddMcp { transport, alias, endpoint, tags, test, description } => {
+            eprintln!("Adding MCP server '{}' (transport: {:?})", alias, transport);
+
+            if config.upstreams.iter().any(|u| u.alias == alias) {
+                eprintln!("Error: Upstream '{}' already exists", alias);
+                eprintln!("Use 'skills list' to see existing servers");
+                std::process::exit(1);
+            }
+
+            let upstream_config = match transport {
+                TransportType::Http => {
+                    skillsrs::execution::upstream::UpstreamConfig {
+                        alias: alias.clone(),
+                        transport: skillsrs::execution::upstream::Transport::Http,
+                        url: Some(endpoint.clone()),
+                        command: None,
+                        auth: None,
+                        repo: None,
+                        git_ref: None,
+                        skills: None,
+                        roots: None,
+                        tags,
+                        sandbox_config: None,
+                        description,
+                    }
+                }
+                TransportType::Stdio => {
+                    let command_parts: Vec<String> = endpoint
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    
+                    skillsrs::execution::upstream::UpstreamConfig {
+                        alias: alias.clone(),
+                        transport: skillsrs::execution::upstream::Transport::Stdio,
+                        url: None,
+                        command: Some(command_parts),
+                        auth: None,
+                        repo: None,
+                        git_ref: None,
+                        skills: None,
+                        roots: None,
+                        tags,
+                        sandbox_config: None,
+                        description,
+                    }
+                }
+            };
+
+            if test {
+                eprint!("Testing connection... ");
+                let registry = Arc::new(Registry::new());
+                let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+                
+                match upstream_manager.add_upstream(upstream_config.clone()).await {
+                    Ok(_) => {
+                        eprintln!("✓");
+                        upstream_manager.disconnect(&alias).await.ok();
+                    }
+                    Err(e) => {
+                        eprintln!("✗");
+                        eprintln!("Warning: Connection test failed: {}", e);
+                        eprintln!("Server added to config but may not be reachable.");
+                    }
+                }
+            }
+
+            config.upstreams.push(upstream_config);
+
+            if let Err(e) = save_config(&config, &active_config_path) {
+                eprintln!("Error: Failed to save config: {}", e);
+                std::process::exit(1);
+            }
+
+            eprintln!("✓ Added MCP server '{}' to {}", alias, active_config_path.display());
+            eprintln!("\nThe server will be available after restarting skills.rs:");
+            eprintln!("  skills list  # To see all available tools");
+        }
+
+        Commands::EditMcp { alias, description, tags, url, command } => {
+            eprintln!("Editing MCP server '{}'", alias);
+
+            let upstream_idx = config.upstreams.iter().position(|u| u.alias == alias);
+            
+            if upstream_idx.is_none() {
+                eprintln!("Error: Upstream '{}' not found", alias);
+                eprintln!("Use 'skills list' to see existing servers");
+                std::process::exit(1);
+            }
+
+            let idx = upstream_idx.unwrap();
+            let upstream = &mut config.upstreams[idx];
+
+            if let Some(desc) = description {
+                upstream.description = Some(desc);
+            }
+            if !tags.is_empty() {
+                upstream.tags = tags;
+            }
+            if let Some(new_url) = url {
+                upstream.url = Some(new_url);
+            }
+            if let Some(new_cmd) = command {
+                upstream.command = Some(new_cmd.split_whitespace().map(|s| s.to_string()).collect());
+            }
+
+            if let Err(e) = save_config(&config, &active_config_path) {
+                eprintln!("Error: Failed to save config: {}", e);
+                std::process::exit(1);
+            }
+
+            eprintln!("✓ Updated MCP server '{}' in {}", alias, active_config_path.display());
+            eprintln!("\nThe changes will take effect after restarting skills.rs:");
+            eprintln!("  skills server stdio  # Or restart your MCP client");
         }
     }
 
