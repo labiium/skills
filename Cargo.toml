@@ -90,7 +90,7 @@ tempfile = "3.24"
 wasmtime = { version = "26.0", features = ["cranelift"] }
 
 # Docker sandboxing
-bollard = { version = "0.18", features = ["ssl"] }
+bollard = { version = "0.20", features = ["ssl"] }
 http = "1.0"
 wasmtime-wasi = "26.0"
 wasi-common = "26.0"
