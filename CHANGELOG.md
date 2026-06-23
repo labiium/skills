@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **MCP schema flow** - Merged callable schema inspection into `exec` via `describe`, reducing the MCP surface to `search`, `exec`, and `manage`.
+- **MCP exec output** - `exec` now returns non-lossy content, structured content, and error status instead of joining text blocks into a string.
+
 ## [0.1.7] - 2026-02-08
 
 ### Changed

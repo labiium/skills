@@ -141,14 +141,10 @@ impl Runtime {
 
         info!("Executing callable: {}", ctx.callable_id.as_str());
 
-        // Get callable record
-        let record = self
-            .registry
-            .get(&ctx.callable_id)
-            .ok_or_else(|| RuntimeError::CallableNotFound(ctx.callable_id.as_str().to_string()))?;
+        let record = self.get_callable_record(&ctx.callable_id)?;
 
         // Validate arguments against schema
-        self.validate_arguments(&record.input_schema, &ctx.arguments)?;
+        self.validate_callable_arguments(&ctx.callable_id, &ctx.arguments)?;
 
         // Apply timeout
         let timeout_duration = ctx.timeout_ms.map(Duration::from_millis);
@@ -194,6 +190,22 @@ impl Runtime {
         }
 
         Ok(result)
+    }
+
+    /// Validate arguments for a registered callable without executing it.
+    pub fn validate_callable_arguments(
+        &self,
+        callable_id: &CallableId,
+        arguments: &serde_json::Value,
+    ) -> Result<()> {
+        let record = self.get_callable_record(callable_id)?;
+        self.validate_arguments(&record.input_schema, arguments)
+    }
+
+    fn get_callable_record(&self, callable_id: &CallableId) -> Result<crate::core::CallableRecord> {
+        self.registry
+            .get(callable_id)
+            .ok_or_else(|| RuntimeError::CallableNotFound(callable_id.as_str().to_string()))
     }
 
     /// Validate arguments against JSON schema

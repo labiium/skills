@@ -35,9 +35,10 @@ User wants to convert a CSV file to JSON, filter certain rows, and calculate sta
 ```
 
 ```json
-// Step 2: Get schema to understand parameters
+// Step 2: Describe the callable to understand parameters
 {
   "id": "skill:csv-json-pipeline@1.2.0",
+  "describe": true,
   "format": "both"
 }
 ```

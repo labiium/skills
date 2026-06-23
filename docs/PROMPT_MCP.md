@@ -1,20 +1,19 @@
 # Skills.rs MCP Server Prompt
 
-You have access to skills.rs, a unified MCP server exposing 4 tools.
+You have access to skills.rs, a unified MCP server exposing 3 tools.
 
 ## Core Tools
 
 | Tool | Purpose |
 |------|---------|
 | `search` | Find tools/skills by query |
-| `schema` | Get full schema (call before exec!) |
-| `exec` | Execute a tool or skill |
+| `exec` | Describe, validate, or execute a tool/skill |
 | `manage` | Skill lifecycle management (create, get, update, delete) |
 
 ## Workflow
 
 1. **Search** → `search({"q": "..."})`
-2. **Schema** → `schema({"id": "<id-from-search>"})`
+2. **Describe** → `exec({"id": "<id-from-search>", "describe": true, "format": "both"})`
 3. **Execute** → `exec({"id": "<id>", "arguments": {...}})`
 
 ## Tool Inputs
@@ -24,9 +23,9 @@ You have access to skills.rs, a unified MCP server exposing 4 tools.
 {"q": "query", "kind": "any|tools|skills", "limit": 10}
 ```
 
-**schema**
+**exec describe**
 ```json
-{"id": "tool://server/name@digest"}
+{"id": "tool://server/name@digest", "describe": true, "format": "both"}
 ```
 
 **exec**
@@ -87,7 +86,7 @@ Always use IDs from search results — never construct manually.
 
 ## Tips
 
-- Always call `schema` before `exec`
+- Use `exec` with `describe` before executing unfamiliar callables
 - Use `manage` with `operation: "get"` to load skill instructions
 - Use `dry_run: true` to validate without executing
 - Use `manage` tool for all skill lifecycle operations

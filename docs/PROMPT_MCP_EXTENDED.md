@@ -19,17 +19,17 @@ Every interaction follows this pattern:
 
 ```
 search  →  Find what you need
-schema  →  Understand the parameters  
-exec    →  Run it
+exec.describe  →  Understand the parameters
+exec           →  Run it
 ```
 
 ### Why this matters
 
 1. **Search returns minimal data** to save tokens (just names and descriptions)
-2. **Schema gives you full parameter details** only when needed
+2. **Exec describe gives you full parameter details** only when needed
 3. **Exec validates and runs** with policy enforcement
 
-**Never skip schema.** Even for familiar tools, schema confirms the tool exists and returns the exact ID for exec.
+**Never skip description for unfamiliar callables.** Even for familiar tools, `exec` with `describe` confirms the parameter contract before execution.
 
 ---
 
@@ -41,7 +41,7 @@ exec    →  Run it
 1. search(q: "read_file")
    → Returns matches with IDs
 
-2. schema(id: <id from search>)
+2. exec(id: <id from search>, describe: true, format: "both")
    → Returns input parameters and types
 
 3. exec(id: <id>, arguments: {path: "./file.txt"})
@@ -82,7 +82,7 @@ Skills are different from tools. A skill is a **documented procedure** that tell
 
 3. Read the instructions, then for each tool mentioned:
    - search for the tool
-   - schema to get parameters
+   - exec with describe to get parameters
    - exec to run it
 
 4. Continue following the skill's steps until complete
@@ -199,12 +199,12 @@ The system is designed to minimize token usage through three levels:
 | Level | What You Get | Size |
 |-------|-------------|------|
 | Search | Names, descriptions, IDs | ~200 bytes each |
-| Schema | Full parameter details | ~2-5 KB |
+| Exec describe | Full parameter details | ~2-5 KB |
 | Content | Complete SKILL.md | ~5-50 KB |
 
 **This matters because:** Loading 100 skills' full content would be 2MB. With progressive disclosure, you load only what you need.
 
-**Workflow implication:** Always search first, then selectively load schema/content for the specific items you'll use.
+**Workflow implication:** Always search first, then selectively load descriptions/content for the specific items you'll use.
 
 ---
 
@@ -217,8 +217,8 @@ The system is designed to minimize token usage through three levels:
 - List all: `search(q: "", limit: 50)`
 
 ### "Invalid arguments"
-- You skipped schema—call it first
-- Check required vs optional in schema response
+- You skipped `exec.describe` - call it first
+- Check required vs optional in the describe response
 - Verify argument types match
 
 ### "Skill not found"
@@ -233,7 +233,7 @@ The system is designed to minimize token usage through three levels:
 
 ## ID Format
 
-IDs are returned by search and used in schema/exec calls:
+IDs are returned by search and used in exec calls:
 
 - **Tools:** `tool:srv:<server>::<name>::sd:<digest>`
 - **Skills:** `skill:<name>@<version>`
@@ -246,7 +246,7 @@ IDs are returned by search and used in schema/exec calls:
 
 ```
 Need to use a specific tool?
-  → search → schema → exec
+  → search → exec.describe → exec
 
 Starting a multi-step task?
   → First: search(kind: "skills") for existing workflow
@@ -279,7 +279,7 @@ Check for bundled tools in the manage get response. If present, you can exec the
 - Check for existing skills before building workflows manually
 
 **Execution:**
-- Always call schema before exec
+- Always describe unfamiliar callables before exec
 - Use dry_run for destructive operations
 - Pass timeout_ms for slow operations
 

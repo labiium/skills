@@ -148,6 +148,53 @@ async fn test_validation_missing_required() {
     assert!(err.to_string().contains("Missing required") || err.to_string().contains("validation"));
 }
 
+#[test]
+fn test_validate_callable_arguments_success() {
+    let registry = Arc::new(Registry::new());
+    let tool = create_test_tool_record("test-tool", "test-server");
+    let id = tool.id.clone();
+    registry.register(tool).unwrap();
+
+    let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+    let runtime = Runtime::new(registry, upstream_manager);
+
+    runtime
+        .validate_callable_arguments(&id, &serde_json::json!({ "path": "/tmp/file.txt" }))
+        .unwrap();
+}
+
+#[test]
+fn test_validate_callable_arguments_missing_required() {
+    let registry = Arc::new(Registry::new());
+    let tool = create_test_tool_record("test-tool", "test-server");
+    let id = tool.id.clone();
+    registry.register(tool).unwrap();
+
+    let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+    let runtime = Runtime::new(registry, upstream_manager);
+
+    let err = runtime
+        .validate_callable_arguments(&id, &serde_json::json!({}))
+        .unwrap_err();
+    assert!(err.to_string().contains("Missing required argument: path"));
+}
+
+#[test]
+fn test_validate_callable_arguments_requires_object_when_schema_has_required_fields() {
+    let registry = Arc::new(Registry::new());
+    let tool = create_test_tool_record("test-tool", "test-server");
+    let id = tool.id.clone();
+    registry.register(tool).unwrap();
+
+    let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+    let runtime = Runtime::new(registry, upstream_manager);
+
+    let err = runtime
+        .validate_callable_arguments(&id, &serde_json::json!(null))
+        .unwrap_err();
+    assert!(err.to_string().contains("Arguments must be an object"));
+}
+
 #[tokio::test]
 async fn test_callable_not_found() {
     let registry = Arc::new(Registry::new());

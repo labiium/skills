@@ -6,16 +6,15 @@ This guide covers how LLMs should effectively use skills.rs for tool and skill m
 
 ---
 
-## The 4 MCP Tools: Reference
+## The 3 MCP Tools: Reference
 
 | Tool | Purpose | When to Use |
 |------|---------|-------------|
 | `search` | Discovery | Find tools/skills by keywords, descriptions, or capabilities |
-| `schema` | Inspection | Get parameter schemas before execution |
-| `exec` | Execution | Run tools/skills with validated arguments |
+| `exec` | Inspection and execution | Describe, validate, or run tools/skills with validated arguments |
 | `manage` | Lifecycle | Create, read, update, delete skills |
 
-**Golden Rule**: Always use `search` → `schema` → `exec` workflow. Never skip schema inspection.
+**Golden Rule**: Always use `search` → `exec.describe` → `exec` workflow. Never skip inspection for unfamiliar callables.
 
 ---
 
@@ -103,14 +102,14 @@ If search returns nothing:
 
 ## Part 2: Inspecting Before Execution
 
-### 2.1 Always Get Schema First
+### 2.1 Always Describe First
 
 ```json
 // After finding a skill/tool
-{ "id": "skill:csv-processor@1.0.0", "format": "both" }
+{ "id": "skill:csv-processor@1.0.0", "describe": true, "format": "both" }
 ```
 
-### 2.2 Understanding Schema Output
+### 2.2 Understanding Describe Output
 
 ```json
 {
@@ -645,7 +644,7 @@ skills skill create test-skill --description "Test" --skill-md ./SKILL.md
 # 2. List to verify registration
 skills list
 
-# 3. Get schema
+# 3. Get schema through the CLI
 skills tool local/test-skill
 
 # 4. Execute with test data
@@ -787,7 +786,7 @@ def stream_results(items):
 **Symptoms**: `Missing required argument: xyz`
 
 **Solutions**:
-1. Re-fetch schema: `schema` tool
+1. Re-fetch schema: `exec` with `describe`
 2. Check required vs optional fields
 3. Verify parameter types match
 
@@ -810,9 +809,9 @@ def stream_results(items):
 { "q": "keywords", "kind": "skills|tools|any", "mode": "literal|regex|fuzzy", "limit": 10 }
 ```
 
-### Schema
+### Describe
 ```json
-{ "id": "skill:name@version", "format": "json_schema|signature|both" }
+{ "id": "skill:name@version", "describe": true, "format": "json_schema|signature|both" }
 ```
 
 ### Execute
@@ -845,7 +844,7 @@ def stream_results(items):
 ## Summary Checklist
 
 - [ ] Always search before creating (avoid duplicates)
-- [ ] Always get schema before executing
+- [ ] Always describe unfamiliar callables before executing
 - [ ] Use dry_run for risky operations
 - [ ] Set appropriate timeouts
 - [ ] Handle errors gracefully

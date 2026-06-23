@@ -30,12 +30,12 @@ This doesn't scale. As you add more capabilities, you quickly hit context limits
 
 ## The Solution: Progressive Disclosure
 
-skills.rs introduces a radical approach: **expose 7 focused meta-tools instead of hundreds of individual tools.**
+skills.rs introduces a radical approach: **expose 3 focused meta-tools instead of hundreds of individual tools.**
 
 Instead of loading every tool description into context, agents can:
 
 1. **Search** for tools on-demand (`search`)
-2. **Inspect** only the tools they need (`schema`)
+2. **Inspect** only the tools they need (`exec` with `describe`)
 3. **Execute** with validation and sandboxing (`exec`)
 
 This achieves a **99% token reduction** in tool metadata while enabling *unlimited* tool discovery.
@@ -62,14 +62,10 @@ skills.rs Approach:
 ┌────────────────────────────────────────┐
 │ Agent Context (8K tokens)              │
 │ ┌────────────────────────────────────┐ │
-│ │ 7 Meta-tools (350 tokens)          │ │
+│ │ 3 Meta-tools                       │ │
 │ │   - search                  │ │
-│ │   - schema                  │ │
 │ │   - exec                    │ │
-│ │   - create                  │ │
-│ │   - get_content             │ │
-│ │   - update                  │ │
-│ │   - delete                  │ │
+│ │   - manage                  │ │
 │ └────────────────────────────────────┘ │
 │ Task: "Search for latest AI news"     │
 │ (7,650+ tokens available!)             │
@@ -84,7 +80,7 @@ skills.rs is designed for flexibility, supporting both traditional MCP server mo
 
 ### Mode 1: MCP Server (Progressive Disclosure)
 
-Run skills.rs as an MCP server that aggregates multiple upstream servers and exposes 7 focused meta-tools:
+Run skills.rs as an MCP server that aggregates multiple upstream servers and exposes 3 focused meta-tools:
 
 ```bash
 skills stdio
@@ -100,10 +96,10 @@ Your AI agent connects via MCP protocol and uses progressive disclosure:
 }
 // Returns: 5 matching tools with minimal metadata
 
-// Step 2: Get schema for the right tool
+// Step 2: Describe the right tool
 {
-  "tool": "schema",
-  "args": { "id": "tool://brave_search@1.0" }
+  "tool": "exec",
+  "args": { "id": "tool://brave_search@1.0", "describe": true, "format": "both" }
 }
 // Returns: Full JSON schema only for this tool
 

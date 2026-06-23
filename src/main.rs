@@ -992,7 +992,7 @@ use_global:
                     print_banner();
                     info!("Starting skills.rs in stdio mode");
                     eprintln!("Mode: stdio");
-                    eprintln!("Exposing 4 tools: search, schema, exec, manage");
+                    eprintln!("Exposing 3 tools: search, exec, manage");
                     eprintln!("Skills directory: {}", paths.skills_root.display());
                     if no_sandbox {
                         eprintln!("⚠️  Sandboxing: DISABLED");
@@ -1012,7 +1012,7 @@ use_global:
                     eprintln!("Mode: HTTP");
                     eprintln!("Listening on: http://{}", bind);
                     eprintln!("MCP Endpoint: http://{}/mcp", bind);
-                    eprintln!("Exposing 4 tools: search, schema, exec, manage");
+                    eprintln!("Exposing 3 tools: search, exec, manage");
                     eprintln!("Skills directory: {}", paths.skills_root.display());
                     if no_sandbox {
                         eprintln!("⚠️  Sandboxing: DISABLED");
@@ -1046,11 +1046,10 @@ use_global:
                                 <body>
                                     <h1>skills.rs - Infinite Skills. Finite Context.</h1>
                                     <p>MCP endpoint available at: <a href="/mcp">/mcp</a></p>
-                                    <p>Exposes exactly 4 tools:</p>
+                                    <p>Exposes exactly 3 tools:</p>
                                     <ul>
                                         <li><code>search</code> - Discovery over registry</li>
-                                        <li><code>schema</code> - On-demand schema fetching</li>
-                                        <li><code>exec</code> - Validated execution</li>
+                                        <li><code>exec</code> - Description, validation, and execution</li>
                                         <li><code>manage</code> - Skill lifecycle management</li>
                                     </ul>
                                 </body>

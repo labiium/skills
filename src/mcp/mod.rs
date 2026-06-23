@@ -1,29 +1,28 @@
 //! MCP Server Façade using Official rmcp SDK
 //!
-//! Exposes exactly four MCP tools to the host LLM:
+//! Exposes exactly three MCP tools to the host LLM:
 //! - search: Discovery over unified registry
-//! - schema: On-demand schema fetching
-//! - exec: Validated execution with policy enforcement
+//! - exec: Description, dry-run validation, and execution with policy enforcement
 //! - manage: Skill lifecycle management (create, read, update, delete)
 //!
 //! This implementation uses the official Rust MCP SDK (rmcp) to ensure
 //! full protocol compliance and leverage battle-tested infrastructure.
 //!
-//! Design rationale for 4 tools:
-//! - 3 core tools (search/schema/exec) for the 99% use case of discovering and executing callables
+//! Design rationale for 3 tools:
+//! - 2 core tools (search/exec) for the 99% use case of discovering and executing callables
 //! - 1 management tool (manage) for skill lifecycle, keeping the context minimal while enabling full CRUD
 //! - This balance achieves "Infinite Skills. Finite Context." - agents can manage skills without tool bloat
 
 use crate::core::policy::{ConsentLevel, PolicyEngine};
 use crate::core::registry::Registry;
-use crate::core::{CallableId, ToolResult};
+use crate::core::CallableId;
 use crate::execution::{ExecContext, Runtime};
 use crate::storage::search::{SearchEngine, SearchFilters, SearchQuery};
 use crate::storage::{CreateSkillRequest, SkillStore};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     service::RequestContext,
     tool, tool_router, Json, RoleServer, ServerHandler,
 };
@@ -107,6 +106,26 @@ fn json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Sche
     .unwrap()
 }
 
+fn optional_json_value_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "anyOf": [{}, { "type": "null" }]
+    }))
+    .unwrap()
+}
+
+fn optional_json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::from_value(serde_json::json!({
+        "anyOf": [
+            {
+                "type": "array",
+                "items": {}
+            },
+            { "type": "null" }
+        ]
+    }))
+    .unwrap()
+}
+
 fn non_negative_int_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
     serde_json::from_value(serde_json::json!({
         "type": "integer",
@@ -156,31 +175,6 @@ pub struct SearchStats {
     pub stale_servers: Vec<String>,
 }
 
-/// Input schema for schema
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SchemaInput {
-    /// Callable ID from search results
-    pub id: String,
-
-    /// Schema format to return
-    #[serde(default = "default_format")]
-    #[schemars(description = "Format: json_schema, signature, or both")]
-    pub format: String,
-
-    /// Include output schema if available
-    #[serde(default = "default_true")]
-    pub include_output_schema: bool,
-
-    /// Maximum response size in bytes
-    #[serde(default = "default_max_bytes")]
-    #[schemars(schema_with = "non_negative_int_schema")]
-    pub max_bytes: usize,
-
-    /// JSON Pointer to schema subtree
-    #[serde(default)]
-    pub json_pointer: Option<String>,
-}
-
 fn default_format() -> String {
     "both".to_string()
 }
@@ -222,9 +216,32 @@ pub struct ExecInput {
     /// Callable ID from search results
     pub id: String,
 
-    /// Arguments to pass to the callable
+    /// Arguments to pass to the callable. Missing arguments normalize to an empty object.
+    #[serde(default = "default_arguments")]
     #[schemars(schema_with = "json_value_schema")]
     pub arguments: JsonValue,
+
+    /// Return callable schema/signature details instead of executing.
+    #[serde(default)]
+    pub describe: bool,
+
+    /// Schema format to return when describe is true.
+    #[serde(default = "default_format")]
+    #[schemars(description = "Format: json_schema, signature, or both")]
+    pub format: String,
+
+    /// Include output schema if available when describe is true.
+    #[serde(default = "default_true")]
+    pub include_output_schema: bool,
+
+    /// Maximum describe response size in bytes.
+    #[serde(default = "default_max_bytes")]
+    #[schemars(schema_with = "non_negative_int_schema")]
+    pub max_bytes: usize,
+
+    /// JSON Pointer to schema subtree when describe is true.
+    #[serde(default)]
+    pub json_pointer: Option<String>,
 
     /// Validate without executing
     #[serde(default)]
@@ -241,6 +258,31 @@ pub struct ExecInput {
     /// Trace options
     #[serde(default)]
     pub trace: Option<TraceArgs>,
+}
+
+fn default_arguments() -> JsonValue {
+    serde_json::json!({})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DescribeOptions {
+    /// Schema format to return
+    #[serde(default = "default_format")]
+    #[schemars(description = "Format: json_schema, signature, or both")]
+    pub format: String,
+
+    /// Include output schema if available
+    #[serde(default = "default_true")]
+    pub include_output_schema: bool,
+
+    /// Maximum response size in bytes
+    #[serde(default = "default_max_bytes")]
+    #[schemars(schema_with = "non_negative_int_schema")]
+    pub max_bytes: usize,
+
+    /// JSON Pointer to schema subtree
+    #[serde(default)]
+    pub json_pointer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -261,18 +303,41 @@ pub struct TraceArgs {
     pub include_steps: bool,
 }
 
-/// Output schema for exec
+/// Response from exec. Exactly one or more sections may be present depending on describe/dry_run/execution mode.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExecResponse {
+    pub mode: String,
+    pub callable: CallableInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<SchemaOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<DryRunOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DryRunOutput {
+    pub valid: bool,
+    pub message: String,
+}
+
+/// Non-lossy execution output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecOutput {
-    #[schemars(schema_with = "json_value_schema")]
-    pub result: JsonValue,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub route: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "json_value_schema")]
-    pub timing: Option<JsonValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "json_value_vec_schema")]
+    pub content: Vec<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "optional_json_value_schema")]
+    pub structured_content: Option<JsonValue>,
+    pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "optional_json_value_schema")]
+    pub timing: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "optional_json_value_vec_schema")]
     pub steps: Option<Vec<JsonValue>>,
 }
 
@@ -295,47 +360,233 @@ impl SkillsServer {
         }
     }
 
-    pub fn with_upstream_manager(mut self, upstream_manager: Arc<crate::execution::upstream::UpstreamManager>) -> Self {
+    pub fn with_upstream_manager(
+        mut self,
+        upstream_manager: Arc<crate::execution::upstream::UpstreamManager>,
+    ) -> Self {
         self.upstream_manager = Some(upstream_manager);
         self
     }
 
-    /// Convert ToolResult to CallToolResult
-    #[allow(dead_code)]
-    fn tool_result_to_call_result(result: ToolResult) -> CallToolResult {
-        let mut contents = Vec::new();
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
 
-        for content in result.content {
-            match content {
-                crate::core::ToolResultContent::Text { text } => {
-                    contents.push(Content::text(text));
+    fn callable_info(record: &crate::core::CallableRecord) -> CallableInfo {
+        CallableInfo {
+            id: record.id.as_str().to_string(),
+            kind: record.kind.to_string(),
+            name: record.name.clone(),
+            fq_name: record.fq_name.clone(),
+            server: record.server_alias.clone(),
+            version: record.skill_version.clone(),
+        }
+    }
+
+    fn describe_callable(
+        record: &crate::core::CallableRecord,
+        describe: &DescribeOptions,
+    ) -> Result<SchemaOutput, String> {
+        let format = describe.format.as_str();
+        let mut output = SchemaOutput {
+            callable: Self::callable_info(record),
+            schema_digest: record.schema_digest.as_str().to_string(),
+            input_schema: None,
+            output_schema: None,
+            signature: None,
+        };
+
+        if format == "json_schema" || format == "both" {
+            let mut schema = record.input_schema.clone();
+
+            if let Some(pointer) = describe.json_pointer.as_deref() {
+                if let Some(subtree) = schema.pointer(pointer) {
+                    schema = subtree.clone();
+                } else {
+                    return Err(format!("Invalid JSON pointer: {}", pointer));
                 }
-                crate::core::ToolResultContent::Image { data, mime_type } => {
-                    contents.push(Content::image(data, mime_type));
-                }
-                crate::core::ToolResultContent::Resource { resource } => {
-                    // Convert resource to text representation
-                    let text = resource.text.unwrap_or_else(|| {
-                        format!(
-                            "Resource: {} ({})",
-                            resource.uri,
-                            resource.mime_type.unwrap_or_default()
-                        )
-                    });
-                    contents.push(Content::text(text));
-                }
+            }
+
+            output.input_schema = Some(schema);
+
+            if describe.include_output_schema {
+                output.output_schema = record.output_schema.clone();
             }
         }
 
-        if result.is_error {
-            CallToolResult::error(contents)
-        } else {
-            CallToolResult::success(contents)
+        if format == "signature" || format == "both" {
+            let signature = crate::core::CallableSignature::from_schema(&record.input_schema);
+            output.signature = Some(serde_json::to_value(signature).unwrap());
         }
+
+        let output_str = serde_json::to_string(&output).unwrap();
+        if output_str.len() > describe.max_bytes {
+            return Err(format!(
+                "Response exceeds max_bytes limit: {} > {}",
+                output_str.len(),
+                describe.max_bytes
+            ));
+        }
+
+        Ok(output)
+    }
+
+    fn result_to_exec_output(
+        result: crate::core::ToolResult,
+        record: &crate::core::CallableRecord,
+        trace: Option<&TraceArgs>,
+    ) -> ExecOutput {
+        let include_route = trace.map(|t| t.include_route).unwrap_or(false);
+        let include_timing = trace.map(|t| t.include_timing).unwrap_or(false);
+        let include_steps = trace.map(|t| t.include_steps).unwrap_or(false);
+
+        let trace_value = result
+            .structured_content
+            .as_ref()
+            .and_then(|structured| structured.get("trace"));
+        let timing = include_timing
+            .then(|| {
+                trace_value.map(|trace| {
+                    serde_json::json!({
+                        "started_at": trace.get("started_at").cloned().unwrap_or(JsonValue::Null),
+                        "completed_at": trace.get("completed_at").cloned().unwrap_or(JsonValue::Null),
+                        "total_duration_ms": trace.get("total_duration_ms").cloned().unwrap_or(JsonValue::Null),
+                    })
+                })
+            })
+            .flatten();
+        let steps = include_steps
+            .then(|| {
+                trace_value
+                    .and_then(|trace| trace.get("steps"))
+                    .and_then(|steps| steps.as_array())
+                    .cloned()
+            })
+            .flatten();
+
+        ExecOutput {
+            content: result
+                .content
+                .into_iter()
+                .map(|content| serde_json::to_value(content).unwrap())
+                .collect(),
+            structured_content: result.structured_content,
+            is_error: result.is_error,
+            route: include_route.then(|| record.fq_name.clone()),
+            timing,
+            steps,
+        }
+    }
+
+    pub async fn exec_callable(&self, input: ExecInput) -> Result<ExecResponse, String> {
+        debug!("exec called for: {}", input.id);
+
+        let callable_id: CallableId = input.id.into();
+        let dry_run = input.dry_run;
+
+        let record = self
+            .registry
+            .get(&callable_id)
+            .ok_or_else(|| format!("Callable not found: {}", callable_id))?;
+
+        if input.describe {
+            let describe = DescribeOptions {
+                format: input.format,
+                include_output_schema: input.include_output_schema,
+                max_bytes: input.max_bytes,
+                json_pointer: input.json_pointer,
+            };
+            let description = Some(Self::describe_callable(&record, &describe)?);
+            info!("exec described {}", record.fq_name);
+            return Ok(ExecResponse {
+                mode: "describe".to_string(),
+                callable: Self::callable_info(&record),
+                description,
+                dry_run: None,
+                execution: None,
+            });
+        }
+
+        self.runtime
+            .validate_callable_arguments(&callable_id, &input.arguments)
+            .map_err(|e| format!("Validation failed: {}", e))?;
+
+        let consent_level = input
+            .consent
+            .as_ref()
+            .and_then(|c| c.level.as_deref())
+            .map(|s| match s {
+                "user_confirmed" => ConsentLevel::UserConfirmed,
+                "admin_confirmed" => ConsentLevel::AdminConfirmed,
+                _ => ConsentLevel::None,
+            })
+            .unwrap_or(ConsentLevel::None);
+
+        let policy_result = self
+            .policy_engine
+            .authorize(&record, &input.arguments, consent_level)
+            .await
+            .map_err(|e| format!("Policy check failed: {}", e))?;
+
+        if !policy_result.allowed {
+            warn!("Execution denied: {}", policy_result.reason);
+            return Err(format!("Execution denied: {}", policy_result.reason));
+        }
+
+        if dry_run {
+            info!("Dry run validated {}", record.fq_name);
+            return Ok(ExecResponse {
+                mode: "dry_run".to_string(),
+                callable: Self::callable_info(&record),
+                description: None,
+                dry_run: Some(DryRunOutput {
+                    valid: true,
+                    message: format!("Dry run validated {}", record.fq_name),
+                }),
+                execution: None,
+            });
+        }
+
+        let trace_enabled = input
+            .trace
+            .as_ref()
+            .map(|t| t.include_route || t.include_timing || t.include_steps)
+            .unwrap_or(false);
+
+        let ctx = ExecContext {
+            callable_id: callable_id.clone(),
+            arguments: input.arguments,
+            timeout_ms: input.timeout_ms,
+            trace_enabled,
+        };
+
+        let result = self
+            .runtime
+            .execute(ctx)
+            .await
+            .map_err(|e| format!("Execution failed: {}", e))?;
+
+        info!("exec completed for {}", record.fq_name);
+
+        Ok(ExecResponse {
+            mode: "exec".to_string(),
+            callable: Self::callable_info(&record),
+            description: None,
+            dry_run: None,
+            execution: Some(Self::result_to_exec_output(
+                result,
+                &record,
+                input.trace.as_ref(),
+            )),
+        })
     }
 }
 
-/// Implement the tool router with exactly 4 tools
+/// Implement the tool router with exactly 3 tools
 #[tool_router]
 impl SkillsServer {
     /// Fast discovery over registry (tools + skills) with filters.
@@ -387,159 +638,17 @@ impl SkillsServer {
         Ok(Json(output))
     }
 
-    /// Fetch full schema and signature for a callable.
-    /// Use this after search to get detailed parameter info.
-    #[tool(
-        name = "schema",
-        description = "Fetch full schema and signature for a callable. Use this after search to get detailed parameter info."
-    )]
-    async fn schema(
-        &self,
-        Parameters(input): Parameters<SchemaInput>,
-    ) -> Result<Json<SchemaOutput>, String> {
-        debug!("schema called for: {}", input.id);
-
-        let callable_id: CallableId = input.id.into();
-        let record = self
-            .registry
-            .get(&callable_id)
-            .ok_or_else(|| format!("Callable not found: {}", callable_id))?;
-
-        let format = input.format.as_str();
-        let max_bytes = input.max_bytes;
-
-        let mut output = SchemaOutput {
-            callable: CallableInfo {
-                id: record.id.as_str().to_string(),
-                kind: record.kind.to_string(),
-                name: record.name.clone(),
-                fq_name: record.fq_name.clone(),
-                server: record.server_alias.clone(),
-                version: record.skill_version.clone(),
-            },
-            schema_digest: record.schema_digest.as_str().to_string(),
-            input_schema: None,
-            output_schema: None,
-            signature: None,
-        };
-
-        if format == "json_schema" || format == "both" {
-            let mut schema = record.input_schema.clone();
-
-            // Apply JSON pointer if specified
-            if let Some(pointer) = input.json_pointer {
-                if let Some(subtree) = schema.pointer(&pointer) {
-                    schema = subtree.clone();
-                } else {
-                    return Err(format!("Invalid JSON pointer: {}", pointer));
-                }
-            }
-
-            output.input_schema = Some(schema);
-
-            if input.include_output_schema {
-                output.output_schema = record.output_schema.clone();
-            }
-        }
-
-        if format == "signature" || format == "both" {
-            let signature = crate::core::CallableSignature::from_schema(&record.input_schema);
-            output.signature = Some(serde_json::to_value(signature).unwrap());
-        }
-
-        // Check size limit
-        let output_str = serde_json::to_string(&output).unwrap();
-        if output_str.len() > max_bytes {
-            return Err(format!(
-                "Response exceeds maxBytes limit: {} > {}",
-                output_str.len(),
-                max_bytes
-            ));
-        }
-
-        info!("schema returned schema for {}", record.fq_name);
-        Ok(Json(output))
-    }
-
-    /// Execute a callable with validation and policy enforcement.
-    /// Always search and get schema first.
+    /// Describe, validate, or execute a callable with policy enforcement.
+    /// Use describe for schema/signature details, dry_run to validate without execution.
     #[tool(
         name = "exec",
-        description = "Execute a callable with validation and policy enforcement. Always search and get schema first."
+        description = "Describe, validate, or execute a callable with policy enforcement. Set describe for schema/signature details or dry_run to validate without execution."
     )]
-    async fn exec(&self, Parameters(input): Parameters<ExecInput>) -> Result<String, String> {
-        debug!("exec called for: {}", input.id);
-
-        let callable_id: CallableId = input.id.into();
-        let dry_run = input.dry_run;
-
-        // Get callable record
-        let record = self
-            .registry
-            .get(&callable_id)
-            .ok_or_else(|| format!("Callable not found: {}", callable_id))?;
-
-        // Parse consent level
-        let consent_level = input
-            .consent
-            .as_ref()
-            .and_then(|c| c.level.as_deref())
-            .map(|s| match s {
-                "user_confirmed" => ConsentLevel::UserConfirmed,
-                "admin_confirmed" => ConsentLevel::AdminConfirmed,
-                _ => ConsentLevel::None,
-            })
-            .unwrap_or(ConsentLevel::None);
-
-        // Check policy authorization
-        let policy_result = self
-            .policy_engine
-            .authorize(&record, &input.arguments, consent_level)
-            .await
-            .map_err(|e| format!("Policy check failed: {}", e))?;
-
-        if !policy_result.allowed {
-            warn!("Execution denied: {}", policy_result.reason);
-            return Err(format!("Execution denied: {}", policy_result.reason));
-        }
-
-        if dry_run {
-            info!("Dry run: would execute {}", record.fq_name);
-            return Ok(format!("Dry run: would execute {}", record.fq_name));
-        }
-
-        // Execute
-        let ctx = ExecContext {
-            callable_id: callable_id.clone(),
-            arguments: input.arguments,
-            timeout_ms: input.timeout_ms,
-            trace_enabled: input
-                .trace
-                .as_ref()
-                .map(|t| t.include_route || t.include_timing || t.include_steps)
-                .unwrap_or(false),
-        };
-
-        let result = self
-            .runtime
-            .execute(ctx)
-            .await
-            .map_err(|e| format!("Execution failed: {}", e))?;
-
-        info!("exec completed for {}", record.fq_name);
-
-        // Convert ToolResult to string representation (content is already JSON from runtime)
-        let text: String = result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                crate::core::ToolResultContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(text)
+    async fn exec(
+        &self,
+        Parameters(input): Parameters<ExecInput>,
+    ) -> Result<Json<ExecResponse>, String> {
+        self.exec_callable(input).await.map(Json)
     }
 
     /// Manage skills lifecycle: create, get, update, delete
@@ -751,9 +860,13 @@ impl SkillsServer {
             }
 
             ManageOperation::AddUpstream => {
-                let alias = input.upstream_alias.ok_or("upstream_alias is required for add_upstream operation")?;
-                let transport_str = input.transport.ok_or("transport is required for add_upstream operation")?;
-                
+                let alias = input
+                    .upstream_alias
+                    .ok_or("upstream_alias is required for add_upstream operation")?;
+                let transport_str = input
+                    .transport
+                    .ok_or("transport is required for add_upstream operation")?;
+
                 let transport = match transport_str.as_str() {
                     "stdio" => crate::execution::upstream::Transport::Stdio,
                     "http" => crate::execution::upstream::Transport::Http,
@@ -777,20 +890,28 @@ impl SkillsServer {
                 };
 
                 let message = if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager.add_upstream(config).await
+                    upstream_manager
+                        .add_upstream(config)
+                        .await
                         .map_err(|e| format!("Failed to add upstream: {}", e))?;
-                    
+
                     if input.test_connection {
-                        format!("Upstream MCP server '{}' added and connected successfully", alias)
+                        format!(
+                            "Upstream MCP server '{}' added and connected successfully",
+                            alias
+                        )
                     } else {
-                        format!("Upstream MCP server '{}' added (connection test skipped)", alias)
+                        format!(
+                            "Upstream MCP server '{}' added (connection test skipped)",
+                            alias
+                        )
                     }
                 } else {
                     return Err("Upstream manager not available".to_string());
                 };
 
                 info!("Added upstream: {}", alias);
-                
+
                 Ok(Json(ManageOutput {
                     operation: "add_upstream".to_string(),
                     skill_id: None,
@@ -801,17 +922,21 @@ impl SkillsServer {
             }
 
             ManageOperation::RemoveUpstream => {
-                let alias = input.upstream_alias.ok_or("upstream_alias is required for remove_upstream operation")?;
+                let alias = input
+                    .upstream_alias
+                    .ok_or("upstream_alias is required for remove_upstream operation")?;
 
                 if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager.disconnect(&alias).await
+                    upstream_manager
+                        .disconnect(&alias)
+                        .await
                         .map_err(|e| format!("Failed to remove upstream: {}", e))?;
                 } else {
                     return Err("Upstream manager not available".to_string());
                 }
 
                 info!("Removed upstream: {}", alias);
-                
+
                 Ok(Json(ManageOutput {
                     operation: "remove_upstream".to_string(),
                     skill_id: None,
@@ -831,11 +956,15 @@ impl SkillsServer {
                 let message = if servers.is_empty() {
                     "No upstream MCP servers configured".to_string()
                 } else {
-                    format!("Found {} upstream server(s): {}", servers.len(), servers.join(", "))
+                    format!(
+                        "Found {} upstream server(s): {}",
+                        servers.len(),
+                        servers.join(", ")
+                    )
                 };
 
                 info!("Listed {} upstream servers", servers.len());
-                
+
                 Ok(Json(ManageOutput {
                     operation: "list_upstreams".to_string(),
                     skill_id: None,
@@ -846,12 +975,16 @@ impl SkillsServer {
             }
 
             ManageOperation::UpdateUpstream => {
-                let alias = input.upstream_alias.ok_or("upstream_alias is required for update_upstream operation")?;
-                
+                let alias = input
+                    .upstream_alias
+                    .ok_or("upstream_alias is required for update_upstream operation")?;
+
                 let updates = if let Some(ref upstream_manager) = self.upstream_manager {
-                    let current = upstream_manager.get_config(&alias).await
+                    let current = upstream_manager
+                        .get_config(&alias)
+                        .await
                         .ok_or(format!("Upstream '{}' not found", alias))?;
-                    
+
                     crate::execution::upstream::UpstreamConfig {
                         alias: alias.clone(),
                         transport: current.transport,
@@ -863,7 +996,11 @@ impl SkillsServer {
                         skills: current.skills,
                         roots: current.roots,
                         tags: if let Some(tags) = input.tags {
-                            if tags.is_empty() { current.tags } else { tags }
+                            if tags.is_empty() {
+                                current.tags
+                            } else {
+                                tags
+                            }
                         } else {
                             current.tags
                         },
@@ -875,12 +1012,14 @@ impl SkillsServer {
                 };
 
                 if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager.update_upstream(&alias, updates).await
+                    upstream_manager
+                        .update_upstream(&alias, updates)
+                        .await
                         .map_err(|e| format!("Failed to update upstream: {}", e))?;
                 }
 
                 info!("Updated upstream: {}", alias);
-                
+
                 Ok(Json(ManageOutput {
                     operation: "update_upstream".to_string(),
                     skill_id: None,
@@ -1078,9 +1217,10 @@ impl ServerHandler for SkillsServer {
             },
             instructions: Some(
                 "Unified MCP server that aggregates upstream MCP tools and Skills into a unified registry. \
-                Exposes exactly 4 tools: search (discovery), schema (parameters), exec (execution), \
+                Exposes exactly 3 tools: search (discovery), exec (description, validation, execution), \
                 and manage (skill lifecycle). Usage: (1) search to find callables, \
-                (2) schema to get parameters, (3) exec to execute, (4) manage to create/update/delete skills."
+                (2) exec with describe to get parameters, (3) exec to validate or execute, \
+                (4) manage to create/update/delete skills."
                     .to_string(),
             ),
         }

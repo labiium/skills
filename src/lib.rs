@@ -1,7 +1,7 @@
 //! skills.rs - Infinite Skills. Finite Context.
 //!
 //! Unified MCP server aggregating tools and skills with 99% token reduction.
-//! Exposes exactly 4 tools to the host LLM: search, schema, exec, manage.
+//! Exposes exactly 3 tools to the host LLM: search, exec, manage.
 
 pub mod core;
 pub mod execution;

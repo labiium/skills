@@ -12,7 +12,7 @@
 
 ## 🎯 What is skills.rs?
 
-skills.rs is a **unified MCP server** that aggregates multiple upstream MCP servers and high-level Skills into a single, unified registry. It exposes **4 focused MCP tools** to prevent context-window bloat while enabling unbounded tool/skill discovery and skill lifecycle management.
+skills.rs is a **unified MCP server** that aggregates multiple upstream MCP servers and high-level Skills into a single, unified registry. It exposes **3 focused MCP tools** to prevent context-window bloat while enabling unbounded tool/skill discovery and skill lifecycle management.
 
 ### Key Features
 
@@ -37,7 +37,7 @@ skills.rs is a **unified MCP server** that aggregates multiple upstream MCP serv
 
 2. **Server Mode** (MCP Protocol)
    - Run as MCP server exposing meta-tools
-   - `search`, `schema`, `exec`, `manage`
+   - `search`, `exec`, `manage`
    - Aggregate multiple upstream MCP servers
    - Create, update, delete skills via unified manage tool
 
@@ -426,7 +426,7 @@ Workflow:
 
 ---
 
-## 🔧 The 4 MCP Tools
+## 🔧 The 3 MCP Tools
 
 ### Core Discovery & Execution
 
@@ -441,12 +441,13 @@ Fast discovery over unified registry (tools + skills)
 }
 ```
 
-#### 2. `schema`
-Fetch full schema and signature for a callable
+#### 2. `exec` describe
+Fetch full schema and signature for a callable without executing it
 
 ```json
 {
   "id": "skill://web-researcher@1.0@abc123",
+  "describe": true,
   "format": "json_schema"
 }
 ```
@@ -464,7 +465,7 @@ Execute a callable with validation and policy enforcement
 
 ### Skill Lifecycle Management
 
-#### 4. `manage`
+#### 3. `manage`
 Unified skill lifecycle management: create, get, update, delete
 
 **Create a skill:**
@@ -716,7 +717,7 @@ skills.rs automatically detects skill format:
 - **Has `SKILL.md`**: Agent Skills format (YAML frontmatter + markdown)
 - **No `SKILL.md`**: Not a valid skill
 
-Skills are seamlessly converted to the unified internal format and available through all 4 MCP tools.
+Skills are seamlessly converted to the unified internal format and available through the MCP tools.
 
 ### Progressive Disclosure
 
@@ -1056,7 +1057,7 @@ docker run -p 8000:8000 -v ./skills:/var/lib/skills skills:latest
 └──────────────┬──────────────────────────┘
                │ MCP Protocol
 ┌──────────────▼──────────────────────────┐
-│      SkillsServer (4 MCP Tools)         │
+│      SkillsServer (3 MCP Tools)         │
 └──┬──────┬──────┬──────┬─────────────────┘
    │      │      │      │
 ┌──▼──┐ ┌─▼──┐ ┌▼───┐ ┌▼────────┐

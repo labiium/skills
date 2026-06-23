@@ -120,7 +120,7 @@ EOF
 The server will:
 - Load all skills from `./skills/`
 - Connect to upstream MCP servers
-- Expose 4 MCP tools
+- Expose 3 MCP tools
 
 ---
 

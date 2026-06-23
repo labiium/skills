@@ -16,6 +16,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::debug;
 
+const SEARCHABLE_BODY_CHAR_LIMIT: usize = 50_000;
+
 #[derive(Error, Debug)]
 pub enum IndexError {
     #[error("Invalid query: {0}")]
@@ -161,12 +163,15 @@ impl SearchEngine {
             candidates = apply_filters(candidates, filters);
         }
 
-        // Score and rank matches
-        // Score and rank matches using ripgrep-style substring matching
+        // Score and rank matches using field-weighted, separator-insensitive matching.
         let mut scored: Vec<(CallableRecord, f64)> = candidates
             .into_iter()
             .filter_map(|record| {
-                let score = score_ripgrep(&query.q, &record);
+                let body = {
+                    let index = self.index.read();
+                    index.body_texts.get(record.id.as_str()).cloned()
+                };
+                let score = score_record(&query.q, &record, body.as_deref());
 
                 if score > 0.0 {
                     Some((record, score))
@@ -248,6 +253,8 @@ struct InMemoryIndex {
     tokens: HashMap<String, HashSet<String>>,
     // CallableId -> tokens for removal
     reverse: HashMap<String, HashSet<String>>,
+    // CallableId -> capped SKILL.md body text for low-weight matching
+    body_texts: HashMap<String, Arc<str>>,
 }
 
 impl InMemoryIndex {
@@ -255,18 +262,26 @@ impl InMemoryIndex {
         InMemoryIndex {
             tokens: HashMap::new(),
             reverse: HashMap::new(),
+            body_texts: HashMap::new(),
         }
     }
 
     fn add_record(&mut self, record: &CallableRecord) {
         let id = record.id.as_str().to_string();
-        let tokens = tokenize_record(record);
+        let body = load_searchable_body(record);
+        let tokens = tokenize_record(record, body.as_deref());
 
         for token in &tokens {
             self.tokens
                 .entry(token.clone())
                 .or_default()
                 .insert(id.clone());
+        }
+
+        if let Some(body) = body {
+            self.body_texts.insert(id.clone(), Arc::from(body));
+        } else {
+            self.body_texts.remove(&id);
         }
 
         self.reverse.insert(id, tokens);
@@ -281,11 +296,13 @@ impl InMemoryIndex {
                 }
             }
         }
+        self.body_texts.remove(id_str);
     }
 
     fn clear(&mut self) {
         self.tokens.clear();
         self.reverse.clear();
+        self.body_texts.clear();
     }
 
     fn len(&self) -> usize {
@@ -294,7 +311,7 @@ impl InMemoryIndex {
 }
 
 /// Tokenize a record for indexing
-fn tokenize_record(record: &CallableRecord) -> HashSet<String> {
+fn tokenize_record(record: &CallableRecord, body: Option<&str>) -> HashSet<String> {
     let mut tokens = HashSet::new();
 
     // Tokenize name
@@ -321,6 +338,12 @@ fn tokenize_record(record: &CallableRecord) -> HashSet<String> {
         }
     }
 
+    if let Some(body) = body {
+        for token in tokenize(body) {
+            tokens.insert(token);
+        }
+    }
+
     // Add tags
     for tag in &record.tags {
         tokens.insert(tag.to_lowercase());
@@ -338,30 +361,117 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Score using fuzzy matching (simple edit distance)
-fn score_ripgrep(query: &str, record: &CallableRecord) -> f64 {
-    let query_lower = query.to_lowercase();
+fn strip_frontmatter(content: &str) -> String {
+    let normalized = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .replace("\r\n", "\n");
+
+    if let Some(after_first) = normalized.strip_prefix("---\n") {
+        if let Some(end_pos) = after_first.find("\n---\n") {
+            return after_first[end_pos + "\n---\n".len()..].trim().to_string();
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+fn cap_text(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+fn load_searchable_body(record: &CallableRecord) -> Option<String> {
+    if record.kind != CallableKind::Skill {
+        return None;
+    }
+
+    let skill_dir = record.skill_directory.as_ref()?;
+    let skill_md = std::fs::read_to_string(skill_dir.join("SKILL.md")).ok()?;
+    let body = strip_frontmatter(&skill_md);
+
+    if body.is_empty() {
+        None
+    } else {
+        Some(cap_text(&body, SEARCHABLE_BODY_CHAR_LIMIT))
+    }
+}
+
+fn compact(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+fn score_field(query: &str, query_tokens: &[String], text: &str, weight: f64) -> f64 {
+    let text_lower = text.to_lowercase();
+    let text_tokens = tokenize(text);
+    let text_compact = compact(text);
+    let query_compact = compact(query);
     let mut score = 0.0;
 
-    // Use simple substring matching as fuzzy approximation
-    if record.name.to_lowercase().contains(&query_lower) {
-        score += 30.0;
+    if text_lower == query.to_lowercase() {
+        score += weight * 3.0;
+    } else if text_lower.contains(&query.to_lowercase()) {
+        score += weight * 2.0;
     }
 
-    if record.fq_name.to_lowercase().contains(&query_lower) {
-        score += 25.0;
+    if !query_compact.is_empty() && text_compact.contains(&query_compact) {
+        score += weight * 1.75;
     }
+
+    let mut matched_tokens = 0;
+    for query_token in query_tokens {
+        let query_token_compact = compact(query_token);
+        if query_token_compact.is_empty() {
+            continue;
+        }
+
+        let matched = text_tokens.iter().any(|text_token| {
+            text_token == query_token
+                || text_token.starts_with(query_token)
+                || query_token.starts_with(text_token)
+        }) || text_compact.contains(&query_token_compact);
+
+        if matched {
+            matched_tokens += 1;
+            score += weight;
+        }
+    }
+
+    if !query_tokens.is_empty() && matched_tokens == query_tokens.len() {
+        score += weight * 1.25;
+    }
+
+    score
+}
+
+/// Score a callable with forgiving discovery semantics:
+/// - case-insensitive matching
+/// - separator-insensitive matching (`pytestlab core` -> `pytestlab-core`)
+/// - per-token matching so partial intent still finds plausible callables
+/// - field weighting so names outrank incidental description mentions
+fn score_record(query: &str, record: &CallableRecord, body: Option<&str>) -> f64 {
+    let query_tokens = tokenize(query);
+    let mut score = 0.0;
+
+    score += score_field(query, &query_tokens, &record.name, 30.0);
+    score += score_field(query, &query_tokens, &record.fq_name, 25.0);
 
     if let Some(title) = &record.title {
-        if title.to_lowercase().contains(&query_lower) {
-            score += 15.0;
-        }
+        score += score_field(query, &query_tokens, title, 15.0);
     }
 
     if let Some(desc) = &record.description {
-        if desc.to_lowercase().contains(&query_lower) {
-            score += 10.0;
-        }
+        score += score_field(query, &query_tokens, desc, 8.0);
+    }
+
+    for tag in &record.tags {
+        score += score_field(query, &query_tokens, tag, 12.0);
+    }
+
+    if let Some(body) = body {
+        score += score_field(query, &query_tokens, body, 3.0);
     }
 
     score

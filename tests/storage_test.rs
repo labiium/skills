@@ -270,6 +270,256 @@ async fn test_search_engine() {
 }
 
 #[tokio::test]
+async fn test_search_matches_skill_names_across_separators() {
+    let registry = Arc::new(Registry::new());
+    let search_engine = SearchEngine::new(registry.clone());
+
+    let schema = serde_json::json!({"type": "object"});
+    let digest = skillsrs::core::SchemaDigest::from_schema(&schema).unwrap();
+    let id = skillsrs::core::CallableId::skill("pytestlab-core", "1.0.0");
+
+    registry
+        .register(skillsrs::core::CallableRecord {
+            id,
+            kind: skillsrs::core::CallableKind::Skill,
+            fq_name: "skill.pytestlab-core".to_string(),
+            name: "pytestlab-core".to_string(),
+            title: Some("PyTestLab Core".to_string()),
+            description: Some("Use PyTestLab core library workflows".to_string()),
+            tags: vec!["pytestlab".to_string(), "lamb".to_string()],
+            input_schema: schema,
+            output_schema: None,
+            schema_digest: digest,
+            server_alias: None,
+            upstream_tool_name: None,
+            skill_version: Some("1.0.0".to_string()),
+            uses: vec![],
+            skill_directory: None,
+            bundled_tools: vec![],
+            additional_files: vec![],
+            cost_hints: skillsrs::core::CostHints::default(),
+            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+            sandbox_config: None,
+        })
+        .unwrap();
+
+    search_engine.rebuild();
+
+    let single_token_query = SearchQuery {
+        q: "pytestlab".to_string(),
+        kind: "skills".to_string(),
+        limit: 10,
+        filters: None,
+        cursor: None,
+    };
+
+    let results = search_engine.search(&single_token_query).await.unwrap();
+    assert_eq!(results.total_matches, 1);
+    assert_eq!(results.matches[0].name, "pytestlab-core");
+
+    let spaced_query = SearchQuery {
+        q: "pytestlab core".to_string(),
+        kind: "skills".to_string(),
+        limit: 10,
+        filters: None,
+        cursor: None,
+    };
+
+    let results = search_engine.search(&spaced_query).await.unwrap();
+    assert_eq!(results.total_matches, 1);
+    assert_eq!(results.matches[0].name, "pytestlab-core");
+    assert!(
+        results.matches[0].score >= 50.0,
+        "name token matches should score strongly, got {}",
+        results.matches[0].score
+    );
+}
+
+#[tokio::test]
+async fn test_search_ranks_name_matches_before_description_only_matches() {
+    let registry = Arc::new(Registry::new());
+    let search_engine = SearchEngine::new(registry.clone());
+
+    let schema = serde_json::json!({"type": "object"});
+    let digest = skillsrs::core::SchemaDigest::from_schema(&schema).unwrap();
+
+    registry
+        .register(skillsrs::core::CallableRecord {
+            id: skillsrs::core::CallableId::skill("pytestlab-core", "1.0.0"),
+            kind: skillsrs::core::CallableKind::Skill,
+            fq_name: "skill.pytestlab-core".to_string(),
+            name: "pytestlab-core".to_string(),
+            title: Some("PyTestLab Core".to_string()),
+            description: Some("Use the core lab workflow".to_string()),
+            tags: vec![],
+            input_schema: schema.clone(),
+            output_schema: None,
+            schema_digest: digest.clone(),
+            server_alias: None,
+            upstream_tool_name: None,
+            skill_version: Some("1.0.0".to_string()),
+            uses: vec![],
+            skill_directory: None,
+            bundled_tools: vec![],
+            additional_files: vec![],
+            cost_hints: skillsrs::core::CostHints::default(),
+            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+            sandbox_config: None,
+        })
+        .unwrap();
+
+    registry
+        .register(skillsrs::core::CallableRecord {
+            id: skillsrs::core::CallableId::skill("generic-lab", "1.0.0"),
+            kind: skillsrs::core::CallableKind::Skill,
+            fq_name: "skill.generic-lab".to_string(),
+            name: "generic-lab".to_string(),
+            title: Some("Generic Lab".to_string()),
+            description: Some("A workflow that can mention pytestlab core in prose".to_string()),
+            tags: vec![],
+            input_schema: schema,
+            output_schema: None,
+            schema_digest: digest,
+            server_alias: None,
+            upstream_tool_name: None,
+            skill_version: Some("1.0.0".to_string()),
+            uses: vec![],
+            skill_directory: None,
+            bundled_tools: vec![],
+            additional_files: vec![],
+            cost_hints: skillsrs::core::CostHints::default(),
+            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+            sandbox_config: None,
+        })
+        .unwrap();
+
+    search_engine.rebuild();
+
+    let query = SearchQuery {
+        q: "pytestlab core".to_string(),
+        kind: "skills".to_string(),
+        limit: 10,
+        filters: None,
+        cursor: None,
+    };
+
+    let results = search_engine.search(&query).await.unwrap();
+    assert_eq!(results.total_matches, 2);
+    assert_eq!(results.matches[0].name, "pytestlab-core");
+}
+
+#[tokio::test]
+async fn test_search_matches_skill_body_terms() {
+    let temp = TempDir::new().unwrap();
+    let skill_dir = temp.path().join("body-search-skill");
+    std::fs::create_dir(&skill_dir).unwrap();
+
+    let skill_md = r#"---
+name: body-search-skill
+description: Short workflow metadata
+version: 1.0.0
+---
+
+# Body Search Skill
+
+Use AutoInstrument source selection with from_preset and VISA connectivity.
+"#;
+
+    std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+
+    let registry = Arc::new(Registry::new());
+    let search_engine = SearchEngine::new(registry.clone());
+    let store = SkillStore::new(temp.path(), registry.clone()).unwrap();
+
+    let ids = store.load_and_register_all().await.unwrap();
+    assert_eq!(ids.len(), 1);
+    search_engine.rebuild();
+
+    let query = SearchQuery {
+        q: "AutoInstrument from_preset".to_string(),
+        kind: "skills".to_string(),
+        limit: 10,
+        filters: None,
+        cursor: None,
+    };
+
+    let results = search_engine.search(&query).await.unwrap();
+    assert_eq!(results.total_matches, 1);
+    assert_eq!(results.matches[0].name, "body-search-skill");
+}
+
+#[tokio::test]
+async fn test_search_ranks_metadata_matches_before_body_only_matches() {
+    let temp = TempDir::new().unwrap();
+    let body_skill_dir = temp.path().join("body-only-skill");
+    std::fs::create_dir(&body_skill_dir).unwrap();
+
+    let body_skill_md = r#"---
+name: body-only-skill
+description: Short workflow metadata
+version: 1.0.0
+---
+
+# Body Only Skill
+
+This workflow mentions precision calibration in the instructions only.
+"#;
+
+    std::fs::write(body_skill_dir.join("SKILL.md"), body_skill_md).unwrap();
+
+    let registry = Arc::new(Registry::new());
+    let search_engine = SearchEngine::new(registry.clone());
+    let store = SkillStore::new(temp.path(), registry.clone()).unwrap();
+
+    let schema = serde_json::json!({"type": "object"});
+    let digest = skillsrs::core::SchemaDigest::from_schema(&schema).unwrap();
+    registry
+        .register(skillsrs::core::CallableRecord {
+            id: skillsrs::core::CallableId::skill("calibration-helper", "1.0.0"),
+            kind: skillsrs::core::CallableKind::Skill,
+            fq_name: "skill.calibration-helper".to_string(),
+            name: "calibration-helper".to_string(),
+            title: Some("Calibration Helper".to_string()),
+            description: Some("Short workflow metadata".to_string()),
+            tags: vec![],
+            input_schema: schema,
+            output_schema: None,
+            schema_digest: digest,
+            server_alias: None,
+            upstream_tool_name: None,
+            skill_version: Some("1.0.0".to_string()),
+            uses: vec![],
+            skill_directory: None,
+            bundled_tools: vec![],
+            additional_files: vec![],
+            cost_hints: skillsrs::core::CostHints::default(),
+            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            last_seen: chrono::Utc::now(),
+            sandbox_config: None,
+        })
+        .unwrap();
+
+    let ids = store.load_and_register_all().await.unwrap();
+    assert_eq!(ids.len(), 1);
+    search_engine.rebuild();
+
+    let query = SearchQuery {
+        q: "calibration".to_string(),
+        kind: "skills".to_string(),
+        limit: 10,
+        filters: None,
+        cursor: None,
+    };
+
+    let results = search_engine.search(&query).await.unwrap();
+    assert_eq!(results.total_matches, 2);
+    assert_eq!(results.matches[0].name, "calibration-helper");
+}
+
+#[tokio::test]
 async fn test_search_with_filters() {
     let registry = Arc::new(Registry::new());
     let search_engine = SearchEngine::new(registry.clone());

@@ -4,16 +4,15 @@
 
 ---
 
-## The 4 Tools
+## The 3 Tools
 
 ```
 search  → Find tools/skills by keywords
-schema  → Get parameter requirements
-exec    → Execute with validation
+exec    → Describe, validate, or execute
 manage  → Create/read/update/delete skills
 ```
 
-**Always follow**: `search` → `schema` → `exec`
+**Always follow**: `search` → `exec.describe` → `exec`
 
 ---
 
@@ -42,13 +41,13 @@ manage  → Create/read/update/delete skills
 
 ```json
 // Get full schema
-{ "id": "skill:name@1.0.0", "format": "both" }
+{ "id": "skill:name@1.0.0", "describe": true, "format": "both" }
 
 // Get only signature
-{ "id": "skill:name@1.0.0", "format": "signature" }
+{ "id": "skill:name@1.0.0", "describe": true, "format": "signature" }
 
 // Get JSON schema only
-{ "id": "skill:name@1.0.0", "format": "json_schema" }
+{ "id": "skill:name@1.0.0", "describe": true, "format": "json_schema" }
 ```
 
 **Key fields to check**:
@@ -201,7 +200,7 @@ if __name__ == '__main__':
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `Callable not found` | Wrong ID | Check `search` results for exact ID |
-| `Missing required argument` | Schema mismatch | Re-check `schema` output |
+| `Missing required argument` | Schema mismatch | Re-check `exec.describe` output |
 | `Timeout exceeded` | Too slow | Increase `timeout_ms` |
 | `Permission denied` | Sandbox | Check sandbox_config |
 | `Path traversal` | Invalid path | Use relative paths only |
@@ -213,7 +212,7 @@ if __name__ == '__main__':
 ### Pattern 1: Discover and Execute
 ```
 1. search → Find tool
-2. schema → Check parameters
+2. exec.describe → Check parameters
 3. exec → Run with args
 ```
 
@@ -221,7 +220,7 @@ if __name__ == '__main__':
 ```
 1. search → Check if exists
 2. manage(create) → Create skill with bundled script
-3. schema → Verify schema
+3. exec.describe → Verify schema
 4. exec → Test execution
 ```
 
@@ -229,7 +228,7 @@ if __name__ == '__main__':
 ```
 1. manage(get) → Read SKILL.md
 2. manage(get, filename=script.py) → Read source
-3. schema → Check expected parameters
+3. exec.describe → Check expected parameters
 4. exec(dry_run=true) → Validate
 5. exec → Execute
 ```
@@ -290,7 +289,7 @@ LLM:
 1. search → { "q": "log analyzer", "kind": "skills" }
    → Found: log-analyzer@1.0.0
 
-2. schema → { "id": "skill:log-analyzer@1.0.0" }
+2. exec.describe → { "id": "skill:log-analyzer@1.0.0", "describe": true, "format": "both" }
    → Required: log_file
    → Optional: format, top_n
 
