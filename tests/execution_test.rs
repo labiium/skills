@@ -9,6 +9,10 @@ use skillsrs::execution::{
 };
 use std::sync::Arc;
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
     let schema = serde_json::json!({
         "type": "object",
@@ -21,9 +25,9 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
     let id = CallableId::tool(server, name, digest.as_str());
 
     CallableRecord {
-        id: id.clone(),
+        id,
         kind: CallableKind::Tool,
-        fq_name: format!("{}.{}", server, name),
+        fq_name: format!("{server}.{name}"),
         name: name.to_string(),
         title: Some("Test Tool".to_string()),
         description: Some("A test tool".to_string()),
@@ -84,6 +88,10 @@ async fn test_add_upstream_stdio() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_sandbox_basic() {
     let config = SandboxConfig {
         timeout_ms: 5000,
@@ -110,6 +118,10 @@ async fn test_sandbox_basic() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_sandbox_env_vars() {
     let config = SandboxConfig::default();
     let sandbox = Sandbox::new(config);
@@ -126,6 +138,10 @@ async fn test_sandbox_env_vars() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_validation_missing_required() {
     let registry = Arc::new(Registry::new());
     let tool = create_test_tool_record("test-tool", "test-server");
@@ -149,6 +165,10 @@ async fn test_validation_missing_required() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_validate_callable_arguments_success() {
     let registry = Arc::new(Registry::new());
     let tool = create_test_tool_record("test-tool", "test-server");
@@ -164,6 +184,10 @@ fn test_validate_callable_arguments_success() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_validate_callable_arguments_missing_required() {
     let registry = Arc::new(Registry::new());
     let tool = create_test_tool_record("test-tool", "test-server");
@@ -180,6 +204,10 @@ fn test_validate_callable_arguments_missing_required() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_validate_callable_arguments_requires_object_when_schema_has_required_fields() {
     let registry = Arc::new(Registry::new());
     let tool = create_test_tool_record("test-tool", "test-server");
@@ -196,6 +224,10 @@ fn test_validate_callable_arguments_requires_object_when_schema_has_required_fie
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_callable_not_found() {
     let registry = Arc::new(Registry::new());
     let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));

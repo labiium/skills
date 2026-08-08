@@ -184,16 +184,18 @@ pub struct ValidationResult {
 }
 
 impl ValidationResult {
-    pub fn success() -> Self {
-        ValidationResult {
+    #[must_use]
+    pub const fn success() -> Self {
+        Self {
             valid: true,
             errors: vec![],
             warnings: vec![],
         }
     }
 
+    #[must_use]
     pub fn with_error(error: String) -> Self {
-        ValidationResult {
+        Self {
             valid: false,
             errors: vec![error],
             warnings: vec![],
@@ -215,16 +217,14 @@ pub struct SkillStore {
     root: PathBuf,
     registry: Arc<Registry>,
     search_engine: Option<Arc<SearchEngine>>,
-    _watcher: Option<RecommendedWatcher>,
+    watcher: Option<RecommendedWatcher>,
     reload_tx: Option<tokio::sync::mpsc::Sender<PathBuf>>,
 }
 
 impl SkillStore {
     fn normalize_skill_body(content: &str) -> String {
         if content.starts_with("---\n") {
-            if let Ok((_, body)) = Self::parse_yaml_frontmatter(content) {
-                return body;
-            }
+            return Self::parse_yaml_frontmatter(content).1;
         }
         content.trim().to_string()
     }
@@ -233,8 +233,7 @@ impl SkillStore {
         for (filename, _) in files {
             if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
                 return Err(SkillStoreError::ValidationError(format!(
-                    "Invalid {} filename: {}",
-                    kind, filename
+                    "Invalid {kind} filename: {filename}"
                 )));
             }
         }
@@ -261,15 +260,16 @@ impl SkillStore {
             tags: (!request.tags.is_empty()).then_some(&request.tags),
         };
 
-        let yaml = serde_yaml::to_string(&frontmatter).map_err(|e| {
-            SkillStoreError::Parse(format!("Failed to serialize frontmatter: {}", e))
-        })?;
+        let yaml = serde_yaml::to_string(&frontmatter)
+            .map_err(|e| SkillStoreError::Parse(format!("Failed to serialize frontmatter: {e}")))?;
         let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
 
         Ok(format!("---\n{}---\n\n{}", yaml, body_content.trim()))
     }
 
     /// Create new skill store
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn new(root: impl AsRef<Path>, registry: Arc<Registry>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
 
@@ -279,16 +279,18 @@ impl SkillStore {
             info!("Created skill store root: {:?}", root);
         }
 
-        Ok(SkillStore {
+        Ok(Self {
             root,
             registry,
             search_engine: None,
-            _watcher: None,
+            watcher: None,
             reload_tx: None,
         })
     }
 
     /// Create new skill store with search engine for automatic index updates
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn with_search_engine(
         root: impl AsRef<Path>,
         registry: Arc<Registry>,
@@ -300,6 +302,8 @@ impl SkillStore {
     }
 
     /// Load all skills from disk
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_all(&self) -> Result<Vec<Skill>> {
         info!("Loading skills from: {:?}", self.root);
 
@@ -337,18 +341,19 @@ impl SkillStore {
     }
 
     /// Load skill content for progressive disclosure
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn load_skill_content(&self, skill_id: &str) -> Result<SkillContent> {
         // Find the skill directory
         let skill_dir = self.find_skill_directory(skill_id)?;
 
         // Load SKILL.md
         let skill_md_path = skill_dir.join("SKILL.md");
-        let skill_md = if skill_md_path.exists() {
+        let skill_document = if skill_md_path.exists() {
             std::fs::read_to_string(&skill_md_path)?
         } else {
             return Err(SkillStoreError::FileNotFound(format!(
-                "SKILL.md not found for skill: {}",
-                skill_id
+                "SKILL.md not found for skill: {skill_id}"
             )));
         };
 
@@ -364,7 +369,7 @@ impl SkillStore {
                         let path = entry.path();
                         if path.is_file() {
                             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                additional_files.push(format!("{}/{}", subdir, name));
+                                additional_files.push(format!("{subdir}/{name}"));
                             }
                         }
                     }
@@ -382,11 +387,7 @@ impl SkillStore {
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name != "SKILL.md"
-                            && !name.ends_with(".py")
-                            && !name.ends_with(".sh")
-                            && !name.ends_with(".js")
-                        {
+                        if name != "SKILL.md" && !is_script_filename(name) {
                             additional_files.push(name.to_string());
                         }
                     }
@@ -395,10 +396,10 @@ impl SkillStore {
         }
 
         // Discover bundled tools
-        let bundled_tools = self.discover_bundled_tools(&skill_dir)?;
+        let bundled_tools = Self::discover_bundled_tools(&skill_dir);
 
         // Parse allowed_tools from SKILL.md frontmatter
-        let uses_tools = match crate::agent_skills::parse_frontmatter_public(&skill_md) {
+        let uses_tools = match crate::agent_skills::parse_frontmatter_public(&skill_document) {
             Ok((frontmatter, _)) => frontmatter
                 .allowed_tools
                 .map(|tools| tools.to_vec())
@@ -407,7 +408,7 @@ impl SkillStore {
         };
 
         Ok(SkillContent {
-            skill_md,
+            skill_md: skill_document,
             additional_files,
             bundled_tools,
             uses_tools,
@@ -418,20 +419,20 @@ impl SkillStore {
     ///
     /// Allows accessing files in subdirectories (e.g., "references/guide.md")
     /// while preventing path traversal attacks.
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn load_skill_file(&self, skill_id: &str, filename: &str) -> Result<String> {
         // Reject absolute paths
         if filename.starts_with('/') || filename.starts_with('\\') {
             return Err(SkillStoreError::InvalidManifest(format!(
-                "Absolute paths not allowed: {}",
-                filename
+                "Absolute paths not allowed: {filename}"
             )));
         }
 
         // Reject path traversal attempts
         if filename.contains("..") {
             return Err(SkillStoreError::InvalidManifest(format!(
-                "Path traversal not allowed: {}",
-                filename
+                "Path traversal not allowed: {filename}"
             )));
         }
 
@@ -440,10 +441,7 @@ impl SkillStore {
 
         // Canonicalize and verify the path stays within skill directory
         let canonical_file = file_path.canonicalize().map_err(|_| {
-            SkillStoreError::FileNotFound(format!(
-                "File {} not found in skill {}",
-                filename, skill_id
-            ))
+            SkillStoreError::FileNotFound(format!("File {filename} not found in skill {skill_id}"))
         })?;
         let canonical_skill = skill_dir.canonicalize().map_err(|_| {
             SkillStoreError::Io(std::io::Error::new(
@@ -454,8 +452,7 @@ impl SkillStore {
 
         if !canonical_file.starts_with(&canonical_skill) {
             return Err(SkillStoreError::InvalidManifest(format!(
-                "File {} is outside skill directory",
-                filename
+                "File {filename} is outside skill directory"
             )));
         }
 
@@ -492,8 +489,7 @@ impl SkillStore {
         }
 
         Err(SkillStoreError::NotFound(format!(
-            "Skill not found: {}",
-            skill_id
+            "Skill not found: {skill_id}"
         )))
     }
 
@@ -502,7 +498,7 @@ impl SkillStore {
     /// Looks for scripts in:
     /// 1. scripts/ subdirectory (new format)
     /// 2. skill root directory (legacy support)
-    fn discover_bundled_tools(&self, skill_dir: &Path) -> Result<Vec<BundledTool>> {
+    fn discover_bundled_tools(skill_dir: &Path) -> Vec<BundledTool> {
         let mut bundled_tools = Vec::new();
 
         // Helper closure to process a directory and discover scripts
@@ -532,7 +528,7 @@ impl SkillStore {
                             }
 
                             // Try to load schema from companion .schema.json file
-                            let schema_path = dir.join(format!("{}.schema.json", name));
+                            let schema_path = dir.join(format!("{name}.schema.json"));
                             let schema = if schema_path.exists() {
                                 std::fs::read_to_string(&schema_path)
                                     .ok()
@@ -545,12 +541,12 @@ impl SkillStore {
                             let tool_name = if prefix.is_empty() {
                                 name.to_string()
                             } else {
-                                format!("{}/{}", prefix, name)
+                                format!("{prefix}/{name}")
                             };
 
                             bundled_tools.push(BundledTool {
                                 name: tool_name,
-                                description: format!("Bundled tool: {}", name),
+                                description: format!("Bundled tool: {name}"),
                                 command,
                                 schema,
                             });
@@ -569,12 +565,14 @@ impl SkillStore {
         // Then look in skill root (legacy support)
         discover_scripts_in_dir(skill_dir, "");
 
-        Ok(bundled_tools)
+        bundled_tools
     }
 
     /// Load a single skill from a directory.
     ///
     /// Supports only Agent Skills format (SKILL.md with YAML frontmatter).
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_skill(&self, path: &Path) -> Result<Skill> {
         let skill_md_path = path.join("SKILL.md");
 
@@ -595,7 +593,7 @@ impl SkillStore {
     async fn load_agent_skill(&self, path: &Path) -> Result<Skill> {
         let agent_skill = agent_skills::AgentSkill::from_directory(path).await?;
         let manifest = agent_skill.to_skill_manifest();
-        let documentation = Some(agent_skill.content.clone());
+        let documentation = Some(agent_skill.content);
 
         info!(
             "Loaded Agent Skill: {} v{} from {:?}",
@@ -610,6 +608,8 @@ impl SkillStore {
     }
 
     /// Register a skill in the registry
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn register_skill(&self, skill: &Skill) -> Result<CallableId> {
         let manifest = &skill.manifest;
 
@@ -636,7 +636,7 @@ impl SkillStore {
 
         // Create callable record
         // Discover bundled tools
-        let bundled_tools = self.discover_bundled_tools(&skill.path).unwrap_or_default();
+        let bundled_tools = Self::discover_bundled_tools(&skill.path);
 
         // Discover additional files
         let mut additional_files = Vec::new();
@@ -646,9 +646,7 @@ impl SkillStore {
                 if path.is_file() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name != "SKILL.md"
-                            && !name.ends_with(".py")
-                            && !name.ends_with(".sh")
-                            && !name.ends_with(".js")
+                            && !is_script_filename(name)
                             && !name.ends_with(".schema.json")
                         {
                             additional_files.push(name.to_string());
@@ -674,7 +672,7 @@ impl SkillStore {
             skill_version: Some(manifest.version.clone()),
             uses: Vec::new(), // Note: uses_tools field is stored in manifest; full dependency resolution deferred to future enhancement
             skill_directory: Some(skill.path.clone()),
-            bundled_tools: bundled_tools.clone(),
+            bundled_tools,
             additional_files,
             cost_hints: CostHints {
                 expected_calls: manifest.hints.expected_calls,
@@ -702,6 +700,8 @@ impl SkillStore {
     }
 
     /// Load and register all skills
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_and_register_all(&self) -> Result<Vec<CallableId>> {
         let skills = self.load_all().await?;
         let mut ids = Vec::new();
@@ -719,6 +719,8 @@ impl SkillStore {
 
     /// Start filesystem watcher for hot-reload
     /// Returns a receiver channel that receives paths to skills that need reloading
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn start_watch(&mut self) -> Result<tokio::sync::mpsc::Receiver<PathBuf>> {
         let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(100);
         let (event_tx, mut event_rx) = mpsc::channel(100);
@@ -729,13 +731,13 @@ impl SkillStore {
                 let _ = event_tx.blocking_send(event);
             }
         })
-        .map_err(|e| SkillStoreError::Parse(format!("Failed to create watcher: {}", e)))?;
+        .map_err(|e| SkillStoreError::Parse(format!("Failed to create watcher: {e}")))?;
 
         watcher
             .watch(&self.root, RecursiveMode::Recursive)
-            .map_err(|e| SkillStoreError::Parse(format!("Failed to watch directory: {}", e)))?;
+            .map_err(|e| SkillStoreError::Parse(format!("Failed to watch directory: {e}")))?;
 
-        self._watcher = Some(watcher);
+        self.watcher = Some(watcher);
         self.reload_tx = Some(reload_tx.clone());
 
         // Spawn background task to detect SKILL.md changes and send reload requests
@@ -759,9 +761,11 @@ impl SkillStore {
     }
 
     /// Create a new skill
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn create_skill(&self, request: CreateSkillRequest) -> Result<CallableId> {
         // Validate skill name
-        self.validate_skill_name(&request.name)?;
+        Self::validate_skill_name(&request.name)?;
 
         // Check if skill already exists
         let skill_dir = self.root.join(&request.name);
@@ -831,6 +835,8 @@ impl SkillStore {
     /// Update an existing skill
     ///
     /// Updates a skill in Agent Skills format (SKILL.md with YAML frontmatter).
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn update_skill(
         &self,
         skill_id: &str,
@@ -850,10 +856,8 @@ impl SkillStore {
 
         // Parse existing frontmatter if present
         let (_existing_frontmatter, existing_body) = if existing_content.starts_with("---\n") {
-            match Self::parse_yaml_frontmatter(&existing_content) {
-                Ok((fm, body)) => (Some(fm), body),
-                Err(_) => (None, existing_content),
-            }
+            let (frontmatter, body) = Self::parse_yaml_frontmatter(&existing_content);
+            (Some(frontmatter), body)
         } else {
             (None, existing_content)
         };
@@ -912,30 +916,20 @@ impl SkillStore {
         Ok(id)
     }
 
-    /// Parse YAML frontmatter from content (helper for update_skill)
-    fn parse_yaml_frontmatter(content: &str) -> Result<(String, String)> {
-        if !content.starts_with("---\n") {
-            return Ok((String::new(), content.to_string()));
-        }
-
-        let after_first = &content[4..]; // Skip "---\n"
-        let end_pos = match after_first.find("\n---\n") {
-            Some(pos) => pos,
-            None => return Ok((String::new(), content.to_string())),
+    /// Parse YAML frontmatter from content (helper for `update_skill`)
+    fn parse_yaml_frontmatter(content: &str) -> (String, String) {
+        let Some(after_first) = content.strip_prefix("---\n") else {
+            return (String::new(), content.to_string());
         };
-
-        let frontmatter = &after_first[..end_pos];
-        let body_start = 4 + end_pos + 5; // Skip "---\n" + frontmatter + "\n---\n"
-        let body = if body_start < content.len() {
-            content[body_start..].trim().to_string()
-        } else {
-            String::new()
+        let Some((frontmatter, body)) = after_first.split_once("\n---\n") else {
+            return (String::new(), content.to_string());
         };
-
-        Ok((frontmatter.to_string(), body))
+        (frontmatter.to_string(), body.trim().to_string())
     }
 
     /// Delete a skill
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn delete_skill(&self, skill_id: &str) -> Result<()> {
         // Find skill directory
         let skill_dir = self.find_skill_directory(skill_id)?;
@@ -967,7 +961,7 @@ impl SkillStore {
     }
 
     /// Validate skill name
-    fn validate_skill_name(&self, name: &str) -> Result<()> {
+    fn validate_skill_name(name: &str) -> Result<()> {
         if name.is_empty() {
             return Err(SkillStoreError::ValidationError(
                 "Skill name cannot be empty".to_string(),
@@ -976,8 +970,7 @@ impl SkillStore {
 
         if name.contains('/') || name.contains('\\') || name.contains("..") {
             return Err(SkillStoreError::ValidationError(format!(
-                "Invalid skill name: {}",
-                name
+                "Invalid skill name: {name}"
             )));
         }
 
@@ -991,6 +984,7 @@ impl SkillStore {
     }
 
     /// Validate a skill manifest and content
+    #[must_use]
     pub fn validate_skill(&self, skill: &Skill) -> ValidationResult {
         let mut result = ValidationResult::success();
 
@@ -1018,14 +1012,14 @@ impl SkillStore {
         }
 
         // Validate input schema
-        if let Err(e) = self.validate_json_schema(&skill.manifest.inputs) {
-            result.add_error(format!("Invalid input schema: {}", e));
+        if let Err(e) = Self::validate_json_schema(&skill.manifest.inputs) {
+            result.add_error(format!("Invalid input schema: {e}"));
         }
 
         // Validate output schema if present
         if let Some(ref outputs) = skill.manifest.outputs {
-            if let Err(e) = self.validate_json_schema(outputs) {
-                result.add_error(format!("Invalid output schema: {}", e));
+            if let Err(e) = Self::validate_json_schema(outputs) {
+                result.add_error(format!("Invalid output schema: {e}"));
             }
         }
 
@@ -1040,8 +1034,7 @@ impl SkillStore {
                     .any(|r| r.name == *tool || r.fq_name == *tool || r.id.as_str() == *tool);
                 if !found {
                     result.add_warning(format!(
-                        "Tool '{}' not found in registry (may be loaded later)",
-                        tool
+                        "Tool '{tool}' not found in registry (may be loaded later)"
                     ));
                 }
             }
@@ -1063,7 +1056,7 @@ impl SkillStore {
         // Validate risk tier
         if let Some(ref tier) = skill.manifest.risk_tier {
             if tier.parse::<crate::core::RiskTier>().is_err() {
-                result.add_error(format!("Invalid risk tier: {}", tier));
+                result.add_error(format!("Invalid risk tier: {tier}"));
             }
         }
 
@@ -1072,7 +1065,7 @@ impl SkillStore {
             if calls == 0 {
                 result.add_warning("Expected calls is 0".to_string());
             } else if calls > 100 {
-                result.add_warning(format!("Expected calls is very high: {}", calls));
+                result.add_warning(format!("Expected calls is very high: {calls}"));
             }
         }
 
@@ -1089,13 +1082,17 @@ impl SkillStore {
 
         // Validate bundled scripts exist and are executable
         let script_extensions = ["py", "sh", "js"];
-        for entry in std::fs::read_dir(&skill.path)
-            .unwrap_or_else(|_| {
-                result.add_error(format!("Cannot read skill directory: {:?}", skill.path));
-                std::fs::read_dir(".").unwrap() // Dummy to satisfy type
-            })
-            .flatten()
-        {
+        let entries = match std::fs::read_dir(&skill.path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                result.add_error(format!(
+                    "Cannot read skill directory {}: {error}",
+                    skill.path.display()
+                ));
+                return result;
+            }
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -1116,7 +1113,7 @@ impl SkillStore {
     }
 
     /// Validate JSON Schema
-    fn validate_json_schema(&self, schema: &serde_json::Value) -> Result<()> {
+    fn validate_json_schema(schema: &serde_json::Value) -> Result<()> {
         // Basic JSON Schema validation
         if !schema.is_object() {
             return Err(SkillStoreError::ValidationError(
@@ -1124,7 +1121,11 @@ impl SkillStore {
             ));
         }
 
-        let obj = schema.as_object().unwrap();
+        let Some(obj) = schema.as_object() else {
+            return Err(SkillStoreError::ValidationError(
+                "Schema must be an object".to_string(),
+            ));
+        };
 
         // Must have "type" field
         if !obj.contains_key("type") {
@@ -1141,8 +1142,7 @@ impl SkillStore {
                 ];
                 if !valid_types.contains(&type_str) {
                     return Err(SkillStoreError::ValidationError(format!(
-                        "Invalid schema type: {}",
-                        type_str
+                        "Invalid schema type: {type_str}"
                     )));
                 }
             }
@@ -1158,7 +1158,11 @@ impl SkillStore {
         }
 
         // Must start with letter
-        if !id.chars().next().unwrap().is_ascii_lowercase() {
+        if !id
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase())
+        {
             return false;
         }
 
@@ -1168,6 +1172,8 @@ impl SkillStore {
     }
 
     /// Detect circular dependencies in skills
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn detect_circular_dependencies(&self, skill_id: &str) -> Result<Vec<String>> {
         let mut visited = std::collections::HashSet::new();
         let mut stack = vec![skill_id.to_string()];
@@ -1177,7 +1183,7 @@ impl SkillStore {
             if visited.contains(&current) {
                 // Found a cycle
                 if let Some(pos) = path.iter().position(|s| s == &current) {
-                    return Ok(path[pos..].to_vec());
+                    return Ok(path.get(pos..).unwrap_or_default().to_vec());
                 }
             }
 
@@ -1197,4 +1203,14 @@ impl SkillStore {
 
         Ok(vec![]) // No cycle found
     }
+}
+fn is_script_filename(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["py", "sh", "js"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
 }

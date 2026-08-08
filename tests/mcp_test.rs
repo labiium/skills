@@ -1,4 +1,4 @@
-//! Tests for MCP module: SkillsServer
+//! Tests for MCP module: `SkillsServer`
 
 use skillsrs::core::policy::PolicyConfig;
 use skillsrs::core::registry::Registry;
@@ -10,6 +10,10 @@ use skillsrs::storage::SkillStore;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
     let registry = Arc::new(Registry::new());
     let search_engine = Arc::new(SearchEngine::new(registry.clone()));
@@ -36,6 +40,10 @@ fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
     )
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn create_server_with_test_tool() -> (SkillsServer, String) {
     let (server, registry, search_engine) = create_empty_server();
     let schema = serde_json::json!({
@@ -114,6 +122,10 @@ fn test_server_creation() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_exec_describe_returns_schema() {
     let (server, id) = create_server_with_test_tool();
 
@@ -136,6 +148,10 @@ async fn test_exec_describe_returns_schema() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_exec_describe_takes_precedence_over_dry_run_and_invalid_arguments() {
     let (server, id) = create_server_with_test_tool();
 
@@ -155,6 +171,10 @@ async fn test_exec_describe_takes_precedence_over_dry_run_and_invalid_arguments(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_exec_describe_rejects_invalid_json_pointer() {
     let (server, id) = create_server_with_test_tool();
 
@@ -172,6 +192,10 @@ async fn test_exec_describe_rejects_invalid_json_pointer() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_exec_describe_enforces_max_bytes() {
     let (server, id) = create_server_with_test_tool();
 
@@ -188,6 +212,10 @@ async fn test_exec_describe_enforces_max_bytes() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_exec_dry_run_validates_arguments() {
     let (server, id) = create_server_with_test_tool();
 
@@ -203,6 +231,10 @@ async fn test_exec_dry_run_validates_arguments() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_exec_dry_run_accepts_valid_arguments() {
     let (server, id) = create_server_with_test_tool();
 
@@ -220,6 +252,10 @@ async fn test_exec_dry_run_accepts_valid_arguments() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_exec_response_schema_matches_optional_payload_shape() {
     let schema = serde_json::to_value(schemars::schema_for!(ExecResponse)).unwrap();
     let root_required = schema

@@ -74,8 +74,9 @@ pub struct Registry {
 }
 
 impl Registry {
+    #[must_use]
     pub fn new() -> Self {
-        Registry {
+        Self {
             callables: Arc::new(DashMap::new()),
             by_fq_name: Arc::new(DashMap::new()),
             by_server: Arc::new(DashMap::new()),
@@ -84,6 +85,8 @@ impl Registry {
     }
 
     /// Register a callable (tool or skill)
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn register(&self, record: CallableRecord) -> Result<()> {
         let id = record.id.clone();
         let fq_name = record.fq_name.clone();
@@ -112,6 +115,8 @@ impl Registry {
     }
 
     /// Register multiple callables (batch operation)
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn register_batch(&self, records: Vec<CallableRecord>) -> Result<()> {
         for record in records {
             self.register(record)?;
@@ -120,11 +125,13 @@ impl Registry {
     }
 
     /// Get a callable by ID
+    #[must_use]
     pub fn get(&self, id: &CallableId) -> Option<CallableRecord> {
         self.callables.get(id).map(|entry| entry.value().clone())
     }
 
     /// Get a callable by fully qualified name
+    #[must_use]
     pub fn get_by_fq_name(&self, fq_name: &str) -> Option<CallableRecord> {
         self.by_fq_name
             .get(fq_name)
@@ -132,6 +139,7 @@ impl Registry {
     }
 
     /// Get all callables for a server
+    #[must_use]
     pub fn get_by_server(&self, server_alias: &str) -> Vec<CallableRecord> {
         self.by_server
             .get(server_alias)
@@ -177,6 +185,7 @@ impl Registry {
     }
 
     /// Get all callables (for indexing)
+    #[must_use]
     pub fn all(&self) -> Vec<CallableRecord> {
         self.callables
             .iter()
@@ -185,6 +194,7 @@ impl Registry {
     }
 
     /// Get callables by kind
+    #[must_use]
     pub fn by_kind(&self, kind: CallableKind) -> Vec<CallableRecord> {
         self.callables
             .iter()
@@ -201,11 +211,13 @@ impl Registry {
     }
 
     /// Get server info
+    #[must_use]
     pub fn get_server(&self, alias: &str) -> Option<ServerInfo> {
         self.servers.read().get(alias).cloned()
     }
 
     /// Get all server info
+    #[must_use]
     pub fn all_servers(&self) -> Vec<ServerInfo> {
         self.servers.read().values().cloned().collect()
     }
@@ -229,6 +241,7 @@ impl Registry {
     }
 
     /// Get registry statistics
+    #[must_use]
     pub fn stats(&self) -> RegistryStats {
         let all_callables = self.all();
         let tools = all_callables
@@ -257,16 +270,19 @@ impl Registry {
     }
 
     /// Check if a callable exists
+    #[must_use]
     pub fn contains(&self, id: &CallableId) -> bool {
         self.callables.contains_key(id)
     }
 
     /// Get count of callables
+    #[must_use]
     pub fn len(&self) -> usize {
         self.callables.len()
     }
 
     /// Check if registry is empty
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.callables.is_empty()
     }

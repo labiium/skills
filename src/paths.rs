@@ -47,6 +47,8 @@ impl SkillsPaths {
     /// - Linux: ~/.local/share/skills, ~/.config/skills, ~/.cache/skills
     /// - macOS: ~/Library/Application Support/skills, ~/Library/Preferences/skills, ~/Library/Caches/skills
     /// - Windows: %APPDATA%\labiium\skills, %LOCALAPPDATA%\labiium\skills\cache
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn new() -> Result<Self> {
         let project_dirs = ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
             .context("Failed to determine system directories")?;
@@ -91,6 +93,8 @@ impl SkillsPaths {
     ///
     /// Creates directories with appropriate permissions.
     /// Safe to call multiple times.
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn ensure_directories(&self) -> Result<()> {
         let dirs = [
             &self.data_dir,
@@ -111,17 +115,22 @@ impl SkillsPaths {
     }
 
     /// Get default config file path
+    #[must_use]
     pub fn default_config_file(&self) -> PathBuf {
         self.config_dir.join("config.yaml")
     }
 
     /// Get database directory (parent of database file)
     #[allow(dead_code)]
+    #[must_use]
     pub fn database_dir(&self) -> PathBuf {
-        self.database_path.parent().unwrap().to_path_buf()
+        self.database_path
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf)
     }
 
     /// Display paths for informational purposes
+    #[must_use]
     pub fn display(&self) -> String {
         format!(
             "Skills paths:
@@ -143,7 +152,7 @@ impl SkillsPaths {
 
 impl Default for SkillsPaths {
     fn default() -> Self {
-        Self::new().expect("Failed to determine system directories")
+        Self::new().unwrap_or_else(|_| Self::with_root("."))
     }
 }
 
@@ -174,26 +183,27 @@ pub struct PathsConfig {
 impl PathsConfig {
     /// Apply overrides to default paths
     ///
-    /// Note: skills_root is always derived from data_dir/skills/ to enforce
+    /// Note: `skills_root` is always derived from `data_dir/skills`/ to enforce
     /// the nested directory structure regardless of configuration.
+    #[must_use]
     pub fn apply_to(&self, mut paths: SkillsPaths) -> SkillsPaths {
         if let Some(ref data_dir) = self.data_dir {
-            paths.data_dir = data_dir.clone();
+            paths.data_dir.clone_from(data_dir);
         }
         if let Some(ref config_dir) = self.config_dir {
-            paths.config_dir = config_dir.clone();
+            paths.config_dir.clone_from(config_dir);
         }
         if let Some(ref cache_dir) = self.cache_dir {
-            paths.cache_dir = cache_dir.clone();
+            paths.cache_dir.clone_from(cache_dir);
         }
         if let Some(ref database_path) = self.database_path {
-            paths.database_path = database_path.clone();
+            paths.database_path.clone_from(database_path);
         }
         // Always derive skills_root from data_dir/skills/
         // This enforces the nested structure: .skills/skills/
         paths.skills_root = paths.data_dir.join("skills");
         if let Some(ref logs_dir) = self.logs_dir {
-            paths.logs_dir = logs_dir.clone();
+            paths.logs_dir.clone_from(logs_dir);
         }
         paths
     }
@@ -201,22 +211,24 @@ impl PathsConfig {
 
 /// Get paths from environment variable
 ///
-/// Only SKILLS_PATH is supported. All other paths are derived from it:
-/// - Skills: {SKILLS_PATH}/skills/
-/// - Database: {SKILLS_PATH}/skills.db
-/// - Cache: {SKILLS_PATH}/cache/
-/// - Logs: {SKILLS_PATH}/logs/
+/// Only `SKILLS_PATH` is supported. All other paths are derived from it:
+/// - Skills: {`SKILLS_PATH}/skills`/
+/// - Database: {`SKILLS_PATH}/skills.db`
+/// - Cache: {`SKILLS_PATH}/cache`/
+/// - Logs: {`SKILLS_PATH}/logs`/
+#[must_use]
 pub fn paths_from_env() -> PathsConfig {
-    if let Ok(path) = std::env::var("SKILLS_PATH") {
-        let base = PathBuf::from(path);
-        PathsConfig {
-            data_dir: Some(base.clone()),
-            config_dir: None,
-            cache_dir: Some(base.join("cache")),
-            database_path: Some(base.join("skills.db")),
-            logs_dir: Some(base.join("logs")),
-        }
-    } else {
-        PathsConfig::default()
-    }
+    std::env::var("SKILLS_PATH").map_or_else(
+        |_| PathsConfig::default(),
+        |path| {
+            let base = PathBuf::from(path);
+            PathsConfig {
+                data_dir: Some(base.clone()),
+                config_dir: None,
+                cache_dir: Some(base.join("cache")),
+                database_path: Some(base.join("skills.db")),
+                logs_dir: Some(base.join("logs")),
+            }
+        },
+    )
 }

@@ -71,7 +71,7 @@ pub struct UpstreamConfig {
     pub auth: Option<AuthConfig>,
 
     // For Agent Skills Repo
-    /// Git repository URL (e.g., "https://github.com/owner/repo" or "owner/repo")
+    /// Git repository URL (e.g., "<https://github.com/owner/repo>" or "owner/repo")
     pub repo: Option<String>,
     /// Git ref (branch, tag, or commit SHA)
     pub git_ref: Option<String>,
@@ -151,8 +151,9 @@ pub struct UpstreamManager {
 }
 
 impl UpstreamManager {
+    #[must_use]
     pub fn new(registry: Arc<Registry>) -> Self {
-        UpstreamManager {
+        Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             registry,
             http_client: reqwest::Client::new(),
@@ -160,6 +161,8 @@ impl UpstreamManager {
     }
 
     /// Add an upstream server
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn add_upstream(&self, config: UpstreamConfig) -> Result<()> {
         let alias = config.alias.clone();
         info!("Adding upstream server: {}", alias);
@@ -182,6 +185,8 @@ impl UpstreamManager {
     }
 
     /// Connect to an upstream server
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn connect(&self, alias: &str) -> Result<()> {
         info!("Connecting to upstream: {}", alias);
 
@@ -245,6 +250,10 @@ impl UpstreamManager {
     }
 
     /// Connect via stdio (subprocess)
+    #[expect(
+        clippy::too_many_lines,
+        reason = "stdio MCP handshake and task wiring form one ordered protocol operation"
+    )]
     async fn connect_stdio(&self, config: &UpstreamConfig) -> Result<()> {
         let command = config
             .command
@@ -260,14 +269,18 @@ impl UpstreamManager {
         debug!("Spawning stdio process: {:?}", command);
 
         // Spawn subprocess with stdio piped
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
+        let program = command
+            .first()
+            .ok_or_else(|| UpstreamError::ConnectionFailed("Command list is empty".to_string()))?;
+        let arguments = command.get(1..).unwrap_or_default();
+        let mut child = Command::new(program)
+            .args(arguments)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| UpstreamError::ConnectionFailed(format!("Failed to spawn: {}", e)))?;
+            .map_err(|e| UpstreamError::ConnectionFailed(format!("Failed to spawn: {e}")))?;
 
         let stdin = child
             .stdin
@@ -326,7 +339,7 @@ impl UpstreamManager {
                             Ok(j) => j,
                             Err(e) => {
                                 let _ = response_tx.send(Err(UpstreamError::ProtocolError(
-                                    format!("Failed to serialize request: {}", e)
+                                    format!("Failed to serialize request: {e}")
                                 )));
                                 continue;
                             }
@@ -334,21 +347,21 @@ impl UpstreamManager {
 
                         if let Err(e) = stdin.write_all(json.as_bytes()).await {
                             let _ = response_tx.send(Err(UpstreamError::ConnectionFailed(
-                                format!("Failed to write to stdin: {}", e)
+                                format!("Failed to write to stdin: {e}")
                             )));
                             break;
                         }
 
                         if let Err(e) = stdin.write_all(b"\n").await {
                             let _ = response_tx.send(Err(UpstreamError::ConnectionFailed(
-                                format!("Failed to write newline: {}", e)
+                                format!("Failed to write newline: {e}")
                             )));
                             break;
                         }
 
                         if let Err(e) = stdin.flush().await {
                             let _ = response_tx.send(Err(UpstreamError::ConnectionFailed(
-                                format!("Failed to flush: {}", e)
+                                format!("Failed to flush: {e}")
                             )));
                             break;
                         }
@@ -436,11 +449,16 @@ impl UpstreamManager {
             session.process = Some(child);
             session.request_tx = Some(request_tx);
         }
+        drop(sessions);
 
         Ok(())
     }
 
     /// Connect via HTTP
+    #[expect(
+        clippy::unused_async,
+        reason = "HTTP connector retains the async transport interface while initialization is mocked"
+    )]
     async fn connect_http(&self, config: &UpstreamConfig) -> Result<()> {
         let url = config
             .url
@@ -459,6 +477,10 @@ impl UpstreamManager {
     }
 
     /// Connect via HTTP+SSE (legacy)
+    #[expect(
+        clippy::unused_async,
+        reason = "SSE connector retains the async transport interface while initialization is mocked"
+    )]
     async fn connect_http_sse(&self, config: &UpstreamConfig) -> Result<()> {
         let url = config
             .url
@@ -477,6 +499,8 @@ impl UpstreamManager {
     }
 
     /// Refresh tools from an upstream server
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn refresh_tools(&self, alias: &str) -> Result<()> {
         info!("Refreshing tools from: {}", alias);
 
@@ -547,7 +571,7 @@ impl UpstreamManager {
         {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(alias) {
-                session.tools = tool_ids.clone();
+                session.tools.clone_from(&tool_ids);
             }
         }
 
@@ -613,7 +637,7 @@ impl UpstreamManager {
             let description = tool_value
                 .get("description")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
 
             let input_schema = tool_value
                 .get("inputSchema")
@@ -669,7 +693,7 @@ impl UpstreamManager {
             }))
             .send()
             .await
-            .map_err(|e| UpstreamError::RequestFailed(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| UpstreamError::RequestFailed(format!("HTTP request failed: {e}")))?;
 
         if !response.status().is_success() {
             return Err(UpstreamError::RequestFailed(format!(
@@ -678,14 +702,14 @@ impl UpstreamManager {
             )));
         }
 
-        let response_json: McpResponse = response.json().await.map_err(|e| {
-            UpstreamError::ProtocolError(format!("Failed to parse response: {}", e))
-        })?;
+        let response_json: McpResponse = response
+            .json()
+            .await
+            .map_err(|e| UpstreamError::ProtocolError(format!("Failed to parse response: {e}")))?;
 
         if let Some(error) = response_json.error {
             return Err(UpstreamError::RequestFailed(format!(
-                "Server error: {}",
-                error
+                "Server error: {error}"
             )));
         }
 
@@ -711,7 +735,7 @@ impl UpstreamManager {
             let description = tool_value
                 .get("description")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(std::string::ToString::to_string);
 
             let input_schema = tool_value
                 .get("inputSchema")
@@ -729,6 +753,8 @@ impl UpstreamManager {
     }
 
     /// Call a tool on an upstream server
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn call_tool(
         &self,
         server_alias: &str,
@@ -850,7 +876,7 @@ impl UpstreamManager {
             }))
             .send()
             .await
-            .map_err(|e| UpstreamError::RequestFailed(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| UpstreamError::RequestFailed(format!("HTTP request failed: {e}")))?;
 
         if !response.status().is_success() {
             return Err(UpstreamError::RequestFailed(format!(
@@ -859,14 +885,14 @@ impl UpstreamManager {
             )));
         }
 
-        let response_json: McpResponse = response.json().await.map_err(|e| {
-            UpstreamError::ProtocolError(format!("Failed to parse response: {}", e))
-        })?;
+        let response_json: McpResponse = response
+            .json()
+            .await
+            .map_err(|e| UpstreamError::ProtocolError(format!("Failed to parse response: {e}")))?;
 
         if let Some(error) = response_json.error {
             return Err(UpstreamError::RequestFailed(format!(
-                "Server error: {}",
-                error
+                "Server error: {error}"
             )));
         }
 
@@ -898,41 +924,46 @@ impl UpstreamManager {
         sessions.get(alias).map(|s| s.config.clone())
     }
 
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn update_upstream(&self, alias: &str, updates: UpstreamConfig) -> Result<()> {
         info!("Updating upstream server: {}", alias);
 
-        let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .get_mut(alias)
-            .ok_or_else(|| UpstreamError::ServerNotFound(alias.to_string()))?;
+        let (health, tool_count, tags) = {
+            let mut sessions = self.sessions.write().await;
+            let session = sessions
+                .get_mut(alias)
+                .ok_or_else(|| UpstreamError::ServerNotFound(alias.to_string()))?;
 
-        if let Some(desc) = updates.description {
-            session.config.description = Some(desc);
-        }
-        if !updates.tags.is_empty() {
-            session.config.tags = updates.tags;
-        }
-        
-        if updates.url.is_some() {
-            session.config.url = updates.url;
-        }
-        if updates.command.is_some() {
-            session.config.command = updates.command;
-        }
+            if let Some(desc) = updates.description {
+                session.config.description = Some(desc);
+            }
+            if !updates.tags.is_empty() {
+                session.config.tags = updates.tags;
+            }
+            if updates.url.is_some() {
+                session.config.url = updates.url;
+            }
+            if updates.command.is_some() {
+                session.config.command = updates.command;
+            }
 
-        let health = match session.state {
-            ConnectionState::Connected => ServerHealth::Connected,
-            ConnectionState::Degraded => ServerHealth::Degraded,
-            ConnectionState::Disconnected | ConnectionState::Failed => ServerHealth::Down,
-            ConnectionState::Connecting => ServerHealth::Connected,
+            let health = match session.state {
+                ConnectionState::Connected | ConnectionState::Connecting => ServerHealth::Connected,
+                ConnectionState::Degraded => ServerHealth::Degraded,
+                ConnectionState::Disconnected | ConnectionState::Failed => ServerHealth::Down,
+            };
+            let values = (health, session.tools.len(), session.config.tags.clone());
+            drop(sessions);
+            values
         };
 
         self.registry.update_server(ServerInfo {
             alias: alias.to_string(),
             health,
-            tool_count: session.tools.len(),
+            tool_count,
             last_refresh: chrono::Utc::now(),
-            tags: session.config.tags.clone(),
+            tags,
         });
 
         info!("Updated upstream server: {}", alias);
@@ -940,6 +971,8 @@ impl UpstreamManager {
     }
 
     /// Disconnect from a server
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn disconnect(&self, alias: &str) -> Result<()> {
         info!("Disconnecting from: {}", alias);
 
@@ -963,6 +996,8 @@ impl UpstreamManager {
     }
 
     /// Reconnect to a server (for failure recovery)
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn reconnect(&self, alias: &str) -> Result<()> {
         warn!("Reconnecting to: {}", alias);
 
@@ -971,7 +1006,7 @@ impl UpstreamManager {
 
         // Attempt reconnection
         match self.connect(alias).await {
-            Ok(_) => {
+            Ok(()) => {
                 info!("Reconnected successfully: {}", alias);
                 Ok(())
             }

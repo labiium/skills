@@ -42,21 +42,21 @@ pub struct PersistenceLayer {
 
 impl PersistenceLayer {
     /// Create a new persistence layer with the given database path
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn new(db_path: impl AsRef<Path>) -> Result<Self> {
         let db_path = db_path.as_ref();
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                PersistenceError::InvalidData(format!("Failed to create directory: {}", e))
+                PersistenceError::InvalidData(format!("Failed to create directory: {e}"))
             })?;
         }
 
         let options =
             SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=rwc", db_path.display()))
-                .map_err(|e| {
-                    PersistenceError::InvalidData(format!("Invalid database path: {}", e))
-                })?
+                .map_err(|e| PersistenceError::InvalidData(format!("Invalid database path: {e}")))?
                 .create_if_missing(true);
 
         let pool = SqlitePoolOptions::new()
@@ -64,7 +64,7 @@ impl PersistenceLayer {
             .connect_with(options)
             .await?;
 
-        let layer = PersistenceLayer { pool };
+        let layer = Self { pool };
         layer.initialize_schema().await?;
 
         info!("Persistence layer initialized at: {:?}", db_path);
@@ -74,7 +74,7 @@ impl PersistenceLayer {
     /// Initialize database schema
     async fn initialize_schema(&self) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS callables (
                 id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
@@ -99,29 +99,29 @@ impl PersistenceLayer {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE INDEX IF NOT EXISTS idx_callables_kind ON callables(kind)
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE INDEX IF NOT EXISTS idx_callables_name ON callables(name)
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS execution_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 execution_id TEXT NOT NULL,
@@ -134,35 +134,35 @@ impl PersistenceLayer {
                 completed_at INTEGER,
                 trace TEXT
             )
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE INDEX IF NOT EXISTS idx_execution_callable ON execution_history(callable_id)
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE INDEX IF NOT EXISTS idx_execution_time ON execution_history(started_at)
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS server_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             )
-            "#,
+            ",
         )
         .execute(&self.pool)
         .await?;
@@ -172,6 +172,8 @@ impl PersistenceLayer {
     }
 
     /// Save a callable record
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn save_callable(&self, record: &CallableRecord) -> Result<()> {
         let now = Utc::now().timestamp();
 
@@ -182,14 +184,19 @@ impl PersistenceLayer {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let uses_json =
-            serde_json::to_string(&record.uses.iter().map(|id| id.as_str()).collect::<Vec<_>>())?;
+        let uses_json = serde_json::to_string(
+            &record
+                .uses
+                .iter()
+                .map(super::CallableId::as_str)
+                .collect::<Vec<_>>(),
+        )?;
         let bundled_tools_json = serde_json::to_string(&record.bundled_tools)?;
         let additional_files_json = serde_json::to_string(&record.additional_files)?;
         let cost_hints_json = serde_json::to_string(&record.cost_hints)?;
 
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO callables (
                 id, kind, fq_name, name, title, description, tags,
                 input_schema, output_schema, schema_digest,
@@ -201,7 +208,7 @@ impl PersistenceLayer {
                 COALESCE((SELECT created_at FROM callables WHERE id = ?1), ?21),
                 ?21
             )
-            "#,
+            ",
         )
         .bind(record.id.as_str())
         .bind(format!("{:?}", record.kind))
@@ -232,56 +239,60 @@ impl PersistenceLayer {
     }
 
     /// Load a callable by ID
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_callable(&self, id: &CallableId) -> Result<CallableRecord> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT * FROM callables WHERE id = ?1
-            "#,
+            ",
         )
         .bind(id.as_str())
         .fetch_one(&self.pool)
         .await?;
 
-        self.row_to_callable(row)
+        Self::row_to_callable(&row)
     }
 
     /// Load all callables
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_all_callables(&self) -> Result<Vec<CallableRecord>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT * FROM callables ORDER BY name
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|row| self.row_to_callable(row))
-            .collect()
+        rows.iter().map(Self::row_to_callable).collect()
     }
 
     /// Load callables by kind
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_callables_by_kind(&self, kind: CallableKind) -> Result<Vec<CallableRecord>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT * FROM callables WHERE kind = ?1 ORDER BY name
-            "#,
+            ",
         )
-        .bind(format!("{:?}", kind))
+        .bind(format!("{kind:?}"))
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|row| self.row_to_callable(row))
-            .collect()
+        rows.iter().map(Self::row_to_callable).collect()
     }
 
     /// Delete a callable
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn delete_callable(&self, id: &CallableId) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             DELETE FROM callables WHERE id = ?1
-            "#,
+            ",
         )
         .bind(id.as_str())
         .execute(&self.pool)
@@ -291,8 +302,8 @@ impl PersistenceLayer {
         Ok(())
     }
 
-    /// Convert database row to CallableRecord
-    fn row_to_callable(&self, row: sqlx::sqlite::SqliteRow) -> Result<CallableRecord> {
+    /// Convert database row to `CallableRecord`
+    fn row_to_callable(row: &sqlx::sqlite::SqliteRow) -> Result<CallableRecord> {
         let id_str: String = row.get("id");
         let kind_str: String = row.get("kind");
         let tags_json: String = row.get("tags");
@@ -311,8 +322,7 @@ impl PersistenceLayer {
             "Skill" => CallableKind::Skill,
             _ => {
                 return Err(PersistenceError::InvalidData(format!(
-                    "Invalid kind: {}",
-                    kind_str
+                    "Invalid kind: {kind_str}"
                 )))
             }
         };
@@ -361,6 +371,8 @@ impl PersistenceLayer {
 
     /// Record execution history
     #[allow(clippy::too_many_arguments)]
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn record_execution(
         &self,
         execution_id: &str,
@@ -376,21 +388,25 @@ impl PersistenceLayer {
         let arguments_json = serde_json::to_string(arguments)?;
         let result_json = result.map(serde_json::to_string).transpose()?;
         let trace_json = trace.map(serde_json::to_string).transpose()?;
+        let duration_ms = duration_ms
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| PersistenceError::InvalidData("Duration exceeds i64::MAX".to_string()))?;
 
         sqlx::query(
-            r#"
+            r"
             INSERT INTO execution_history (
                 execution_id, callable_id, arguments, result, is_error,
                 duration_ms, started_at, completed_at, trace
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
+            ",
         )
         .bind(execution_id)
         .bind(callable_id.as_str())
         .bind(arguments_json)
         .bind(result_json)
-        .bind(is_error as i32)
-        .bind(duration_ms.map(|d| d as i64))
+        .bind(i32::from(is_error))
+        .bind(duration_ms)
         .bind(started_at.timestamp())
         .bind(completed_at.map(|t| t.timestamp()))
         .bind(trace_json)
@@ -402,18 +418,20 @@ impl PersistenceLayer {
     }
 
     /// Get execution history for a callable
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn get_execution_history(
         &self,
         callable_id: &CallableId,
         limit: i64,
     ) -> Result<Vec<ExecutionRecord>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT * FROM execution_history
             WHERE callable_id = ?1
             ORDER BY started_at DESC
             LIMIT ?2
-            "#,
+            ",
         )
         .bind(callable_id.as_str())
         .bind(limit)
@@ -435,7 +453,15 @@ impl PersistenceLayer {
                         .map(|s| serde_json::from_str(&s))
                         .transpose()?,
                     is_error: row.get::<i32, _>("is_error") != 0,
-                    duration_ms: row.get::<Option<i64>, _>("duration_ms").map(|d| d as u64),
+                    duration_ms: row
+                        .get::<Option<i64>, _>("duration_ms")
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            PersistenceError::InvalidData(
+                                "Stored duration cannot be negative".to_string(),
+                            )
+                        })?,
                     started_at: DateTime::from_timestamp(started_at_ts, 0).ok_or_else(|| {
                         PersistenceError::InvalidData("Invalid timestamp".to_string())
                     })?,
@@ -450,15 +476,17 @@ impl PersistenceLayer {
     }
 
     /// Save server state
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn save_state(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let value_json = serde_json::to_string(value)?;
         let now = Utc::now().timestamp();
 
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO server_state (key, value, updated_at)
             VALUES (?1, ?2, ?3)
-            "#,
+            ",
         )
         .bind(key)
         .bind(value_json)
@@ -471,11 +499,13 @@ impl PersistenceLayer {
     }
 
     /// Load server state
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn load_state(&self, key: &str) -> Result<serde_json::Value> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT value FROM server_state WHERE key = ?1
-            "#,
+            ",
         )
         .bind(key)
         .fetch_one(&self.pool)
@@ -486,13 +516,23 @@ impl PersistenceLayer {
     }
 
     /// Prune old execution history
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn prune_execution_history(&self, older_than_days: i64) -> Result<u64> {
-        let cutoff = Utc::now().timestamp() - (older_than_days * 86400);
+        let retention_seconds = older_than_days.checked_mul(86_400).ok_or_else(|| {
+            PersistenceError::InvalidData("Retention period overflow".to_string())
+        })?;
+        let cutoff = Utc::now()
+            .timestamp()
+            .checked_sub(retention_seconds)
+            .ok_or_else(|| {
+                PersistenceError::InvalidData("Retention cutoff overflow".to_string())
+            })?;
 
         let result = sqlx::query(
-            r#"
+            r"
             DELETE FROM execution_history WHERE started_at < ?1
-            "#,
+            ",
         )
         .bind(cutoff)
         .execute(&self.pool)
@@ -504,6 +544,8 @@ impl PersistenceLayer {
     }
 
     /// Get database statistics
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn get_stats(&self) -> Result<PersistenceStats> {
         let callables_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM callables")
             .fetch_one(&self.pool)
@@ -524,10 +566,15 @@ impl PersistenceLayer {
             .await?;
 
         Ok(PersistenceStats {
-            total_callables: callables_count as usize,
-            total_tools: tools_count as usize,
-            total_skills: skills_count as usize,
-            total_executions: executions_count as usize,
+            total_callables: usize::try_from(callables_count)
+                .map_err(|_| PersistenceError::InvalidData("Invalid callable count".to_string()))?,
+            total_tools: usize::try_from(tools_count)
+                .map_err(|_| PersistenceError::InvalidData("Invalid tool count".to_string()))?,
+            total_skills: usize::try_from(skills_count)
+                .map_err(|_| PersistenceError::InvalidData("Invalid skill count".to_string()))?,
+            total_executions: usize::try_from(executions_count).map_err(|_| {
+                PersistenceError::InvalidData("Invalid execution count".to_string())
+            })?,
         })
     }
 
@@ -537,6 +584,8 @@ impl PersistenceLayer {
         info!("Persistence layer closed");
     }
     /// Search callables using FTS5
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn search_callables(
         &self,
         query: &str,
@@ -548,13 +597,13 @@ impl PersistenceLayer {
 
         let rows = if let Some(kind) = kind_filter {
             sqlx::query(
-                r#"
+                r"
                 SELECT c.id FROM callables c
                 JOIN callables_fts fts ON c.rowid = fts.rowid
                 WHERE callables_fts MATCH ?1 AND c.kind = ?2
                 ORDER BY rank
                 LIMIT ?3
-                "#,
+                ",
             )
             .bind(&fts_query)
             .bind(kind)
@@ -563,13 +612,13 @@ impl PersistenceLayer {
             .await?
         } else {
             sqlx::query(
-                r#"
+                r"
                 SELECT c.id FROM callables c
                 JOIN callables_fts fts ON c.rowid = fts.rowid
                 WHERE callables_fts MATCH ?1
                 ORDER BY rank
                 LIMIT ?2
-                "#,
+                ",
             )
             .bind(&fts_query)
             .bind(limit)

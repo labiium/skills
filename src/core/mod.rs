@@ -59,11 +59,9 @@ pub enum RiskTier {
 }
 
 impl RiskTier {
-    pub fn requires_consent(&self) -> bool {
-        matches!(
-            self,
-            RiskTier::Writes | RiskTier::Destructive | RiskTier::Admin
-        )
+    #[must_use]
+    pub const fn requires_consent(&self) -> bool {
+        matches!(self, Self::Writes | Self::Destructive | Self::Admin)
     }
 }
 
@@ -72,11 +70,11 @@ impl FromStr for RiskTier {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "read_only" | "readonly" => Ok(RiskTier::ReadOnly),
-            "writes" | "write" => Ok(RiskTier::Writes),
-            "destructive" => Ok(RiskTier::Destructive),
-            "admin" => Ok(RiskTier::Admin),
-            "unknown" => Ok(RiskTier::Unknown),
+            "read_only" | "readonly" => Ok(Self::ReadOnly),
+            "writes" | "write" => Ok(Self::Writes),
+            "destructive" => Ok(Self::Destructive),
+            "admin" => Ok(Self::Admin),
+            "unknown" => Ok(Self::Unknown),
             _ => Err(CoreError::InvalidRiskTier(s.to_string())),
         }
     }
@@ -85,11 +83,11 @@ impl FromStr for RiskTier {
 impl fmt::Display for RiskTier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RiskTier::ReadOnly => write!(f, "read_only"),
-            RiskTier::Writes => write!(f, "writes"),
-            RiskTier::Destructive => write!(f, "destructive"),
-            RiskTier::Admin => write!(f, "admin"),
-            RiskTier::Unknown => write!(f, "unknown"),
+            Self::ReadOnly => write!(f, "read_only"),
+            Self::Writes => write!(f, "writes"),
+            Self::Destructive => write!(f, "destructive"),
+            Self::Admin => write!(f, "admin"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -123,8 +121,8 @@ pub enum CallableKind {
 impl fmt::Display for CallableKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CallableKind::Tool => write!(f, "tool"),
-            CallableKind::Skill => write!(f, "skill"),
+            Self::Tool => write!(f, "tool"),
+            Self::Skill => write!(f, "skill"),
         }
     }
 }
@@ -140,20 +138,23 @@ pub struct CallableId(String);
 
 impl CallableId {
     /// Create a tool ID
+    #[must_use]
     pub fn tool(server_alias: &str, tool_name: &str, schema_digest: &str) -> Self {
-        let digest8 = &schema_digest[..8.min(schema_digest.len())];
-        CallableId(format!(
-            "tool:srv:{}::{}::sd:{}",
-            server_alias, tool_name, digest8
+        let digest8 = schema_digest.get(..8).unwrap_or(schema_digest);
+        Self(format!(
+            "tool:srv:{server_alias}::{tool_name}::sd:{digest8}"
         ))
     }
 
     /// Create a skill ID
+    #[must_use]
     pub fn skill(skill_id: &str, version: &str) -> Self {
-        CallableId(format!("skill:{}@{}", skill_id, version))
+        Self(format!("skill:{skill_id}@{version}"))
     }
 
     /// Parse a callable ID and return its kind
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn kind(&self) -> Result<CallableKind> {
         if self.0.starts_with("tool:") {
             Ok(CallableKind::Tool)
@@ -165,6 +166,7 @@ impl CallableId {
     }
 
     /// Extract server alias (tools only)
+    #[must_use]
     pub fn server_alias(&self) -> Option<String> {
         if let Some(rest) = self.0.strip_prefix("tool:srv:") {
             if let Some(alias) = rest.split("::").next() {
@@ -175,17 +177,16 @@ impl CallableId {
     }
 
     /// Extract tool name (tools only)
+    #[must_use]
     pub fn tool_name(&self) -> Option<String> {
         if let Some(rest) = self.0.strip_prefix("tool:srv:") {
-            let parts: Vec<&str> = rest.split("::").collect();
-            if parts.len() >= 2 {
-                return Some(parts[1].to_string());
-            }
+            return rest.split("::").nth(1).map(ToString::to_string);
         }
         None
     }
 
     /// Extract skill name (skills only)
+    #[must_use]
     pub fn skill_name(&self) -> Option<String> {
         if let Some(rest) = self.0.strip_prefix("skill:") {
             if let Some(name) = rest.split('@').next() {
@@ -195,6 +196,7 @@ impl CallableId {
         None
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -208,13 +210,13 @@ impl fmt::Display for CallableId {
 
 impl From<String> for CallableId {
     fn from(s: String) -> Self {
-        CallableId(s)
+        Self(s)
     }
 }
 
 impl From<&str> for CallableId {
     fn from(s: &str) -> Self {
-        CallableId(s.to_string())
+        Self(s.to_string())
     }
 }
 
@@ -224,19 +226,23 @@ pub struct SchemaDigest(String);
 
 impl SchemaDigest {
     /// Compute digest from JSON schema
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn from_schema(schema: &serde_json::Value) -> Result<Self> {
         let canonical = canonicalize_json(schema)?;
         let hash = blake3::hash(canonical.as_bytes());
-        Ok(SchemaDigest(hash.to_hex().to_string()))
+        Ok(Self(hash.to_hex().to_string()))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Get first 8 characters for short representation
+    #[must_use]
     pub fn short(&self) -> &str {
-        &self.0[..8.min(self.0.len())]
+        self.0.get(..8).unwrap_or(&self.0)
     }
 }
 
@@ -248,23 +254,25 @@ impl fmt::Display for SchemaDigest {
 
 impl From<Hash> for SchemaDigest {
     fn from(hash: Hash) -> Self {
-        SchemaDigest(hash.to_hex().to_string())
+        Self(hash.to_hex().to_string())
     }
 }
 
 impl From<String> for SchemaDigest {
     fn from(s: String) -> Self {
-        SchemaDigest(s)
+        Self(s)
     }
 }
 
 impl From<&str> for SchemaDigest {
     fn from(s: &str) -> Self {
-        SchemaDigest(s.to_string())
+        Self(s.to_string())
     }
 }
 
 /// Canonicalize JSON for stable hashing (sorted keys)
+/// # Errors
+/// Returns an error if the operation cannot be completed.
 pub fn canonicalize_json(value: &serde_json::Value) -> Result<String> {
     fn sort_value(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -273,7 +281,9 @@ pub fn canonicalize_json(value: &serde_json::Value) -> Result<String> {
                 let mut keys: Vec<_> = map.keys().collect();
                 keys.sort();
                 for key in keys {
-                    sorted.insert(key.clone(), sort_value(&map[key]));
+                    if let Some(value) = map.get(key) {
+                        sorted.insert(key.clone(), sort_value(value));
+                    }
                 }
                 serde_json::Value::Object(sorted)
             }
@@ -324,10 +334,12 @@ pub struct CallableRecord {
 }
 
 impl CallableRecord {
+    #[must_use]
     pub fn is_tool(&self) -> bool {
         self.kind == CallableKind::Tool
     }
 
+    #[must_use]
     pub fn is_skill(&self) -> bool {
         self.kind == CallableKind::Skill
     }
@@ -368,22 +380,25 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    #[must_use]
     pub fn success(text: String) -> Self {
-        ToolResult {
+        Self {
             content: vec![ToolResultContent::Text { text }],
             structured_content: None,
             is_error: false,
         }
     }
 
+    #[must_use]
     pub fn error(message: String) -> Self {
-        ToolResult {
+        Self {
             content: vec![ToolResultContent::Text { text: message }],
             structured_content: None,
             is_error: true,
         }
     }
 
+    #[must_use]
     pub fn with_structured(mut self, data: serde_json::Value) -> Self {
         self.structured_content = Some(data);
         self
@@ -410,8 +425,9 @@ pub struct CallableSignature {
 
 impl CallableSignature {
     /// Generate signature from JSON Schema
+    #[must_use]
     pub fn from_schema(schema: &serde_json::Value) -> Self {
-        let mut signature = CallableSignature {
+        let mut signature = Self {
             required: Vec::new(),
             optional: Vec::new(),
             constraints: HashMap::new(),
@@ -459,7 +475,7 @@ impl CallableSignature {
 
             // Extract examples
             if let Some(examples) = obj.get("examples").and_then(|e| e.as_array()) {
-                signature.examples = examples.clone();
+                signature.examples.clone_from(examples);
             }
         }
 

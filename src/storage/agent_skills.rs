@@ -8,7 +8,7 @@
 //! - Optional scripts/, references/, assets/ directories
 //! - Lowercase, hyphenated naming convention
 //!
-//! Spec: https://agentskills.io/specification
+//! Spec: <https://agentskills.io/specification>
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,18 +39,22 @@ pub type Result<T> = std::result::Result<T, AgentSkillsError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AllowedTools {
-    /// Space-delimited string format: "Bash Read Write"
+    /// Space-delimited string format: `Bash Read Write`
     String(String),
-    /// Array format: ["Bash", "Read", "Write"]
+    /// Array format: `["Bash", "Read", "Write"]`
     Array(Vec<String>),
 }
 
 impl AllowedTools {
     /// Convert to Vec<String> regardless of format
+    #[must_use]
     pub fn to_vec(&self) -> Vec<String> {
         match self {
-            AllowedTools::String(s) => s.split_whitespace().map(|t| t.to_string()).collect(),
-            AllowedTools::Array(arr) => arr.clone(),
+            Self::String(s) => s
+                .split_whitespace()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            Self::Array(arr) => arr.clone(),
         }
     }
 }
@@ -83,7 +87,8 @@ pub struct AgentSkillsFrontmatter {
     pub metadata: HashMap<String, String>,
 
     /// Pre-approved tools (experimental)
-    /// Accepts both string format ("Bash Read Write") and array format (["Bash", "Read", "Write"])
+    /// Accepts both string format (`Bash Read Write`) and array format
+    /// (`["Bash", "Read", "Write"]`).
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Option<AllowedTools>,
 }
@@ -106,6 +111,8 @@ pub struct AgentSkill {
 
 impl AgentSkill {
     /// Parse an Agent Skill from a directory
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn from_directory(path: &Path) -> Result<Self> {
         let skill_md_path = path.join("SKILL.md");
 
@@ -139,7 +146,7 @@ impl AgentSkill {
         let references = Self::discover_files(&path.join("references")).await;
         let assets = Self::discover_files(&path.join("assets")).await;
 
-        Ok(AgentSkill {
+        Ok(Self {
             frontmatter,
             content: body,
             path: path.to_path_buf(),
@@ -155,23 +162,17 @@ impl AgentSkill {
         let normalized = content.replace("\r\n", "\n");
 
         // Check for frontmatter delimiters
-        if !normalized.starts_with("---\n") {
-            return Err(AgentSkillsError::InvalidFormat(
+        let after_first = normalized.strip_prefix("---\n").ok_or_else(|| {
+            AgentSkillsError::InvalidFormat(
                 "SKILL.md must start with YAML frontmatter (---)".to_string(),
-            ));
-        }
-
-        // Find the closing delimiter
-        let after_first = &normalized[4..]; // Skip "---\n"
-        let end_pos = after_first.find("\n---\n").ok_or_else(|| {
+            )
+        })?;
+        let (yaml_content, body) = after_first.split_once("\n---\n").ok_or_else(|| {
             AgentSkillsError::InvalidFormat(
                 "SKILL.md frontmatter not properly closed with ---".to_string(),
             )
         })?;
-
-        let yaml_content = &after_first[..end_pos];
-        let body_start = 4 + end_pos + 5; // Skip "---\n" + frontmatter + "\n---\n"
-        let body = normalized[body_start..].trim().to_string();
+        let body = body.trim().to_string();
 
         let frontmatter: AgentSkillsFrontmatter = serde_yaml::from_str(yaml_content)?;
 
@@ -259,40 +260,47 @@ impl AgentSkill {
     }
 
     /// Parse allowed-tools into a Vec (supports both string and array formats)
+    #[must_use]
     pub fn parse_allowed_tools(&self) -> Vec<String> {
         self.frontmatter
             .allowed_tools
             .as_ref()
-            .map(|tools| tools.to_vec())
+            .map(AllowedTools::to_vec)
             .unwrap_or_default()
     }
 
     /// Extract version from frontmatter
+    #[must_use]
     pub fn version(&self) -> String {
         self.frontmatter.version.clone()
     }
 
     /// Extract author from metadata
+    #[must_use]
     pub fn author(&self) -> Option<String> {
         self.frontmatter.metadata.get("author").cloned()
     }
 
     /// Check if skill has scripts
+    #[must_use]
     pub fn has_scripts(&self) -> bool {
         !self.scripts.is_empty()
     }
 
     /// Check if skill has references
+    #[must_use]
     pub fn has_references(&self) -> bool {
         !self.references.is_empty()
     }
 
     /// Check if skill has assets
+    #[must_use]
     pub fn has_assets(&self) -> bool {
         !self.assets.is_empty()
     }
 
-    /// Convert Agent Skill to skills.rs SkillManifest format
+    /// Convert Agent Skill to skills.rs `SkillManifest` format
+    #[must_use]
     pub fn to_skill_manifest(&self) -> crate::SkillManifest {
         use crate::{EntrypointType, SkillHints, SkillManifest, ToolPolicy};
 
@@ -331,7 +339,7 @@ impl AgentSkill {
             .collect();
 
         let hints = SkillHints {
-            intent: description_words.clone(),
+            intent: description_words,
             domain: vec![],
             outcomes: vec![],
             expected_calls: None,
@@ -342,7 +350,7 @@ impl AgentSkill {
             "type": "object",
             "properties": {},
             "additionalProperties": true,
-            "description": description.clone()
+            "description": description
         });
 
         SkillManifest {
@@ -353,10 +361,9 @@ impl AgentSkill {
                 .split('-')
                 .map(|w| {
                     let mut chars = w.chars();
-                    match chars.next() {
-                        None => String::new(),
-                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                    }
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_uppercase().collect::<String>() + chars.as_str()
+                    })
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -371,7 +378,11 @@ impl AgentSkill {
         }
     }
 
-    /// Convert Agent Skill to SkillContent for progressive disclosure
+    /// Convert Agent Skill to `SkillContent` for progressive disclosure
+    #[expect(
+        clippy::unused_async,
+        reason = "kept async for compatibility with skill-loading call sites"
+    )]
     pub async fn to_skill_content(&self) -> crate::SkillContent {
         use crate::core::BundledTool;
         use crate::SkillContent;
@@ -385,7 +396,7 @@ impl AgentSkill {
                 let interpreter = Self::infer_interpreter(filename);
                 let tool = BundledTool {
                     name: filename.to_string(),
-                    description: format!("Bundled script: {}", filename),
+                    description: format!("Bundled script: {filename}"),
                     command: vec![interpreter, filename.to_string()],
                     schema: serde_json::json!({
                         "type": "object",
@@ -400,14 +411,14 @@ impl AgentSkill {
         // Add references as additional files
         for ref_path in &self.references {
             if let Some(filename) = ref_path.file_name().and_then(|n| n.to_str()) {
-                additional_files.push(format!("references/{}", filename));
+                additional_files.push(format!("references/{filename}"));
             }
         }
 
         // Add assets as additional files
         for asset_path in &self.assets {
             if let Some(filename) = asset_path.file_name().and_then(|n| n.to_str()) {
-                additional_files.push(format!("assets/{}", filename));
+                additional_files.push(format!("assets/{filename}"));
             }
         }
 
@@ -421,11 +432,12 @@ impl AgentSkill {
 
     /// Infer interpreter from file extension
     fn infer_interpreter(filename: &str) -> String {
-        if filename.ends_with(".py") {
+        let extension = Path::new(filename).extension().and_then(|ext| ext.to_str());
+        if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("py")) {
             "python3".to_string()
-        } else if filename.ends_with(".sh") {
+        } else if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("sh")) {
             "bash".to_string()
-        } else if filename.ends_with(".js") {
+        } else if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("js")) {
             "node".to_string()
         } else {
             "bash".to_string() // default
@@ -434,6 +446,8 @@ impl AgentSkill {
 }
 
 /// Public wrapper to parse frontmatter for backward compatibility with old-format skills
+/// # Errors
+/// Returns an error if the operation cannot be completed.
 pub fn parse_frontmatter_public(content: &str) -> Result<(AgentSkillsFrontmatter, String)> {
     AgentSkill::parse_frontmatter(content)
 }

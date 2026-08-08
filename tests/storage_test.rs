@@ -8,6 +8,10 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_validate_skill() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
@@ -36,6 +40,10 @@ async fn test_validate_skill() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_validate_invalid_version() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
@@ -46,14 +54,14 @@ async fn test_validate_invalid_version() {
 
     // Create SKILL.md with version in frontmatter
     // Agent Skills format is lenient with version strings
-    let skill_md = r#"---
+    let skill_md = r"---
 name: invalid-skill
 description: Test
 version: not-a-version
 ---
 
 # Test
-"#;
+";
 
     std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
 
@@ -65,17 +73,21 @@ version: not-a-version
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_validate_circular_dependency() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
     let store = SkillStore::new(temp.path(), registry.clone()).unwrap();
 
     // Create a skill that depends on another skill
-    let skill_a_dir = temp.path().join("skill-a");
-    std::fs::create_dir(&skill_a_dir).unwrap();
+    let first_skill_directory = temp.path().join("skill-a");
+    std::fs::create_dir(&first_skill_directory).unwrap();
 
     // Skill A uses tools including a reference to skill-b
-    let skill_a_md = r#"---
+    let first_manifest = r#"---
 name: skill-a
 description: Test skill A
 version: 1.0.0
@@ -87,13 +99,13 @@ allowed-tools: ["skill-b"]
 This skill uses skill-b.
 "#;
 
-    std::fs::write(skill_a_dir.join("SKILL.md"), skill_a_md).unwrap();
+    std::fs::write(first_skill_directory.join("SKILL.md"), first_manifest).unwrap();
 
     // Create skill B
-    let skill_b_dir = temp.path().join("skill-b");
-    std::fs::create_dir(&skill_b_dir).unwrap();
+    let second_skill_directory = temp.path().join("skill-b");
+    std::fs::create_dir(&second_skill_directory).unwrap();
 
-    let skill_b_md = r#"---
+    let second_manifest = r"---
 name: skill-b
 description: Test skill B
 version: 1.0.0
@@ -102,20 +114,24 @@ version: 1.0.0
 # Skill B
 
 This is skill B.
-"#;
+";
 
-    std::fs::write(skill_b_dir.join("SKILL.md"), skill_b_md).unwrap();
+    std::fs::write(second_skill_directory.join("SKILL.md"), second_manifest).unwrap();
 
     // Load both skills
-    let skill_a = store.load_skill(&skill_a_dir).await.unwrap();
-    let skill_b = store.load_skill(&skill_b_dir).await.unwrap();
+    let first_skill = store.load_skill(&first_skill_directory).await.unwrap();
+    let second_skill = store.load_skill(&second_skill_directory).await.unwrap();
 
     // Register both skills
-    store.register_skill(&skill_a).unwrap();
-    store.register_skill(&skill_b).unwrap();
+    store.register_skill(&first_skill).unwrap();
+    store.register_skill(&second_skill).unwrap();
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_create_skill() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
@@ -147,6 +163,10 @@ async fn test_create_skill() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_load_skill_content() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
@@ -177,6 +197,10 @@ async fn test_load_skill_content() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_load_empty_store() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
@@ -187,13 +211,18 @@ async fn test_load_empty_store() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_register_skill() {
     let temp = TempDir::new().unwrap();
     let skill_dir = temp.path().join("test-skill");
     std::fs::create_dir(&skill_dir).unwrap();
 
     // Create SKILL.md with YAML frontmatter (Agent Skills format)
-    let skill_md = r#"---
+    let skill_md = r"---
 name: test-skill
 description: A test skill
 version: 1.0.0
@@ -202,7 +231,7 @@ version: 1.0.0
 # Test Skill
 
 A test skill for registration.
-"#;
+";
 
     std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
 
@@ -219,6 +248,11 @@ A test skill for registration.
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_search_engine() {
     let registry = Arc::new(Registry::new());
     let search_engine = SearchEngine::new(registry.clone());
@@ -270,6 +304,11 @@ async fn test_search_engine() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_search_matches_skill_names_across_separators() {
     let registry = Arc::new(Registry::new());
     let search_engine = SearchEngine::new(registry.clone());
@@ -337,6 +376,11 @@ async fn test_search_matches_skill_names_across_separators() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_search_ranks_name_matches_before_description_only_matches() {
     let registry = Arc::new(Registry::new());
     let search_engine = SearchEngine::new(registry.clone());
@@ -412,12 +456,17 @@ async fn test_search_ranks_name_matches_before_description_only_matches() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_search_matches_skill_body_terms() {
     let temp = TempDir::new().unwrap();
     let skill_dir = temp.path().join("body-search-skill");
     std::fs::create_dir(&skill_dir).unwrap();
 
-    let skill_md = r#"---
+    let skill_md = r"---
 name: body-search-skill
 description: Short workflow metadata
 version: 1.0.0
@@ -426,7 +475,7 @@ version: 1.0.0
 # Body Search Skill
 
 Use AutoInstrument source selection with from_preset and VISA connectivity.
-"#;
+";
 
     std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
 
@@ -452,12 +501,17 @@ Use AutoInstrument source selection with from_preset and VISA connectivity.
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_search_ranks_metadata_matches_before_body_only_matches() {
     let temp = TempDir::new().unwrap();
     let body_skill_dir = temp.path().join("body-only-skill");
     std::fs::create_dir(&body_skill_dir).unwrap();
 
-    let body_skill_md = r#"---
+    let body_skill_md = r"---
 name: body-only-skill
 description: Short workflow metadata
 version: 1.0.0
@@ -466,7 +520,7 @@ version: 1.0.0
 # Body Only Skill
 
 This workflow mentions precision calibration in the instructions only.
-"#;
+";
 
     std::fs::write(body_skill_dir.join("SKILL.md"), body_skill_md).unwrap();
 
@@ -520,6 +574,11 @@ This workflow mentions precision calibration in the instructions only.
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_search_with_filters() {
     let registry = Arc::new(Registry::new());
     let search_engine = SearchEngine::new(registry.clone());
@@ -613,6 +672,11 @@ async fn test_search_with_filters() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_skills_loaded_from_files_are_searchable() {
     // Test for the bug fix: skills loaded from files should be searchable
     // This verifies that the search index is rebuilt after skills are loaded
@@ -621,7 +685,7 @@ async fn test_skills_loaded_from_files_are_searchable() {
     std::fs::create_dir(&skill_dir).unwrap();
 
     // Create a SKILL.md file
-    let skill_md = r#"---
+    let skill_md = r"---
 name: searchable-skill
 description: A skill that should be searchable after loading
 version: 1.0.0
@@ -630,7 +694,7 @@ version: 1.0.0
 # Searchable Skill
 
 This skill tests that loaded skills are searchable.
-"#;
+";
 
     std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
 
@@ -677,6 +741,10 @@ This skill tests that loaded skills are searchable.
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_find_skill_directory_uses_frontmatter_name() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());
@@ -685,14 +753,14 @@ async fn test_find_skill_directory_uses_frontmatter_name() {
     // Directory name intentionally does not match skill name.
     let skill_dir = temp.path().join("different-folder-name");
     std::fs::create_dir(&skill_dir).unwrap();
-    let skill_md = r#"---
+    let skill_md = r"---
 name: frontmatter-name
 description: Skill loaded by frontmatter name
 version: 1.0.0
 ---
 
 # Skill
-"#;
+";
     std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
 
     let content = store.load_skill_content("frontmatter-name").unwrap();
@@ -700,6 +768,10 @@ version: 1.0.0
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_create_skill_writes_yaml_escaped_frontmatter() {
     let temp = TempDir::new().unwrap();
     let registry = Arc::new(Registry::new());

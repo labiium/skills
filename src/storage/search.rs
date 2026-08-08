@@ -95,8 +95,9 @@ pub struct SearchEngine {
 }
 
 impl SearchEngine {
+    #[must_use]
     pub fn new(registry: Arc<Registry>) -> Self {
-        SearchEngine {
+        Self {
             registry,
             index: Arc::new(RwLock::new(InMemoryIndex::new())),
         }
@@ -106,14 +107,15 @@ impl SearchEngine {
     pub fn rebuild(&self) {
         debug!("Rebuilding search index");
         let callables = self.registry.all();
-        let mut index = self.index.write();
-        index.clear();
-
-        for record in callables {
-            index.add_record(&record);
-        }
-
-        debug!("Index rebuilt with {} entries", index.len());
+        let entry_count = {
+            let mut index = self.index.write();
+            index.clear();
+            for record in callables {
+                index.add_record(&record);
+            }
+            index.len()
+        };
+        debug!("Index rebuilt with {entry_count} entries");
     }
 
     /// Incremental index update
@@ -129,6 +131,12 @@ impl SearchEngine {
     }
 
     /// Search the index
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
+    #[expect(
+        clippy::unused_async,
+        reason = "search remains async as part of the public server interface"
+    )]
     pub async fn search(&self, query: &SearchQuery) -> Result<SearchResults> {
         if query.q.is_empty() {
             return Err(IndexError::InvalidQuery(
@@ -233,8 +241,9 @@ impl SearchEngine {
             })
             .collect();
 
-        let next_cursor = if offset + query.limit < total_matches {
-            Some((offset + query.limit).to_string())
+        let next_offset = offset.saturating_add(query.limit);
+        let next_cursor = if next_offset < total_matches {
+            Some(next_offset.to_string())
         } else {
             None
         };
@@ -259,7 +268,7 @@ struct InMemoryIndex {
 
 impl InMemoryIndex {
     fn new() -> Self {
-        InMemoryIndex {
+        Self {
             tokens: HashMap::new(),
             reverse: HashMap::new(),
             body_texts: HashMap::new(),
@@ -367,10 +376,11 @@ fn strip_frontmatter(content: &str) -> String {
         .unwrap_or(content)
         .replace("\r\n", "\n");
 
-    if let Some(after_first) = normalized.strip_prefix("---\n") {
-        if let Some(end_pos) = after_first.find("\n---\n") {
-            return after_first[end_pos + "\n---\n".len()..].trim().to_string();
-        }
+    if let Some((_, body)) = normalized
+        .strip_prefix("---\n")
+        .and_then(|content| content.split_once("\n---\n"))
+    {
+        return body.trim().to_string();
     }
 
     normalized.trim().to_string()
@@ -403,6 +413,10 @@ fn compact(text: &str) -> String {
         .collect()
 }
 
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "floating-point relevance scoring intentionally accumulates weighted values"
+)]
 fn score_field(query: &str, query_tokens: &[String], text: &str, weight: f64) -> f64 {
     let text_lower = text.to_lowercase();
     let text_tokens = tokenize(text);
@@ -483,12 +497,7 @@ fn apply_filters(candidates: Vec<CallableRecord>, filters: &SearchFilters) -> Ve
 
     // Server filter (tools only)
     if let Some(server) = &filters.server {
-        filtered.retain(|c| {
-            c.server_alias
-                .as_ref()
-                .map(|s| s == server)
-                .unwrap_or(false)
-        });
+        filtered.retain(|c| c.server_alias.as_ref().is_some_and(|s| s == server));
     }
 
     // Tags filter (any match)
@@ -520,9 +529,8 @@ fn apply_filters(candidates: Vec<CallableRecord>, filters: &SearchFilters) -> Ve
 
 /// Extract top-level input keys from JSON schema
 fn extract_input_keys(schema: &serde_json::Value) -> Vec<String> {
-    if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-        properties.keys().cloned().collect()
-    } else {
-        vec![]
-    }
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map_or_else(Vec::new, |properties| properties.keys().cloned().collect())
 }

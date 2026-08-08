@@ -4,6 +4,10 @@ use skillsrs::paths::{PathsConfig, SkillsPaths};
 use tempfile::TempDir;
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_system_paths() {
     let paths = SkillsPaths::new().expect("Should create system paths");
 
@@ -17,6 +21,10 @@ fn test_system_paths() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_custom_root() {
     let temp_dir = TempDir::new().unwrap();
     let paths = SkillsPaths::with_root(temp_dir.path());
@@ -30,6 +38,11 @@ fn test_custom_root() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_ensure_directories() {
     let temp_dir = TempDir::new().unwrap();
     let paths = SkillsPaths::with_root(temp_dir.path());
@@ -46,6 +59,10 @@ fn test_ensure_directories() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_path_overrides() {
     let temp_dir = TempDir::new().unwrap();
     let custom_root = temp_dir.path().join("custom_skills");
@@ -61,6 +78,10 @@ fn test_path_overrides() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_display() {
     let temp_dir = TempDir::new().unwrap();
     let paths = SkillsPaths::with_root(temp_dir.path());

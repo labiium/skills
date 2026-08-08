@@ -84,7 +84,7 @@ pub struct ExecutionTrace {
 
 impl ExecutionTrace {
     fn new() -> Self {
-        ExecutionTrace {
+        Self {
             execution_id: Uuid::new_v4().to_string(),
             started_at: chrono::Utc::now(),
             completed_at: None,
@@ -96,10 +96,21 @@ impl ExecutionTrace {
     fn complete(&mut self) {
         self.completed_at = Some(chrono::Utc::now());
         if let Some(completed) = self.completed_at {
-            self.total_duration_ms =
-                Some((completed - self.started_at).num_milliseconds().max(0) as u64);
+            self.total_duration_ms = Some(duration_ms(self.started_at, completed));
         }
     }
+}
+
+fn duration_ms(
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    u64::try_from(
+        completed_at
+            .signed_duration_since(started_at)
+            .num_milliseconds(),
+    )
+    .unwrap_or(0)
 }
 
 /// Runtime executor
@@ -110,8 +121,9 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    #[must_use]
     pub fn new(registry: Arc<Registry>, upstream_manager: Arc<UpstreamManager>) -> Self {
-        Runtime {
+        Self {
             registry,
             upstream_manager,
             sandbox_config: sandbox::SandboxConfig::default(),
@@ -119,12 +131,13 @@ impl Runtime {
     }
 
     /// Create runtime with custom sandbox configuration
-    pub fn with_sandbox_config(
+    #[must_use]
+    pub const fn with_sandbox_config(
         registry: Arc<Registry>,
         upstream_manager: Arc<UpstreamManager>,
         sandbox_config: sandbox::SandboxConfig,
     ) -> Self {
-        Runtime {
+        Self {
             registry,
             upstream_manager,
             sandbox_config,
@@ -132,6 +145,8 @@ impl Runtime {
     }
 
     /// Execute a callable
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn execute(&self, ctx: ExecContext) -> Result<ToolResult> {
         let mut trace = if ctx.trace_enabled {
             Some(ExecutionTrace::new())
@@ -147,24 +162,28 @@ impl Runtime {
         self.validate_callable_arguments(&ctx.callable_id, &ctx.arguments)?;
 
         // Apply timeout
-        let timeout_duration = ctx.timeout_ms.map(Duration::from_millis);
-
         // Execute based on callable kind
         let result = match record.kind {
             CallableKind::Tool => {
-                if let Some(timeout) = timeout_duration {
-                    tokio::time::timeout(timeout, self.execute_tool(&ctx, &record))
-                        .await
-                        .map_err(|_| RuntimeError::Timeout(ctx.timeout_ms.unwrap()))?
+                if let Some(timeout_ms) = ctx.timeout_ms {
+                    tokio::time::timeout(
+                        Duration::from_millis(timeout_ms),
+                        self.execute_tool(&ctx, &record),
+                    )
+                    .await
+                    .map_err(|_| RuntimeError::Timeout(timeout_ms))?
                 } else {
                     self.execute_tool(&ctx, &record).await
                 }
             }
             CallableKind::Skill => {
-                if let Some(timeout) = timeout_duration {
-                    tokio::time::timeout(timeout, self.execute_skill(&ctx, &record, trace.as_mut()))
-                        .await
-                        .map_err(|_| RuntimeError::Timeout(ctx.timeout_ms.unwrap()))?
+                if let Some(timeout_ms) = ctx.timeout_ms {
+                    tokio::time::timeout(
+                        Duration::from_millis(timeout_ms),
+                        self.execute_skill(&ctx, &record, trace.as_mut()),
+                    )
+                    .await
+                    .map_err(|_| RuntimeError::Timeout(timeout_ms))?
                 } else {
                     self.execute_skill(&ctx, &record, trace.as_mut()).await
                 }
@@ -181,7 +200,9 @@ impl Runtime {
             let mut result_with_trace = result;
             if let Some(ref mut structured) = result_with_trace.structured_content {
                 if let Some(obj) = structured.as_object_mut() {
-                    obj.insert("trace".to_string(), serde_json::to_value(trace).unwrap());
+                    let trace = serde_json::to_value(trace)
+                        .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+                    obj.insert("trace".to_string(), trace);
                 }
             } else {
                 result_with_trace.structured_content = Some(serde_json::json!({ "trace": trace }));
@@ -193,13 +214,15 @@ impl Runtime {
     }
 
     /// Validate arguments for a registered callable without executing it.
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn validate_callable_arguments(
         &self,
         callable_id: &CallableId,
         arguments: &serde_json::Value,
     ) -> Result<()> {
         let record = self.get_callable_record(callable_id)?;
-        self.validate_arguments(&record.input_schema, arguments)
+        Self::validate_arguments(&record.input_schema, arguments)
     }
 
     fn get_callable_record(&self, callable_id: &CallableId) -> Result<crate::core::CallableRecord> {
@@ -209,11 +232,7 @@ impl Runtime {
     }
 
     /// Validate arguments against JSON schema
-    fn validate_arguments(
-        &self,
-        schema: &serde_json::Value,
-        arguments: &serde_json::Value,
-    ) -> Result<()> {
+    fn validate_arguments(schema: &serde_json::Value, arguments: &serde_json::Value) -> Result<()> {
         // Basic validation: check required fields
         if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
             if let Some(args_obj) = arguments.as_object() {
@@ -221,8 +240,7 @@ impl Runtime {
                     if let Some(req_str) = req.as_str() {
                         if !args_obj.contains_key(req_str) {
                             return Err(RuntimeError::ValidationFailed(format!(
-                                "Missing required argument: {}",
-                                req_str
+                                "Missing required argument: {req_str}"
                             )));
                         }
                     }
@@ -273,63 +291,70 @@ impl Runtime {
         // MCP tools/call returns { content: [...], isError?: bool }
         let is_error = result
             .get("isError")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let content = if let Some(content_array) = result.get("content").and_then(|v| v.as_array())
-        {
-            content_array
-                .iter()
-                .filter_map(|item| {
-                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        match item_type {
-                            "text" => {
-                                let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                Some(ToolResultContent::Text {
-                                    text: text.to_string(),
-                                })
-                            }
-                            "image" => {
-                                let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                                let mime_type = item
-                                    .get("mimeType")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("image/png")
-                                    .to_string();
-                                Some(ToolResultContent::Image {
-                                    data: data.to_string(),
-                                    mime_type,
-                                })
-                            }
-                            "resource" => {
-                                let uri = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                                let mime_type: Option<&str> =
-                                    item.get("mimeType").and_then(|v| v.as_str());
-                                let text: Option<&str> = item.get("text").and_then(|v| v.as_str());
-                                let blob: Option<&str> = item.get("blob").and_then(|v| v.as_str());
+        let content = result
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(
+                || {
+                    vec![ToolResultContent::Text {
+                        text: result.to_string(),
+                    }]
+                },
+                |content_array| {
+                    content_array
+                        .iter()
+                        .filter_map(|item| {
+                            item.get("type")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|item_type| match item_type {
+                                    "text" => {
+                                        let text =
+                                            item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                        Some(ToolResultContent::Text {
+                                            text: text.to_string(),
+                                        })
+                                    }
+                                    "image" => {
+                                        let data =
+                                            item.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                                        let mime_type = item
+                                            .get("mimeType")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("image/png")
+                                            .to_string();
+                                        Some(ToolResultContent::Image {
+                                            data: data.to_string(),
+                                            mime_type,
+                                        })
+                                    }
+                                    "resource" => {
+                                        let uri =
+                                            item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                                        let mime_type: Option<&str> =
+                                            item.get("mimeType").and_then(|v| v.as_str());
+                                        let text: Option<&str> =
+                                            item.get("text").and_then(|v| v.as_str());
+                                        let blob: Option<&str> =
+                                            item.get("blob").and_then(|v| v.as_str());
 
-                                Some(ToolResultContent::Resource {
-                                    resource: crate::core::ResourceContent {
-                                        uri: uri.to_string(),
-                                        mime_type: mime_type.map(|s: &str| s.to_string()),
-                                        text: text.map(|s: &str| s.to_string()),
-                                        blob: blob.map(|s: &str| s.to_string()),
-                                    },
+                                        Some(ToolResultContent::Resource {
+                                            resource: crate::core::ResourceContent {
+                                                uri: uri.to_string(),
+                                                mime_type: mime_type.map(|s: &str| s.to_string()),
+                                                text: text.map(|s: &str| s.to_string()),
+                                                blob: blob.map(|s: &str| s.to_string()),
+                                            },
+                                        })
+                                    }
+                                    _ => None,
                                 })
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            // Fallback: wrap entire result as text
-            vec![ToolResultContent::Text {
-                text: result.to_string(),
-            }]
-        };
+                        })
+                        .collect()
+                },
+            );
 
         if content.is_empty() && !is_error {
             error!("Tool returned empty content, treating as error");
@@ -387,7 +412,7 @@ impl Runtime {
                 // Record trace step
                 if let Some(trace) = trace {
                     let step_end = chrono::Utc::now();
-                    let duration = (step_end - step_start).num_milliseconds().max(0) as u64;
+                    let duration = duration_ms(step_start, step_end);
 
                     trace.steps.push(TraceStep {
                         step_index: trace.steps.len(),
@@ -415,7 +440,7 @@ impl Runtime {
             structured_content: Some(serde_json::json!({
                 "skill": record.name,
                 "version": record.skill_version,
-                "uses_tools": record.uses.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                "uses_tools": record.uses.iter().map(super::core::CallableId::as_str).collect::<Vec<_>>(),
                 "bundled_tools": record.bundled_tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
                 "additional_files": &record.additional_files,
                 "message": "Load SKILL.md to see instructions"
@@ -426,7 +451,7 @@ impl Runtime {
         // Record trace step
         if let Some(trace) = trace {
             let step_end = chrono::Utc::now();
-            let duration = (step_end - step_start).num_milliseconds().max(0) as u64;
+            let duration = duration_ms(step_start, step_end);
 
             trace.steps.push(TraceStep {
                 step_index: trace.steps.len(),
@@ -443,6 +468,10 @@ impl Runtime {
     }
 
     /// Execute a bundled tool (script)
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bundled tool execution keeps setup, cleanup, and result mapping together"
+    )]
     async fn execute_bundled_tool(
         &self,
         tool: &BundledTool,
@@ -454,8 +483,11 @@ impl Runtime {
             return Err(RuntimeError::BundledToolError("Empty command".to_string()));
         }
 
-        let program = &tool.command[0];
-        let args: Vec<String> = tool.command[1..].to_vec();
+        let program = tool
+            .command
+            .first()
+            .ok_or_else(|| RuntimeError::BundledToolError("Empty command".to_string()))?;
+        let args = tool.command.get(1..).unwrap_or_default().to_vec();
 
         debug!(
             "Executing bundled tool: {} with command: {:?}",
@@ -464,17 +496,17 @@ impl Runtime {
 
         // Prepare arguments as JSON for the script
         let args_json = serde_json::to_string_pretty(arguments).map_err(|e| {
-            RuntimeError::BundledToolError(format!("Failed to serialize arguments: {}", e))
+            RuntimeError::BundledToolError(format!("Failed to serialize arguments: {e}"))
         })?;
 
         // Determine working directory from script path
-        let working_dir = if !args.is_empty() {
-            Path::new(&args[0])
+        let working_dir = if args.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else {
+            Path::new(args.first().map_or("", String::as_str))
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         };
 
         // Prepare environment variables
@@ -491,11 +523,10 @@ impl Runtime {
         ];
 
         // Create sandbox with configuration merging
-        let sandbox_config = if let Some(override_config) = tool_sandbox_override {
-            self.sandbox_config.with_override(override_config)
-        } else {
-            self.sandbox_config.clone()
-        };
+        let sandbox_config = tool_sandbox_override.map_or_else(
+            || self.sandbox_config.clone(),
+            |override_config| self.sandbox_config.with_override(override_config),
+        );
 
         // Apply timeout override if provided
         let mut sandbox_config = sandbox_config;
@@ -591,11 +622,18 @@ pub struct WorkflowEngine {
 }
 
 impl WorkflowEngine {
-    pub fn new(registry: Arc<Registry>) -> Self {
-        WorkflowEngine { registry }
+    #[must_use]
+    pub const fn new(registry: Arc<Registry>) -> Self {
+        Self { registry }
     }
 
     /// Execute a workflow definition
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
+    #[expect(
+        clippy::unused_async,
+        reason = "workflow execution is async by contract before the implementation gains awaits"
+    )]
     pub async fn execute(
         &self,
         _workflow: &serde_json::Value,

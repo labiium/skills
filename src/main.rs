@@ -11,7 +11,16 @@ mod paths;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use paths::{paths_from_env, PathsConfig, SkillsPaths};
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::{
+    transport::{
+        stdio,
+        streamable_http_server::{
+            session::local::LocalSessionManager,
+            tower::{StreamableHttpServerConfig, StreamableHttpService},
+        },
+    },
+    ServiceExt,
+};
 use skillsrs::core::persistence::PersistenceLayer;
 use skillsrs::core::policy::{PolicyConfig, PolicyEngine};
 use skillsrs::core::registry::Registry;
@@ -21,10 +30,41 @@ use skillsrs::execution::{sandbox::SandboxBackend, sandbox::SandboxConfig, Runti
 use skillsrs::mcp::SkillsServer;
 use skillsrs::storage::search::SearchEngine;
 use skillsrs::storage::SkillStore;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+fn find_skill_md(dir: &Path, found: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.join("SKILL.md").exists() {
+                    found.push(path);
+                } else {
+                    find_skill_md(&path, found);
+                }
+            }
+        }
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "skills")]
@@ -107,7 +147,7 @@ enum Commands {
     /// Get tool schema or execute tool (AI agent mode)
     /// Usage: skills tool <server>/<tool> [args]
     Tool {
-        /// Tool path: server/tool_name
+        /// Tool path: `server/tool_name`
         tool_path: String,
 
         /// JSON arguments (or use stdin)
@@ -135,7 +175,7 @@ enum Commands {
     /// Execute a tool directly (alias for 'tool')
     #[command(visible_alias = "exec")]
     Execute {
-        /// Tool path: server/tool_name
+        /// Tool path: `server/tool_name`
         tool_path: String,
 
         /// JSON arguments (or use stdin)
@@ -158,7 +198,7 @@ enum Commands {
     ///
     /// Examples:
     ///   skills add vercel-labs/agent-skills
-    ///   skills add https://github.com/wshobson/agents --skill monorepo-management
+    ///   skills add <https://github.com/wshobson/agents> --skill monorepo-management
     Add {
         /// Repository URL or GitHub shorthand (owner/repo)
         repo: String,
@@ -178,7 +218,7 @@ enum Commands {
 
     /// Sync Agent Skills from config.yaml repositories
     ///
-    /// Synchronizes all Agent Skills declared in config.yaml agent_skills_repos.
+    /// Synchronizes all Agent Skills declared in config.yaml `agent_skills_repos`.
     /// Adds new skills, updates changed ones, and removes skills from deleted repos.
     Sync,
 
@@ -205,7 +245,7 @@ enum Commands {
     /// Usage:
     ///   skills add-mcp http <alias> <url>                 # Add HTTP MCP server
     ///   skills add-mcp stdio <alias> <command>            # Add stdio MCP server
-    ///   skills add-mcp http deepwiki https://mcp.deepwiki.com/mcp
+    ///   skills add-mcp http deepwiki <https://mcp.deepwiki.com/mcp>
     ///   skills add-mcp stdio filesystem "npx -y @modelcontextprotocol/server-filesystem ."
     ///
     /// The server will be added to your config.yaml and can be used immediately.
@@ -433,7 +473,7 @@ fn is_default_policy_config(cfg: &PolicyConfig) -> bool {
         && cfg.deny_patterns == default.deny_patterns
 }
 
-fn is_default_paths_config(cfg: &PathsConfig) -> bool {
+const fn is_default_paths_config(cfg: &PathsConfig) -> bool {
     cfg.data_dir.is_none()
         && cfg.config_dir.is_none()
         && cfg.cache_dir.is_none()
@@ -452,7 +492,7 @@ fn is_default_sandbox_config(cfg: &SandboxConfig) -> bool {
         && cfg.max_cpu_seconds == default.max_cpu_seconds
 }
 
-fn is_default_use_global(cfg: &UseGlobalSettings) -> bool {
+const fn is_default_use_global(cfg: &UseGlobalSettings) -> bool {
     !cfg.enabled
 }
 
@@ -493,7 +533,7 @@ fn default_log_level() -> String {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig {
+        Self {
             bind: default_bind(),
             transport: default_transport(),
             log_level: default_log_level(),
@@ -573,18 +613,19 @@ fn add_repo_to_config(config: &mut Config, repo: &str, git_ref: Option<&str>, sk
 
     if let Some(idx) = existing_idx {
         // Update existing repo
-        let repo_config = &mut config.agent_skills_repos[idx];
-        if let Some(git_ref_val) = git_ref {
-            repo_config.git_ref = Some(git_ref_val.to_string());
-        }
-        if !skills.is_empty() {
-            repo_config.skills = Some(skills);
+        if let Some(repo_config) = config.agent_skills_repos.get_mut(idx) {
+            if let Some(git_ref_val) = git_ref {
+                repo_config.git_ref = Some(git_ref_val.to_string());
+            }
+            if !skills.is_empty() {
+                repo_config.skills = Some(skills);
+            }
         }
     } else {
         // Add new repo
         let repo_config = skillsrs::storage::sync::AgentSkillsRepoConfig {
             repo: repo.to_string(),
-            git_ref: git_ref.map(|s| s.to_string()),
+            git_ref: git_ref.map(std::string::ToString::to_string),
             skills: if skills.is_empty() {
                 None
             } else {
@@ -658,7 +699,7 @@ fn resolve_paths(cli: &Cli, config: &Config) -> Result<SkillsPaths> {
     // Apply CLI argument override (highest priority)
     if let Some(ref path) = cli.path {
         let base = PathBuf::from(path);
-        paths.data_dir = base.clone();
+        paths.data_dir.clone_from(&base);
         paths.cache_dir = base.join("cache");
         paths.database_path = base.join("skills.db");
         paths.skills_root = base.join("skills");
@@ -672,6 +713,10 @@ fn resolve_paths(cli: &Cli, config: &Config) -> Result<SkillsPaths> {
 }
 
 /// Initialize the server components
+#[expect(
+    clippy::too_many_lines,
+    reason = "server initialization wires all shared services in dependency order"
+)]
 async fn init_server(
     config: &Config,
     paths: &SkillsPaths,
@@ -736,7 +781,9 @@ async fn init_server(
         match skillsrs::storage::sync::AgentSkillsSync::new(&paths.skills_root).await {
             Ok(mut sync) => match sync.sync_all(&config.agent_skills_repos).await {
                 Ok(report) => {
-                    if !report.is_empty() {
+                    if report.is_empty() {
+                        info!("All Agent Skills up-to-date");
+                    } else {
                         info!("Agent Skills sync complete:");
                         if !report.added.is_empty() {
                             info!("  Added: {}", report.added.join(", "));
@@ -750,8 +797,6 @@ async fn init_server(
                         if !report.errors.is_empty() {
                             warn!("  Errors: {}", report.errors.join(", "));
                         }
-                    } else {
-                        info!("All Agent Skills up-to-date");
                     }
                 }
                 Err(e) => {
@@ -848,14 +893,14 @@ async fn init_server(
 /// Print the stylish SKILLS banner
 fn print_banner() {
     eprintln!(
-        r#"
+        r"
  ███████╗██╗  ██╗██╗██╗     ██╗     ███████╗
  ██╔════╝██║ ██╔╝██║██║     ██║     ██╔════╝
  ███████╗█████╔╝ ██║██║     ██║     ███████╗
  ╚════██║██╔═██╗ ██║██║     ██║     ╚════██║
  ███████║██║  ██╗██║███████╗███████╗███████║
  ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚══════╝
-    "#
+    "
     );
     eprintln!(
         "    Infinite Skills. Finite Context. v{}\n",
@@ -864,6 +909,10 @@ fn print_banner() {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the CLI command dispatcher keeps command-specific control flow in one entry point"
+)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -931,8 +980,8 @@ async fn main() -> Result<()> {
     if cli.current_dir {
         let cwd = std::env::current_dir()?;
         info!("Using current directory: {}", cwd.display());
-        paths.skills_root = cwd.clone();
-        paths.data_dir = cwd.clone();
+        paths.skills_root.clone_from(&cwd);
+        paths.data_dir.clone_from(&cwd);
         paths.database_path = cwd.join("skills.db");
     }
 
@@ -1010,8 +1059,8 @@ use_global:
                     print_banner();
                     info!("Starting skills.rs in HTTP mode on {}", bind);
                     eprintln!("Mode: HTTP");
-                    eprintln!("Listening on: http://{}", bind);
-                    eprintln!("MCP Endpoint: http://{}/mcp", bind);
+                    eprintln!("Listening on: http://{bind}");
+                    eprintln!("MCP Endpoint: http://{bind}/mcp");
                     eprintln!("Exposing 3 tools: search, exec, manage");
                     eprintln!("Skills directory: {}", paths.skills_root.display());
                     if no_sandbox {
@@ -1020,12 +1069,6 @@ use_global:
                     eprintln!();
 
                     let server = init_server(&config, &paths, no_sandbox).await?;
-
-                    // Create HTTP service
-                    use rmcp::transport::streamable_http_server::{
-                        session::local::LocalSessionManager,
-                        tower::{StreamableHttpServerConfig, StreamableHttpService},
-                    };
 
                     let mcp_service = StreamableHttpService::new(
                         move || Ok(server.clone()),
@@ -1076,7 +1119,9 @@ use_global:
 
                     axum::serve(listener, app)
                         .with_graceful_shutdown(async {
-                            tokio::signal::ctrl_c().await.unwrap();
+                            if let Err(error) = tokio::signal::ctrl_c().await {
+                                warn!("Failed to listen for shutdown signal: {error}");
+                            }
                             info!("Shutting down...");
                         })
                         .await?;
@@ -1121,11 +1166,9 @@ use_global:
                 let output: Vec<_> = callables
                     .iter()
                     .filter(|c| {
-                        if let Some(ref srv) = server {
-                            c.server_alias.as_deref() == Some(srv)
-                        } else {
-                            true
-                        }
+                        server
+                            .as_ref()
+                            .map_or(true, |srv| c.server_alias.as_deref() == Some(srv))
                     })
                     .map(|c| {
                         serde_json::json!({
@@ -1159,8 +1202,8 @@ use_global:
                         .push(callable);
                 }
 
-                for (server_name, tools) in by_server.iter() {
-                    println!("{}", server_name);
+                for (server_name, tools) in &by_server {
+                    println!("{server_name}");
                     for tool in tools {
                         if descriptions {
                             println!(
@@ -1184,13 +1227,15 @@ use_global:
             raw,
         } => {
             // Parse tool path
-            let parts: Vec<&str> = tool_path.split('/').collect();
-            if parts.len() != 2 {
+            let Some((server_name, tool_name)) = tool_path.split_once('/') else {
                 eprintln!("Error: Tool path must be in format <server>/<tool>");
                 eprintln!("Example: skills tool filesystem/read_file");
                 std::process::exit(1);
+            };
+            if tool_name.contains('/') {
+                eprintln!("Error: Tool path must be in format <server>/<tool>");
+                std::process::exit(1);
             }
-            let (server_name, tool_name) = (parts[0], parts[1]);
 
             // Initialize components (CLI mode uses no sandbox by default)
             let registry = Arc::new(Registry::new());
@@ -1229,32 +1274,26 @@ use_global:
                 .iter()
                 .find(|c| c.server_alias.as_deref() == Some(server_name) && c.name == tool_name);
 
-            let tool = match tool {
-                Some(t) => t,
-                None => {
-                    eprintln!(
-                        "Error: Tool '{}' not found in server '{}'",
-                        tool_name, server_name
-                    );
-                    eprintln!("\nAvailable tools in {}:", server_name);
-                    for c in callables
-                        .iter()
-                        .filter(|c| c.server_alias.as_deref() == Some(server_name))
-                    {
-                        eprintln!(" • {}", c.name);
-                    }
-                    std::process::exit(1);
+            let Some(tool) = tool else {
+                eprintln!("Error: Tool '{tool_name}' not found in server '{server_name}'");
+                eprintln!("\nAvailable tools in {server_name}:");
+                for c in callables
+                    .iter()
+                    .filter(|c| c.server_alias.as_deref() == Some(server_name))
+                {
+                    eprintln!(" • {}", c.name);
                 }
+                std::process::exit(1);
             };
 
             // If no args provided, show schema
             if args.is_none() {
                 println!("Tool: {}", tool.name);
-                println!("Server: {}", server_name);
+                println!("Server: {server_name}");
                 println!();
                 if let Some(desc) = &tool.description {
                     println!("Description:");
-                    println!(" {}", desc);
+                    println!(" {desc}");
                     println!();
                 }
                 println!("Input Schema:");
@@ -1274,7 +1313,7 @@ use_global:
 
             // Parse arguments
             let arguments: serde_json::Value = serde_json::from_str(&args_json)
-                .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {e}"))?;
 
             // Execute the tool
             let exec_context = skillsrs::execution::ExecContext {
@@ -1293,7 +1332,7 @@ use_global:
                         // Extract text content from ToolResult
                         for content in &result.content {
                             if let skillsrs::core::ToolResultContent::Text { text } = content {
-                                print!("{}", text);
+                                print!("{text}");
                             }
                         }
                     } else {
@@ -1303,7 +1342,7 @@ use_global:
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error executing tool: {}", e);
+                    eprintln!("Error executing tool: {e}");
                     std::process::exit(2);
                 }
             }
@@ -1315,13 +1354,15 @@ use_global:
             json,
         } => {
             // Parse tool path
-            let parts: Vec<&str> = tool_path.split('/').collect();
-            if parts.len() != 2 {
+            let Some((server_name, tool_name)) = tool_path.split_once('/') else {
                 eprintln!("Error: Tool path must be in format <server>/<tool>");
                 eprintln!("Example: skills exec filesystem/read_file");
                 std::process::exit(1);
+            };
+            if tool_name.contains('/') {
+                eprintln!("Error: Tool path must be in format <server>/<tool>");
+                std::process::exit(1);
             }
-            let (server_name, tool_name) = (parts[0], parts[1]);
 
             // Initialize components (CLI mode uses no sandbox by default)
             let registry = Arc::new(Registry::new());
@@ -1360,22 +1401,16 @@ use_global:
                 .iter()
                 .find(|c| c.server_alias.as_deref() == Some(server_name) && c.name == tool_name);
 
-            let tool = match tool {
-                Some(t) => t,
-                None => {
-                    eprintln!(
-                        "Error: Tool '{}' not found in server '{}'",
-                        tool_name, server_name
-                    );
-                    eprintln!("\nAvailable tools in {}:", server_name);
-                    for c in callables
-                        .iter()
-                        .filter(|c| c.server_alias.as_deref() == Some(server_name))
-                    {
-                        eprintln!(" • {}", c.name);
-                    }
-                    std::process::exit(1);
+            let Some(tool) = tool else {
+                eprintln!("Error: Tool '{tool_name}' not found in server '{server_name}'");
+                eprintln!("\nAvailable tools in {server_name}:");
+                for c in callables
+                    .iter()
+                    .filter(|c| c.server_alias.as_deref() == Some(server_name))
+                {
+                    eprintln!(" • {}", c.name);
                 }
+                std::process::exit(1);
             };
 
             // Get arguments from CLI or stdin
@@ -1390,7 +1425,7 @@ use_global:
 
             // Parse arguments
             let arguments: serde_json::Value = serde_json::from_str(&args_json)
-                .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {e}"))?;
 
             // Execute the tool
             let exec_context = skillsrs::execution::ExecContext {
@@ -1402,17 +1437,14 @@ use_global:
 
             match runtime.execute(exec_context).await {
                 Ok(result) => {
-                    if json {
-                        let json_result = serde_json::to_value(&result)?;
-                        println!("{}", serde_json::to_string_pretty(&json_result)?);
-                    } else {
+                    if !json {
                         println!("Success!");
-                        let json_result = serde_json::to_value(&result)?;
-                        println!("{}", serde_json::to_string_pretty(&json_result)?);
                     }
+                    let json_result = serde_json::to_value(&result)?;
+                    println!("{}", serde_json::to_string_pretty(&json_result)?);
                 }
                 Err(e) => {
-                    eprintln!("Error executing tool: {}", e);
+                    eprintln!("Error executing tool: {e}");
                     std::process::exit(2);
                 }
             }
@@ -1446,7 +1478,7 @@ use_global:
 
             // Simple glob matching
             let pattern = pattern.replace('*', ".*");
-            let re = regex::Regex::new(&format!("(?i){}", pattern))?;
+            let re = regex::Regex::new(&format!("(?i){pattern}"))?;
 
             let matches: Vec<_> = callables
                 .iter()
@@ -1454,7 +1486,7 @@ use_global:
                 .collect();
 
             if matches.is_empty() {
-                println!("No tools found matching pattern: {}", pattern);
+                println!("No tools found matching pattern: {pattern}");
             } else {
                 println!("Found {} matching tools:\n", matches.len());
                 for tool in matches {
@@ -1519,14 +1551,14 @@ use_global:
             use std::path::PathBuf;
 
             info!("Adding skill(s) from repository: {}", repo);
-            eprintln!("🔍 Fetching skills from: {}", repo);
+            eprintln!("🔍 Fetching skills from: {repo}");
 
             // Parse repo URL
             let repo_url = if repo.starts_with("http://") || repo.starts_with("https://") {
                 repo.clone()
             } else if repo.contains('/') && !repo.contains(':') {
                 // GitHub shorthand: owner/repo
-                format!("https://github.com/{}", repo)
+                format!("https://github.com/{repo}")
             } else {
                 eprintln!("❌ Invalid repository format. Use 'owner/repo' or full URL");
                 return Ok(());
@@ -1561,22 +1593,6 @@ use_global:
             eprintln!("🔍 Discovering Agent Skills...");
             let mut discovered_skills = Vec::new();
 
-            fn find_skill_md(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            if path.join("SKILL.md").exists() {
-                                found.push(path);
-                            } else {
-                                // Recurse into subdirectories
-                                find_skill_md(&path, found);
-                            }
-                        }
-                    }
-                }
-            }
-
             find_skill_md(clone_path, &mut discovered_skills);
 
             if discovered_skills.is_empty() {
@@ -1593,11 +1609,9 @@ use_global:
                 discovered_skills
                     .into_iter()
                     .filter(|path| {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            skill.contains(&name.to_string())
-                        } else {
-                            false
-                        }
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| skill.iter().any(|candidate| candidate == name))
                     })
                     .collect()
             };
@@ -1609,9 +1623,9 @@ use_global:
 
             eprintln!("\n📥 Importing {} skill(s):", skills_to_import.len());
 
-            let mut imported = 0;
-            let mut skipped = 0;
-            let mut errors = 0;
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            let mut errors = 0usize;
 
             for skill_path in &skills_to_import {
                 let skill_name = skill_path
@@ -1619,7 +1633,7 @@ use_global:
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
 
-                eprint!("  • {} ... ", skill_name);
+                eprint!("  • {skill_name} ... ");
 
                 // Parse the Agent Skill
                 match AgentSkill::from_directory(skill_path).await {
@@ -1628,55 +1642,36 @@ use_global:
                         let dest_path = paths.skills_root.join(skill_name);
                         if dest_path.exists() && !force {
                             eprintln!("⚠️  skipped (already exists, use --force to overwrite)");
-                            skipped += 1;
+                            skipped = skipped.saturating_add(1);
                             continue;
                         }
 
                         // Create destination directory
                         std::fs::create_dir_all(&dest_path)?;
 
-                        // Copy all files from source to destination
-                        fn copy_dir_all(
-                            src: &std::path::Path,
-                            dst: &std::path::Path,
-                        ) -> std::io::Result<()> {
-                            std::fs::create_dir_all(dst)?;
-                            for entry in std::fs::read_dir(src)? {
-                                let entry = entry?;
-                                let path = entry.path();
-                                let dest_path = dst.join(entry.file_name());
-                                if path.is_dir() {
-                                    copy_dir_all(&path, &dest_path)?;
-                                } else {
-                                    std::fs::copy(&path, &dest_path)?;
-                                }
-                            }
-                            Ok(())
-                        }
-
                         if let Err(e) = copy_dir_all(skill_path, &dest_path) {
-                            eprintln!("❌ failed ({})", e);
-                            errors += 1;
+                            eprintln!("❌ failed ({e})");
+                            errors = errors.saturating_add(1);
                             continue;
                         }
 
                         eprintln!("✓ imported (v{})", agent_skill.version());
-                        imported += 1;
+                        imported = imported.saturating_add(1);
                     }
                     Err(e) => {
-                        eprintln!("❌ failed ({})", e);
-                        errors += 1;
+                        eprintln!("❌ failed ({e})");
+                        errors = errors.saturating_add(1);
                     }
                 }
             }
 
             eprintln!("\n📊 Summary:");
-            eprintln!("  ✓ Imported: {}", imported);
+            eprintln!("  ✓ Imported: {imported}");
             if skipped > 0 {
-                eprintln!("  ⚠️  Skipped:  {}", skipped);
+                eprintln!("  ⚠️  Skipped:  {skipped}");
             }
             if errors > 0 {
-                eprintln!("  ❌ Errors:   {}", errors);
+                eprintln!("  ❌ Errors:   {errors}");
             }
 
             if imported > 0 {
@@ -1690,7 +1685,7 @@ use_global:
                 .filter_map(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
+                        .map(std::string::ToString::to_string)
                 })
                 .collect();
 
@@ -1698,7 +1693,7 @@ use_global:
 
             // Save config back to the active config file
             if let Err(e) = save_config(&config, &active_config_path) {
-                eprintln!("⚠️  Warning: Failed to save config: {}", e);
+                eprintln!("⚠️  Warning: Failed to save config: {e}");
             } else {
                 eprintln!("\n📝 Config updated: {}", active_config_path.display());
             }
@@ -1714,7 +1709,7 @@ use_global:
                 eprintln!("❌ No agent_skills_repos defined in config.yaml");
                 eprintln!("\nAdd repositories to your config.yaml:");
                 eprintln!(
-                    r#"
+                    r"
 agent_skills_repos:
   - repo: vercel-labs/agent-skills
     skills:
@@ -1722,7 +1717,7 @@ agent_skills_repos:
   - repo: wshobson/agents
     skills:
       - monorepo-management
-"#
+"
                 );
                 return Ok(());
             }
@@ -1750,28 +1745,28 @@ agent_skills_repos:
                             if !report.added.is_empty() {
                                 eprintln!("  ✅ Added ({}):", report.added.len());
                                 for skill in &report.added {
-                                    eprintln!("     • {}", skill);
+                                    eprintln!("     • {skill}");
                                 }
                             }
 
                             if !report.updated.is_empty() {
                                 eprintln!("  🔄 Updated ({}):", report.updated.len());
                                 for skill in &report.updated {
-                                    eprintln!("     • {}", skill);
+                                    eprintln!("     • {skill}");
                                 }
                             }
 
                             if !report.removed.is_empty() {
                                 eprintln!("  🗑️  Removed ({}):", report.removed.len());
                                 for skill in &report.removed {
-                                    eprintln!("     • {}", skill);
+                                    eprintln!("     • {skill}");
                                 }
                             }
 
                             if !report.errors.is_empty() {
                                 eprintln!("  ❌ Errors ({}):", report.errors.len());
                                 for error in &report.errors {
-                                    eprintln!("     • {}", error);
+                                    eprintln!("     • {error}");
                                 }
                             }
 
@@ -1783,12 +1778,12 @@ agent_skills_repos:
                         }
                     }
                     Err(e) => {
-                        eprintln!("❌ Sync failed: {}", e);
+                        eprintln!("❌ Sync failed: {e}");
                         std::process::exit(1);
                     }
                 },
                 Err(e) => {
-                    eprintln!("❌ Failed to initialize sync: {}", e);
+                    eprintln!("❌ Failed to initialize sync: {e}");
                     std::process::exit(1);
                 }
             }
@@ -1844,7 +1839,7 @@ agent_skills_repos:
             let results = search_engine.search(&search_query).await?;
 
             eprintln!("Using skills root: {}\n", paths.skills_root.display());
-            eprintln!("Search results for '{}':\n", query);
+            eprintln!("Search results for '{query}':\n");
             eprintln!(
                 "Found {} matches (showing {}):\n",
                 results.total_matches,
@@ -1852,11 +1847,11 @@ agent_skills_repos:
             );
 
             for (i, result) in results.matches.iter().enumerate() {
-                eprintln!("{}. {} ({})", i + 1, result.name, result.kind);
+                eprintln!("{}. {} ({})", i.saturating_add(1), result.name, result.kind);
                 eprintln!("   ID: {}", result.id);
                 eprintln!("   FQ Name: {}", result.fq_name);
                 if let Some(server) = &result.server {
-                    eprintln!("   Server: {}", server);
+                    eprintln!("   Server: {server}");
                 }
                 eprintln!("   Score: {:.2}", result.score);
                 eprintln!("   Description: {}", result.description_snippet);
@@ -1864,7 +1859,7 @@ agent_skills_repos:
             }
 
             if let Some(cursor) = results.next_cursor {
-                eprintln!("Next cursor: {}", cursor);
+                eprintln!("Next cursor: {cursor}");
             }
         }
 
@@ -1888,7 +1883,6 @@ agent_skills_repos:
                         // Inline content provided
                         if content_str == "-" {
                             // Read from stdin
-                            use std::io::Read;
                             let mut buffer = String::new();
                             std::io::stdin().read_to_string(&mut buffer)?;
                             buffer
@@ -1898,17 +1892,16 @@ agent_skills_repos:
                     } else if let Some(path) = skill_md {
                         // Read from file
                         std::fs::read_to_string(&path)
-                            .map_err(|e| anyhow::anyhow!("Failed to read SKILL.md: {}", e))?
+                            .map_err(|e| anyhow::anyhow!("Failed to read SKILL.md: {e}"))?
                     } else {
                         // Interactive mode - read from stdin with prompt
                         println!("Enter SKILL.md content (Ctrl+D when done):");
-                        use std::io::Read;
                         let mut buffer = String::new();
                         std::io::stdin().read_to_string(&mut buffer)?;
                         buffer
                     };
 
-                    let desc = description.unwrap_or_else(|| format!("Skill: {}", name));
+                    let desc = description.unwrap_or_else(|| format!("Skill: {name}"));
 
                     let request = skillsrs::storage::CreateSkillRequest {
                         name: name.clone(),
@@ -1969,7 +1962,7 @@ agent_skills_repos:
                     } else if let Some(path) = skill_md {
                         // Read from file
                         std::fs::read_to_string(&path)
-                            .map_err(|e| anyhow::anyhow!("Failed to read SKILL.md: {}", e))?
+                            .map_err(|e| anyhow::anyhow!("Failed to read SKILL.md: {e}"))?
                     } else if let Some(current) = current_content.as_ref() {
                         // Start with existing content for modifications
                         let mut md = current.skill_md.clone();
@@ -1981,12 +1974,12 @@ agent_skills_repos:
 
                         // Apply prepend
                         if let Some(prefix) = prepend {
-                            md = format!("{}\n{}", prefix, md);
+                            md = format!("{prefix}\n{md}");
                         }
 
                         // Apply append
                         if let Some(suffix) = append {
-                            md = format!("{}\n{}", md, suffix);
+                            md = format!("{md}\n{suffix}");
                         }
 
                         md
@@ -1998,8 +1991,7 @@ agent_skills_repos:
                     let request = skillsrs::storage::CreateSkillRequest {
                         name: name.unwrap_or_else(|| skill_name.clone()),
                         version: version.unwrap_or_else(|| "1.0.0".to_string()),
-                        description: description
-                            .unwrap_or_else(|| format!("Skill: {}", skill_name)),
+                        description: description.unwrap_or_else(|| format!("Skill: {skill_name}")),
                         skill_md_content,
                         uses_tools,
                         tags: vec!["cli-updated".to_string()],
@@ -2014,14 +2006,10 @@ agent_skills_repos:
 
                 SkillCommands::Delete { skill_id, force } => {
                     if !force {
-                        println!(
-                            "Are you sure you want to delete skill '{}'? [y/N]",
-                            skill_id
-                        );
-                        use std::io::Read;
+                        println!("Are you sure you want to delete skill '{skill_id}'? [y/N]");
                         let mut buffer = [0u8; 1];
                         std::io::stdin().read_exact(&mut buffer).ok();
-                        if buffer[0] != b'y' && buffer[0] != b'Y' {
+                        if !matches!(buffer.first(), Some(b'y' | b'Y')) {
                             println!("Deletion cancelled.");
                             return Ok(());
                         }
@@ -2039,7 +2027,7 @@ agent_skills_repos:
                     };
 
                     skill_store.delete_skill(&skill_name)?;
-                    println!("✓ Deleted skill: {}", skill_id);
+                    println!("✓ Deleted skill: {skill_id}");
                 }
 
                 SkillCommands::Show { skill_id, file } => {
@@ -2055,10 +2043,10 @@ agent_skills_repos:
 
                     if let Some(filename) = file {
                         let content = skill_store.load_skill_file(&skill_name, &filename)?;
-                        println!("{}", content);
+                        println!("{content}");
                     } else {
                         let content = skill_store.load_skill_content(&skill_name)?;
-                        println!("# Skill: {}\n", skill_id);
+                        println!("# Skill: {skill_id}\n");
                         println!("{}", content.skill_md);
                         println!("\n---\n");
                         println!("## Metadata");
@@ -2081,38 +2069,43 @@ agent_skills_repos:
             }
         }
 
-        Commands::AddMcp { transport, alias, endpoint, tags, test, description } => {
-            eprintln!("Adding MCP server '{}' (transport: {:?})", alias, transport);
+        Commands::AddMcp {
+            transport,
+            alias,
+            endpoint,
+            tags,
+            test,
+            description,
+        } => {
+            eprintln!("Adding MCP server '{alias}' (transport: {transport:?})");
 
             if config.upstreams.iter().any(|u| u.alias == alias) {
-                eprintln!("Error: Upstream '{}' already exists", alias);
+                eprintln!("Error: Upstream '{alias}' already exists");
                 eprintln!("Use 'skills list' to see existing servers");
                 std::process::exit(1);
             }
 
             let upstream_config = match transport {
-                TransportType::Http => {
-                    skillsrs::execution::upstream::UpstreamConfig {
-                        alias: alias.clone(),
-                        transport: skillsrs::execution::upstream::Transport::Http,
-                        url: Some(endpoint.clone()),
-                        command: None,
-                        auth: None,
-                        repo: None,
-                        git_ref: None,
-                        skills: None,
-                        roots: None,
-                        tags,
-                        sandbox_config: None,
-                        description,
-                    }
-                }
+                TransportType::Http => skillsrs::execution::upstream::UpstreamConfig {
+                    alias: alias.clone(),
+                    transport: skillsrs::execution::upstream::Transport::Http,
+                    url: Some(endpoint.clone()),
+                    command: None,
+                    auth: None,
+                    repo: None,
+                    git_ref: None,
+                    skills: None,
+                    roots: None,
+                    tags,
+                    sandbox_config: None,
+                    description,
+                },
                 TransportType::Stdio => {
                     let command_parts: Vec<String> = endpoint
                         .split_whitespace()
-                        .map(|s| s.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect();
-                    
+
                     skillsrs::execution::upstream::UpstreamConfig {
                         alias: alias.clone(),
                         transport: skillsrs::execution::upstream::Transport::Stdio,
@@ -2134,15 +2127,15 @@ agent_skills_repos:
                 eprint!("Testing connection... ");
                 let registry = Arc::new(Registry::new());
                 let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
-                
+
                 match upstream_manager.add_upstream(upstream_config.clone()).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         eprintln!("✓");
                         upstream_manager.disconnect(&alias).await.ok();
                     }
                     Err(e) => {
                         eprintln!("✗");
-                        eprintln!("Warning: Connection test failed: {}", e);
+                        eprintln!("Warning: Connection test failed: {e}");
                         eprintln!("Server added to config but may not be reachable.");
                     }
                 }
@@ -2151,28 +2144,34 @@ agent_skills_repos:
             config.upstreams.push(upstream_config);
 
             if let Err(e) = save_config(&config, &active_config_path) {
-                eprintln!("Error: Failed to save config: {}", e);
+                eprintln!("Error: Failed to save config: {e}");
                 std::process::exit(1);
             }
 
-            eprintln!("✓ Added MCP server '{}' to {}", alias, active_config_path.display());
+            eprintln!(
+                "✓ Added MCP server '{}' to {}",
+                alias,
+                active_config_path.display()
+            );
             eprintln!("\nThe server will be available after restarting skills.rs:");
             eprintln!("  skills list  # To see all available tools");
         }
 
-        Commands::EditMcp { alias, description, tags, url, command } => {
-            eprintln!("Editing MCP server '{}'", alias);
+        Commands::EditMcp {
+            alias,
+            description,
+            tags,
+            url,
+            command,
+        } => {
+            eprintln!("Editing MCP server '{alias}'");
 
-            let upstream_idx = config.upstreams.iter().position(|u| u.alias == alias);
-            
-            if upstream_idx.is_none() {
-                eprintln!("Error: Upstream '{}' not found", alias);
+            let Some(upstream) = config.upstreams.iter_mut().find(|item| item.alias == alias)
+            else {
+                eprintln!("Error: Upstream '{alias}' not found");
                 eprintln!("Use 'skills list' to see existing servers");
                 std::process::exit(1);
-            }
-
-            let idx = upstream_idx.unwrap();
-            let upstream = &mut config.upstreams[idx];
+            };
 
             if let Some(desc) = description {
                 upstream.description = Some(desc);
@@ -2184,15 +2183,24 @@ agent_skills_repos:
                 upstream.url = Some(new_url);
             }
             if let Some(new_cmd) = command {
-                upstream.command = Some(new_cmd.split_whitespace().map(|s| s.to_string()).collect());
+                upstream.command = Some(
+                    new_cmd
+                        .split_whitespace()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
+                );
             }
 
             if let Err(e) = save_config(&config, &active_config_path) {
-                eprintln!("Error: Failed to save config: {}", e);
+                eprintln!("Error: Failed to save config: {e}");
                 std::process::exit(1);
             }
 
-            eprintln!("✓ Updated MCP server '{}' in {}", alias, active_config_path.display());
+            eprintln!(
+                "✓ Updated MCP server '{}' in {}",
+                alias,
+                active_config_path.display()
+            );
             eprintln!("\nThe changes will take effect after restarting skills.rs:");
             eprintln!("  skills server stdio  # Or restart your MCP client");
         }

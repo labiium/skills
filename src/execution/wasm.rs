@@ -40,15 +40,17 @@ pub struct WasmContext {
 
 impl WasmContext {
     /// Create a new context with the given WASI configuration
-    pub fn new(wasi_ctx: wasi_common::WasiCtx) -> Self {
-        WasmContext { wasi_ctx }
+    #[must_use]
+    pub const fn new(wasi_ctx: wasi_common::WasiCtx) -> Self {
+        Self { wasi_ctx }
     }
 }
 
 impl WasmSandbox {
     /// Create a new WASM sandbox with the given configuration
-    pub fn new(config: SandboxConfig) -> Self {
-        WasmSandbox { config }
+    #[must_use]
+    pub const fn new(config: SandboxConfig) -> Self {
+        Self { config }
     }
 
     /// Execute a WASM module with the given input arguments
@@ -57,18 +59,20 @@ impl WasmSandbox {
     ///   fn run(input: &str) -> String
     ///
     /// Input and output are JSON strings.
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn execute(
         &self,
         wasm_path: &Path,
         input_json: &str,
     ) -> Result<SandboxResult, SandboxError> {
-        debug!("Executing WASM module: {:?}", wasm_path);
+        debug!("Executing WASM module: {}", wasm_path.display());
 
         // Check if WASM file exists
         if !wasm_path.exists() {
             return Err(SandboxError::ExecutionFailed(format!(
-                "WASM file not found: {:?}",
-                wasm_path
+                "WASM file not found: {}",
+                wasm_path.display()
             )));
         }
 
@@ -80,14 +84,16 @@ impl WasmSandbox {
         let result =
             task::spawn_blocking(move || Self::execute_blocking(&wasm_path, &input_json, &config))
                 .await
-                .map_err(|e| {
-                    SandboxError::ExecutionFailed(format!("WASM task join error: {}", e))
-                })?;
+                .map_err(|e| SandboxError::ExecutionFailed(format!("WASM task join error: {e}")))?;
 
         result
     }
 
     /// Blocking execution of WASM module
+    #[expect(
+        clippy::too_many_lines,
+        reason = "WASM engine setup and execution form one ordered capability boundary"
+    )]
     fn execute_blocking(
         wasm_path: &Path,
         input_json: &str,
@@ -108,12 +114,12 @@ impl WasmSandbox {
 
         // Create engine
         let engine = Engine::new(&engine_config).map_err(|e| {
-            SandboxError::NotAvailable(format!("Failed to create wasmtime engine: {}", e))
+            SandboxError::NotAvailable(format!("Failed to create wasmtime engine: {e}"))
         })?;
 
         // Load module
         let module = Module::from_file(&engine, wasm_path).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("Failed to load WASM module: {}", e))
+            SandboxError::ExecutionFailed(format!("Failed to load WASM module: {e}"))
         })?;
 
         // Validate module exports the `run` function
@@ -180,20 +186,25 @@ impl WasmSandbox {
         // Add initial fuel if enabled
         if config.max_cpu_seconds > 0 {
             // Estimate: 1 second ~ 10 billion fuel units
-            let fuel_limit = config.max_cpu_seconds * 10_000_000_000;
+            let fuel_limit = config
+                .max_cpu_seconds
+                .checked_mul(10_000_000_000)
+                .ok_or_else(|| {
+                    SandboxError::ExecutionFailed("WASM fuel limit overflow".to_string())
+                })?;
             store
                 .set_fuel(fuel_limit)
-                .map_err(|e| SandboxError::ExecutionFailed(format!("Failed to set fuel: {}", e)))?;
+                .map_err(|e| SandboxError::ExecutionFailed(format!("Failed to set fuel: {e}")))?;
         }
 
         // Create linker and add WASI using wasi_common
         let mut linker = Linker::new(&engine);
         wasi_common::sync::add_to_linker(&mut linker, |ctx: &mut WasmContext| &mut ctx.wasi_ctx)
-            .map_err(|e| SandboxError::ExecutionFailed(format!("Failed to link WASI: {}", e)))?;
+            .map_err(|e| SandboxError::ExecutionFailed(format!("Failed to link WASI: {e}")))?;
 
         // Instantiate module
         let instance = linker.instantiate(&mut store, &module).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("Failed to instantiate WASM module: {}", e))
+            SandboxError::ExecutionFailed(format!("Failed to instantiate WASM module: {e}"))
         })?;
 
         // Get memory export for data transfer
@@ -210,8 +221,7 @@ impl WasmSandbox {
             .get_typed_func::<(i32, i32), i32>(&mut store, "run")
             .map_err(|e| {
                 SandboxError::ExecutionFailed(format!(
-                    "WASM module must export 'run(i32, i32) -> i32': {}",
-                    e
+                    "WASM module must export 'run(i32, i32) -> i32': {e}"
                 ))
             })?;
 
@@ -220,16 +230,22 @@ impl WasmSandbox {
 
         // Write input to WASM memory
         let memory_data = memory.data_mut(&mut store);
-        let dest = input_ptr;
-        if dest + input_len > memory_data.len() {
-            return Err(SandboxError::ExecutionFailed(
-                "Input too large for WASM memory".to_string(),
-            ));
-        }
-        memory_data[dest..dest + input_len].copy_from_slice(input_bytes);
+        let input_end = input_ptr.checked_add(input_len).ok_or_else(|| {
+            SandboxError::ExecutionFailed("WASM input range overflow".to_string())
+        })?;
+        let destination = memory_data.get_mut(input_ptr..input_end).ok_or_else(|| {
+            SandboxError::ExecutionFailed("Input too large for WASM memory".to_string())
+        })?;
+        destination.copy_from_slice(input_bytes);
 
         // Execute the function
-        let result = run_func.call(&mut store, (input_ptr as i32, input_len as i32));
+        let input_ptr = i32::try_from(input_ptr).map_err(|_| {
+            SandboxError::ExecutionFailed("WASM input pointer exceeds i32::MAX".to_string())
+        })?;
+        let input_len = i32::try_from(input_len).map_err(|_| {
+            SandboxError::ExecutionFailed("WASM input length exceeds i32::MAX".to_string())
+        })?;
+        let result = run_func.call(&mut store, (input_ptr, input_len));
 
         // Get remaining fuel
         let fuel_consumed = if config.max_cpu_seconds > 0 {
@@ -242,9 +258,12 @@ impl WasmSandbox {
         match result {
             Ok(output_ptr) => {
                 // Read output from WASM memory
-                let output = Self::read_string_from_memory(&store, memory, output_ptr as usize)?;
+                let output_ptr = usize::try_from(output_ptr).map_err(|_| {
+                    SandboxError::ExecutionFailed("WASM returned a negative pointer".to_string())
+                })?;
+                let output = Self::read_string_from_memory(&store, memory, output_ptr)?;
 
-                let duration_ms = start.elapsed().as_millis() as u64;
+                let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                 // Note: WASI stdio capture is more complex - simplified for now
                 let stderr = String::new();
@@ -263,8 +282,6 @@ impl WasmSandbox {
                 })
             }
             Err(e) => {
-                let _duration_ms = start.elapsed().as_millis() as u64;
-
                 // Check if trap is due to fuel exhaustion
                 if let Some(trap) = e.downcast_ref::<wasmtime::Trap>() {
                     if *trap == wasmtime::Trap::OutOfFuel {
@@ -279,8 +296,7 @@ impl WasmSandbox {
                 }
 
                 Err(SandboxError::ExecutionFailed(format!(
-                    "WASM execution failed: {}",
-                    e
+                    "WASM execution failed: {e}"
                 )))
             }
         }
@@ -295,10 +311,17 @@ impl WasmSandbox {
     ) -> Result<usize, SandboxError> {
         // Try to find a malloc export (common convention)
         if let Ok(malloc) = instance.get_typed_func::<i32, i32>(&mut *store, "malloc") {
-            let ptr = malloc.call(store, size as i32).map_err(|e| {
-                SandboxError::ExecutionFailed(format!("Memory allocation failed: {}", e))
+            let allocation_size = i32::try_from(size).map_err(|_| {
+                SandboxError::ExecutionFailed("WASM allocation exceeds i32::MAX".to_string())
             })?;
-            return Ok(ptr as usize);
+            let ptr = malloc.call(store, allocation_size).map_err(|e| {
+                SandboxError::ExecutionFailed(format!("Memory allocation failed: {e}"))
+            })?;
+            return usize::try_from(ptr).map_err(|_| {
+                SandboxError::ExecutionFailed(
+                    "WASM allocator returned a negative pointer".to_string(),
+                )
+            });
         }
 
         // Alternative: Try to use memory.grow directly
@@ -306,12 +329,17 @@ impl WasmSandbox {
         let needed_pages = size.div_ceil(65536); // WASM page size = 64KB
         let current_pages = current_size / 65536;
 
-        if memory.grow(store, needed_pages as u64).is_ok() {
-            return Ok(current_pages * 65536);
+        let needed_pages = u64::try_from(needed_pages).map_err(|_| {
+            SandboxError::ExecutionFailed("WASM page count exceeds u64::MAX".to_string())
+        })?;
+        if memory.grow(store, needed_pages).is_ok() {
+            return current_pages.checked_mul(65_536).ok_or_else(|| {
+                SandboxError::ExecutionFailed("WASM memory offset overflow".to_string())
+            });
         }
 
         // Fallback: Assume memory is already large enough
-        Ok(16 * 1024) // Start after initial data section (16KB offset)
+        Ok(16_384) // Start after initial data section (16KB offset)
     }
 
     /// Read a length-prefixed string from WASM memory
@@ -323,39 +351,38 @@ impl WasmSandbox {
         let memory_data = memory.data(store);
 
         // Read length-prefixed string (first 4 bytes as u32 length)
-        if ptr + 4 > memory_data.len() {
-            return Err(SandboxError::ExecutionFailed(
-                "Invalid memory pointer".to_string(),
-            ));
-        }
+        let string_start = ptr.checked_add(4).ok_or_else(|| {
+            SandboxError::ExecutionFailed("WASM output pointer overflow".to_string())
+        })?;
+        let length_bytes: [u8; 4] = memory_data
+            .get(ptr..string_start)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| SandboxError::ExecutionFailed("Invalid memory pointer".to_string()))?;
+        let length = usize::try_from(u32::from_le_bytes(length_bytes)).map_err(|_| {
+            SandboxError::ExecutionFailed("WASM output length exceeds usize::MAX".to_string())
+        })?;
+        let string_end = string_start.checked_add(length).ok_or_else(|| {
+            SandboxError::ExecutionFailed("WASM output range overflow".to_string())
+        })?;
+        let output_bytes = memory_data.get(string_start..string_end).ok_or_else(|| {
+            SandboxError::ExecutionFailed("String exceeds memory bounds".to_string())
+        })?;
 
-        let len = u32::from_le_bytes([
-            memory_data[ptr],
-            memory_data[ptr + 1],
-            memory_data[ptr + 2],
-            memory_data[ptr + 3],
-        ]) as usize;
-
-        let str_ptr = ptr + 4;
-        if str_ptr + len > memory_data.len() {
-            return Err(SandboxError::ExecutionFailed(
-                "String exceeds memory bounds".to_string(),
-            ));
-        }
-
-        String::from_utf8(memory_data[str_ptr..str_ptr + len].to_vec()).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("Invalid UTF-8 in WASM output: {}", e))
+        String::from_utf8(output_bytes.to_vec()).map_err(|e| {
+            SandboxError::ExecutionFailed(format!("Invalid UTF-8 in WASM output: {e}"))
         })
     }
 
     /// Validate a WASM module without executing it
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn validate(wasm_path: &Path) -> Result<(), SandboxError> {
         let engine = Engine::new(&Config::new()).map_err(|e| {
-            SandboxError::NotAvailable(format!("Failed to create wasmtime engine: {}", e))
+            SandboxError::NotAvailable(format!("Failed to create wasmtime engine: {e}"))
         })?;
 
         let module = Module::from_file(&engine, wasm_path).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("Failed to load WASM module: {}", e))
+            SandboxError::ExecutionFailed(format!("Failed to load WASM module: {e}"))
         })?;
 
         // Check for required exports
@@ -376,13 +403,15 @@ impl WasmSandbox {
     }
 
     /// Load and inspect a WASM module
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn inspect(wasm_path: &Path) -> Result<WasmModuleInfo, SandboxError> {
         let engine = Engine::new(&Config::new()).map_err(|e| {
-            SandboxError::NotAvailable(format!("Failed to create wasmtime engine: {}", e))
+            SandboxError::NotAvailable(format!("Failed to create wasmtime engine: {e}"))
         })?;
 
         let module = Module::from_file(&engine, wasm_path).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("Failed to load WASM module: {}", e))
+            SandboxError::ExecutionFailed(format!("Failed to load WASM module: {e}"))
         })?;
 
         let imports: Vec<String> = module.imports().map(|i| i.name().to_string()).collect();

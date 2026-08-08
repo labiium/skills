@@ -25,6 +25,28 @@ use thiserror::Error;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
+fn elapsed_millis(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "Docker requires an integer nanocpu value after explicit finite and range checks"
+)]
+fn cpu_quota_to_nano_cpus(cpu_quota: f64) -> Result<Option<i64>> {
+    if cpu_quota <= 0.0 {
+        return Ok(None);
+    }
+    let nano_cpus = cpu_quota * 1_000_000_000.0;
+    if !nano_cpus.is_finite() || nano_cpus > 9_223_372_036_854_775_807.0 {
+        return Err(SandboxError::InvalidConfig(
+            "Docker CPU quota is outside the supported range".to_string(),
+        ));
+    }
+    Ok(Some(nano_cpus as i64))
+}
+
 /// Sandbox configuration override for per-server and per-tool settings
 ///
 /// This struct allows overriding sandbox settings at the server or tool level.
@@ -81,16 +103,17 @@ pub enum SandboxPreset {
 
 impl SandboxPreset {
     /// Convert preset to full configuration
+    #[must_use]
     pub fn to_config(&self) -> SandboxConfig {
         match self {
-            SandboxPreset::Default => SandboxConfig::default(),
-            SandboxPreset::Development => SandboxConfig::development(),
-            SandboxPreset::Standard => SandboxConfig::standard(),
-            SandboxPreset::Strict => SandboxConfig::strict(),
-            SandboxPreset::Isolated => SandboxConfig::isolated(),
-            SandboxPreset::Network => SandboxConfig::network(),
-            SandboxPreset::Filesystem => SandboxConfig::filesystem(vec![], vec![]),
-            SandboxPreset::Wasm => SandboxConfig::wasm_optimized(),
+            Self::Default => SandboxConfig::default(),
+            Self::Development => SandboxConfig::development(),
+            Self::Standard => SandboxConfig::standard(),
+            Self::Strict => SandboxConfig::strict(),
+            Self::Isolated => SandboxConfig::isolated(),
+            Self::Network => SandboxConfig::network(),
+            Self::Filesystem => SandboxConfig::filesystem(vec![], vec![]),
+            Self::Wasm => SandboxConfig::wasm_optimized(),
         }
     }
 }
@@ -162,8 +185,9 @@ pub struct SandboxConfigOverride {
 
 impl SandboxConfigOverride {
     /// Create override from preset only
+    #[must_use]
     pub fn from_preset(preset: SandboxPreset) -> Self {
-        SandboxConfigOverride {
+        Self {
             preset: Some(preset),
             ..Default::default()
         }
@@ -171,15 +195,14 @@ impl SandboxConfigOverride {
 
     /// Resolve this override to a full configuration
     ///
-    /// Uses preset if specified, otherwise uses base_config, then applies
+    /// Uses preset if specified, otherwise uses `base_config`, then applies
     /// individual field overrides.
+    #[must_use]
     pub fn resolve(&self, base_config: &SandboxConfig) -> SandboxConfig {
         // Start with preset if specified, otherwise base config
-        let mut config = if let Some(preset) = self.preset {
-            preset.to_config()
-        } else {
-            base_config.clone()
-        };
+        let mut config = self
+            .preset
+            .map_or_else(|| base_config.clone(), |preset| preset.to_config());
 
         // Apply individual overrides
         if let Some(backend) = self.backend {
@@ -270,7 +293,7 @@ pub struct DockerConfig {
     pub mounts: Vec<DockerMount>,
 }
 
-fn default_auto_remove() -> bool {
+const fn default_auto_remove() -> bool {
     true
 }
 
@@ -292,7 +315,7 @@ pub struct DockerMount {
 
 impl Default for DockerConfig {
     fn default() -> Self {
-        DockerConfig {
+        Self {
             image: "alpine:latest".to_string(),
             memory_limit: 256 * 1024 * 1024, // 256 MB
             cpu_quota: 1.0,
@@ -330,7 +353,7 @@ pub struct SandboxConfig {
 
 impl Default for SandboxConfig {
     fn default() -> Self {
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::default(),
             timeout_ms: 30000, // 30 seconds
             allow_read: vec![],
@@ -348,8 +371,9 @@ impl SandboxConfig {
     ///
     /// Only enables timeout protection. No filesystem or network restrictions.
     /// Suitable for: Local development, trusted environments only.
+    #[must_use]
     pub fn development() -> Self {
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::Timeout,
             timeout_ms: 60000,                    // 60 seconds
             allow_read: vec![],                   // No restrictions via sandbox
@@ -369,18 +393,20 @@ impl SandboxConfig {
     ///
     /// Uses timeout + restricted backend with safe defaults.
     /// Suitable for: Production use with bundled tools and skills.
+    #[must_use]
     pub fn standard() -> Self {
-        SandboxConfig::default()
+        Self::default()
     }
 
     /// Strict configuration - maximum security
     ///
     /// Uses bubblewrap containerization with minimal permissions.
     /// Suitable for: Running untrusted code, production WASM execution.
+    #[must_use]
     pub fn strict() -> Self {
         let docker_config = DockerConfig::default();
 
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::Bubblewrap,
             timeout_ms: 10000,                   // 10 seconds
             allow_read: vec![],                  // No filesystem access by default
@@ -398,8 +424,9 @@ impl SandboxConfig {
     /// This is the most secure option for least trusted tools.
     /// Suitable for: Running untrusted code, code from unknown sources,
     /// or when bubblewrap is not available.
+    #[must_use]
     pub fn isolated() -> Self {
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::Docker,
             timeout_ms: 10000,                   // 10 seconds
             allow_read: vec![],                  // No filesystem access by default
@@ -422,8 +449,9 @@ impl SandboxConfig {
     ///
     /// Allows network access with other restrictions in place.
     /// Suitable for: Web search, API clients, fetch tools.
+    #[must_use]
     pub fn network() -> Self {
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::Restricted,
             timeout_ms: 30000,                   // 30 seconds
             allow_read: vec![],                  // Minimal read access
@@ -442,10 +470,11 @@ impl SandboxConfig {
     ///
     /// Allows controlled filesystem access with other restrictions.
     /// Suitable for: File editors, code generators, data processors.
+    #[must_use]
     pub fn filesystem(read_paths: Vec<PathBuf>, write_paths: Vec<PathBuf>) -> Self {
         let docker_config = DockerConfig::default();
 
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::Restricted,
             timeout_ms: 30000,                   // 30 seconds
             allow_read: read_paths,              // Specified read paths
@@ -461,10 +490,11 @@ impl SandboxConfig {
     ///
     /// Optimized for WebAssembly module execution.
     /// Suitable for: Running .wasm bundled tools with resource limits.
+    #[must_use]
     pub fn wasm_optimized() -> Self {
         let docker_config = DockerConfig::default();
 
-        SandboxConfig {
+        Self {
             backend: SandboxBackend::Wasm,
             timeout_ms: 30000,                   // 30 seconds
             allow_read: vec![],                  // Controlled by WASI preopens
@@ -478,11 +508,12 @@ impl SandboxConfig {
 
     /// Merge with override configuration
     ///
-    /// Returns a new SandboxConfig with overrides applied.
+    /// Returns a new `SandboxConfig` with overrides applied.
     /// Override values take precedence over base configuration.
     ///
     /// This method handles presets - if the override specifies a preset,
     /// it starts from the preset configuration and applies individual overrides.
+    #[must_use]
     pub fn with_override(&self, override_config: &SandboxConfigOverride) -> Self {
         override_config.resolve(self)
     }
@@ -495,6 +526,7 @@ impl SandboxConfig {
     /// 3. Tool override (if provided)
     ///
     /// Each override can specify a preset and/or individual field overrides.
+    #[must_use]
     pub fn for_tool(
         &self,
         tool_override: Option<&SandboxConfigOverride>,
@@ -533,11 +565,14 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Create a new sandbox with the given configuration
-    pub fn new(config: SandboxConfig) -> Self {
-        Sandbox { config }
+    #[must_use]
+    pub const fn new(config: SandboxConfig) -> Self {
+        Self { config }
     }
 
     /// Execute a command in the sandbox
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn execute(
         &self,
         program: &str,
@@ -621,7 +656,7 @@ impl Sandbox {
             }
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = elapsed_millis(start);
 
         Ok(SandboxResult {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -639,24 +674,26 @@ impl Sandbox {
     /// - Clean environment (no inherited env vars except PATH)
     /// - Working directory isolation (temp directory)
     /// - Network access control (via env vars, full blocking requires bubblewrap)
+    #[expect(
+        clippy::too_many_lines,
+        reason = "restricted process setup must remain ordered around the pre-exec boundary"
+    )]
     async fn execute_restricted(
         &self,
         program: &str,
         args: &[String],
         _working_dir: &Path,
-        _env_vars: &[(String, String)],
+        env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
-        use std::collections::HashSet;
-
         // Create temp sandbox directory
         let sandbox_dir = tempfile::tempdir()
-            .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create sandbox: {}", e)))?;
+            .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create sandbox: {e}")))?;
 
         // Copy allowed read files into sandbox
         for allowed_path in &self.config.allow_read {
             if allowed_path.exists() {
                 let file_name = allowed_path.file_name().ok_or_else(|| {
-                    SandboxError::InvalidConfig(format!("Invalid path: {:?}", allowed_path))
+                    SandboxError::InvalidConfig(format!("Invalid path: {}", allowed_path.display()))
                 })?;
                 let dest = sandbox_dir.path().join(file_name);
 
@@ -689,14 +726,9 @@ impl Sandbox {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            // Build minimal environment
-            let mut allowed_env = HashSet::new();
-            allowed_env.insert("PATH");
-
             // Add user-specified env vars
-            for (key, value) in _env_vars {
+            for (key, value) in env_vars {
                 cmd.env(key, value);
-                allowed_env.insert(key.as_str());
             }
 
             // Clear all environment except allowed vars
@@ -708,7 +740,7 @@ impl Sandbox {
             }
 
             // Re-add user-specified env vars
-            for (key, value) in _env_vars {
+            for (key, value) in env_vars {
                 cmd.env(key, value);
             }
 
@@ -774,7 +806,7 @@ impl Sandbox {
                 }
             };
 
-            let duration_ms = start.elapsed().as_millis() as u64;
+            let duration_ms = elapsed_millis(start);
 
             Ok(SandboxResult {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -788,7 +820,7 @@ impl Sandbox {
         #[cfg(not(unix))]
         {
             warn!("Restricted mode has limited functionality on this platform, using timeout-only");
-            self.execute_with_timeout(program, args, sandbox_dir.path(), _env_vars)
+            self.execute_with_timeout(program, args, sandbox_dir.path(), env_vars)
                 .await
         }
     }
@@ -819,7 +851,7 @@ impl Sandbox {
         env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
         // Check if bwrap is available
-        if !self.is_bubblewrap_available() {
+        if !Self::is_bubblewrap_available() {
             return Err(SandboxError::NotAvailable(
                 "bubblewrap not found. Install with: sudo apt-get install bubblewrap".to_string(),
             ));
@@ -901,8 +933,7 @@ impl Sandbox {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 return Err(SandboxError::ExecutionFailed(format!(
-                    "Bubblewrap failed: {}",
-                    e
+                    "Bubblewrap failed: {e}"
                 )))
             }
             Err(_) => {
@@ -916,7 +947,7 @@ impl Sandbox {
             }
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = elapsed_millis(start);
 
         Ok(SandboxResult {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -928,7 +959,7 @@ impl Sandbox {
     }
 
     /// Check if bubblewrap is available
-    fn is_bubblewrap_available(&self) -> bool {
+    fn is_bubblewrap_available() -> bool {
         std::process::Command::new("which")
             .arg("bwrap")
             .output()
@@ -945,33 +976,31 @@ impl Sandbox {
         program: &str,
         _args: &[String],
         _working_dir: &Path,
-        _env_vars: &[(String, String)],
+        env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
         let wasm_path = Path::new(program);
 
         // Check if file exists and has .wasm extension
         if !wasm_path.exists() {
             return Err(SandboxError::ExecutionFailed(format!(
-                "WASM file not found: {}",
-                program
+                "WASM file not found: {program}"
             )));
         }
 
         if wasm_path.extension().and_then(|e| e.to_str()) != Some("wasm") {
             return Err(SandboxError::ExecutionFailed(format!(
-                "Not a WASM file: {}",
-                program
+                "Not a WASM file: {program}"
             )));
         }
 
         // Prepare input JSON from environment variables
         // First, try to read from SKILL_ARGS_JSON or SKILL_ARGS_FILE
-        let input_json = _env_vars
+        let input_json = env_vars
             .iter()
             .find(|(k, _)| k == "SKILL_ARGS_JSON")
             .map(|(_, v)| v.clone())
             .or_else(|| {
-                _env_vars
+                env_vars
                     .iter()
                     .find(|(k, _)| k == "SKILL_ARGS_FILE")
                     .and_then(|(_, path)| std::fs::read_to_string(path).ok())
@@ -1006,6 +1035,10 @@ impl Sandbox {
     ///
     /// Creates a Docker container with the configured image and executes the command.
     /// Supports resource limits, network isolation, and volume mounts.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Docker lifecycle cleanup and result collection are kept in one ordered operation"
+    )]
     async fn execute_docker(
         &self,
         program: &str,
@@ -1014,9 +1047,8 @@ impl Sandbox {
         env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
         // Connect to Docker daemon
-        let docker = Docker::connect_with_local_defaults().map_err(|e| {
-            SandboxError::NotAvailable(format!("Failed to connect to Docker: {}", e))
-        })?;
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|e| SandboxError::NotAvailable(format!("Failed to connect to Docker: {e}")))?;
 
         info!(
             "Executing with Docker: {} {} (image: {})",
@@ -1029,7 +1061,7 @@ impl Sandbox {
         let mut cmd_parts = vec![program.to_string()];
         cmd_parts.extend(args.iter().cloned());
         let cmd_json = serde_json::to_string(&cmd_parts).map_err(|e| {
-            SandboxError::InvalidConfig(format!("Failed to serialize command: {}", e))
+            SandboxError::InvalidConfig(format!("Failed to serialize command: {e}"))
         })?;
 
         // Prepare environment variables for the container
@@ -1046,7 +1078,7 @@ impl Sandbox {
         // Convert env vars to Docker format: "KEY=VALUE"
         let env_list: Vec<String> = container_env
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect();
 
         // Build volume mounts from allow_read and allow_write
@@ -1114,11 +1146,7 @@ impl Sandbox {
         };
 
         // Convert timeout to nanoseconds for Docker
-        let nano_cpus = if self.config.docker.cpu_quota > 0.0 {
-            Some((self.config.docker.cpu_quota * 1_000_000_000.0) as i64)
-        } else {
-            None
-        };
+        let nano_cpus = cpu_quota_to_nano_cpus(self.config.docker.cpu_quota)?;
 
         let memory = if self.config.docker.memory_limit > 0 {
             Some(self.config.docker.memory_limit)
@@ -1169,7 +1197,7 @@ impl Sandbox {
             .create_container(Some(create_opts), config)
             .await
             .map_err(|e| {
-                SandboxError::ExecutionFailed(format!("Failed to create container: {}", e))
+                SandboxError::ExecutionFailed(format!("Failed to create container: {e}"))
             })?;
 
         let container_id = container.id;
@@ -1180,7 +1208,7 @@ impl Sandbox {
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await
             .map_err(|e| {
-                SandboxError::ExecutionFailed(format!("Failed to start container: {}", e))
+                SandboxError::ExecutionFailed(format!("Failed to start container: {e}"))
             })?;
 
         let start = std::time::Instant::now();
@@ -1198,7 +1226,7 @@ impl Sandbox {
         })
         .await;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = elapsed_millis(start);
 
         // Check if timed out
         let timed_out = wait_result.is_err();
@@ -1257,7 +1285,7 @@ impl Sandbox {
                 Ok(inspect) => inspect
                     .state
                     .and_then(|s| s.exit_code)
-                    .map(|code| code as i32),
+                    .and_then(|code| i32::try_from(code).ok()),
                 Err(e) => {
                     error!("Failed to inspect container: {}", e);
                     None
@@ -1280,13 +1308,9 @@ impl Sandbox {
     }
 
     /// Check if Docker is available
+    #[must_use]
     pub fn is_docker_available() -> bool {
-        match Docker::connect_with_local_defaults() {
-            Ok(docker) => {
-                // Try to ping Docker to verify connection
-                futures::executor::block_on(async { docker.ping().await.is_ok() })
-            }
-            Err(_) => false,
-        }
+        Docker::connect_with_local_defaults()
+            .is_ok_and(|docker| futures::executor::block_on(async { docker.ping().await.is_ok() }))
     }
 }

@@ -45,9 +45,9 @@ impl FromStr for ConsentLevel {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
-            "user_confirmed" => ConsentLevel::UserConfirmed,
-            "admin_confirmed" => ConsentLevel::AdminConfirmed,
-            _ => ConsentLevel::None,
+            "user_confirmed" => Self::UserConfirmed,
+            "admin_confirmed" => Self::AdminConfirmed,
+            _ => Self::None,
         })
     }
 }
@@ -55,9 +55,9 @@ impl FromStr for ConsentLevel {
 impl std::fmt::Display for ConsentLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConsentLevel::None => write!(f, "none"),
-            ConsentLevel::UserConfirmed => write!(f, "user_confirmed"),
-            ConsentLevel::AdminConfirmed => write!(f, "admin_confirmed"),
+            Self::None => write!(f, "none"),
+            Self::UserConfirmed => write!(f, "user_confirmed"),
+            Self::AdminConfirmed => write!(f, "admin_confirmed"),
         }
     }
 }
@@ -102,17 +102,17 @@ fn default_risk() -> String {
     "unknown".to_string()
 }
 
-fn default_max_calls() -> usize {
+const fn default_max_calls() -> usize {
     30
 }
 
-fn default_max_exec_ms() -> u64 {
-    120000
+const fn default_max_exec_ms() -> u64 {
+    120_000
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        PolicyConfig {
+        Self {
             default_risk: default_risk(),
             require_consent_for: vec![
                 "writes".to_string(),
@@ -138,24 +138,27 @@ pub struct AuthorizationResult {
 }
 
 impl AuthorizationResult {
+    #[must_use]
     pub fn allow() -> Self {
-        AuthorizationResult {
+        Self {
             allowed: true,
             reason: "Authorized".to_string(),
             required_consent: None,
         }
     }
 
-    pub fn deny(reason: String) -> Self {
-        AuthorizationResult {
+    #[must_use]
+    pub const fn deny(reason: String) -> Self {
+        Self {
             allowed: false,
             reason,
             required_consent: None,
         }
     }
 
-    pub fn deny_with_consent(reason: String, required: ConsentLevel) -> Self {
-        AuthorizationResult {
+    #[must_use]
+    pub const fn deny_with_consent(reason: String, required: ConsentLevel) -> Self {
+        Self {
             allowed: false,
             reason,
             required_consent: Some(required),
@@ -175,6 +178,8 @@ pub struct PolicyEngine {
 
 impl PolicyEngine {
     /// Create new policy engine from config
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn new(config: PolicyConfig) -> Result<Self> {
         let consent_required_tiers: HashSet<RiskTier> = config
             .require_consent_for
@@ -197,7 +202,7 @@ impl PolicyEngine {
             .filter_map(|p| Pattern::new(p).ok())
             .collect();
 
-        Ok(PolicyEngine {
+        Ok(Self {
             config,
             consent_required_tiers,
             trusted_servers,
@@ -208,6 +213,7 @@ impl PolicyEngine {
     }
 
     /// Create permissive policy engine (for testing)
+    #[must_use]
     pub fn new_permissive() -> Self {
         let config = PolicyConfig {
             default_risk: "read_only".to_string(),
@@ -215,15 +221,28 @@ impl PolicyEngine {
             trusted_servers: vec!["*".to_string()],
             deny_tags: vec![],
             max_calls_per_skill: 100,
-            max_exec_ms: 300000,
+            max_exec_ms: 300_000,
             allow_patterns: vec!["*".to_string()],
             deny_patterns: vec![],
         };
 
-        PolicyEngine::new(config).unwrap()
+        Self {
+            consent_required_tiers: HashSet::new(),
+            trusted_servers: HashSet::from(["*".to_string()]),
+            deny_tags: HashSet::new(),
+            allow_patterns: Pattern::new("*").into_iter().collect(),
+            deny_patterns: Vec::new(),
+            config,
+        }
     }
 
     /// Authorize a callable for execution
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
+    #[expect(
+        clippy::unused_async,
+        reason = "authorization is async to preserve the public execution interface"
+    )]
     pub async fn authorize(
         &self,
         callable: &CallableRecord,
@@ -237,8 +256,7 @@ impl PolicyEngine {
             if self.deny_tags.contains(tag) {
                 warn!("Callable denied due to tag: {}", tag);
                 return Ok(AuthorizationResult::deny(format!(
-                    "Callable has denied tag: {}",
-                    tag
+                    "Callable has denied tag: {tag}"
                 )));
             }
         }
@@ -277,8 +295,7 @@ impl PolicyEngine {
             {
                 warn!("Server not trusted: {}", server);
                 return Ok(AuthorizationResult::deny(format!(
-                    "Server not in trusted list: {}",
-                    server
+                    "Server not in trusted list: {server}"
                 )));
             }
         }
@@ -287,8 +304,7 @@ impl PolicyEngine {
         if self.consent_required_tiers.contains(&callable.risk_tier) {
             let required_consent = match callable.risk_tier {
                 RiskTier::Admin => ConsentLevel::AdminConfirmed,
-                RiskTier::Destructive => ConsentLevel::UserConfirmed,
-                RiskTier::Writes => ConsentLevel::UserConfirmed,
+                RiskTier::Destructive | RiskTier::Writes => ConsentLevel::UserConfirmed,
                 _ => ConsentLevel::None,
             };
 
@@ -312,6 +328,8 @@ impl PolicyEngine {
     }
 
     /// Check if execution time is within limits
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub fn check_timeout(&self, requested_ms: Option<u64>) -> Result<u64> {
         let timeout = requested_ms.unwrap_or(self.config.max_exec_ms);
         if timeout > self.config.max_exec_ms {
@@ -324,11 +342,13 @@ impl PolicyEngine {
     }
 
     /// Get max calls per skill
-    pub fn max_calls_per_skill(&self) -> usize {
+    #[must_use]
+    pub const fn max_calls_per_skill(&self) -> usize {
         self.config.max_calls_per_skill
     }
 
     /// Check if a server is trusted
+    #[must_use]
     pub fn is_server_trusted(&self, server: &str) -> bool {
         self.trusted_servers.contains(server) || self.trusted_servers.contains("*")
     }

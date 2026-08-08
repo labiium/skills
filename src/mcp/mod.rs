@@ -88,33 +88,38 @@ fn default_kind() -> String {
     "any".to_string()
 }
 
-fn default_limit() -> usize {
+const fn default_limit() -> usize {
     10
 }
 
-/// Custom schema for JsonValue fields - accepts any JSON value
+fn schema_from_object(value: JsonValue) -> schemars::Schema {
+    match value {
+        JsonValue::Object(map) => map.into(),
+        _ => schemars::Schema::default(),
+    }
+}
+
+/// Custom schema for `JsonValue` fields - accepts any JSON value
 fn json_value_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({})).unwrap()
+    schema_from_object(serde_json::json!({}))
 }
 
 /// Custom schema for Vec<JsonValue> fields - array of any JSON values
 fn json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({
+    schema_from_object(serde_json::json!({
         "type": "array",
         "items": {}
     }))
-    .unwrap()
 }
 
 fn optional_json_value_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({
+    schema_from_object(serde_json::json!({
         "anyOf": [{}, { "type": "null" }]
     }))
-    .unwrap()
 }
 
 fn optional_json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({
+    schema_from_object(serde_json::json!({
         "anyOf": [
             {
                 "type": "array",
@@ -123,20 +128,18 @@ fn optional_json_value_vec_schema(_gen: &mut schemars::SchemaGenerator) -> schem
             { "type": "null" }
         ]
     }))
-    .unwrap()
 }
 
 fn non_negative_int_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({
+    schema_from_object(serde_json::json!({
         "type": "integer",
         "minimum": 0
     }))
-    .unwrap()
 }
 
-/// Schema for bundled_files: array of [filename, content] tuples (or null).
+/// Schema for `bundled_files`: array of [filename, content] tuples (or null).
 fn bundled_files_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({
+    schema_from_object(serde_json::json!({
         "anyOf": [
             {
                 "type": "array",
@@ -150,7 +153,6 @@ fn bundled_files_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schem
             { "type": "null" }
         ]
     }))
-    .unwrap()
 }
 
 /// Output schema for search
@@ -179,11 +181,11 @@ fn default_format() -> String {
     "both".to_string()
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_max_bytes() -> usize {
+const fn default_max_bytes() -> usize {
     50000
 }
 
@@ -303,7 +305,7 @@ pub struct TraceArgs {
     pub include_steps: bool,
 }
 
-/// Response from exec. Exactly one or more sections may be present depending on describe/dry_run/execution mode.
+/// Response from exec. Exactly one or more sections may be present depending on `describe/dry_run/execution` mode.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecResponse {
     pub mode: String,
@@ -342,6 +344,7 @@ pub struct ExecOutput {
 }
 
 impl SkillsServer {
+    #[must_use]
     pub fn new(
         registry: Arc<Registry>,
         search_engine: Arc<SearchEngine>,
@@ -349,7 +352,7 @@ impl SkillsServer {
         runtime: Arc<Runtime>,
         skill_store: Arc<SkillStore>,
     ) -> Self {
-        SkillsServer {
+        Self {
             registry,
             search_engine,
             policy_engine,
@@ -360,6 +363,7 @@ impl SkillsServer {
         }
     }
 
+    #[must_use]
     pub fn with_upstream_manager(
         mut self,
         upstream_manager: Arc<crate::execution::upstream::UpstreamManager>,
@@ -368,6 +372,7 @@ impl SkillsServer {
         self
     }
 
+    #[must_use]
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_router
             .list_all()
@@ -407,23 +412,27 @@ impl SkillsServer {
                 if let Some(subtree) = schema.pointer(pointer) {
                     schema = subtree.clone();
                 } else {
-                    return Err(format!("Invalid JSON pointer: {}", pointer));
+                    return Err(format!("Invalid JSON pointer: {pointer}"));
                 }
             }
 
             output.input_schema = Some(schema);
 
             if describe.include_output_schema {
-                output.output_schema = record.output_schema.clone();
+                output.output_schema.clone_from(&record.output_schema);
             }
         }
 
         if format == "signature" || format == "both" {
             let signature = crate::core::CallableSignature::from_schema(&record.input_schema);
-            output.signature = Some(serde_json::to_value(signature).unwrap());
+            output.signature = Some(
+                serde_json::to_value(signature)
+                    .map_err(|error| format!("Failed to serialize signature: {error}"))?,
+            );
         }
 
-        let output_str = serde_json::to_string(&output).unwrap();
+        let output_str = serde_json::to_string(&output)
+            .map_err(|error| format!("Failed to serialize description: {error}"))?;
         if output_str.len() > describe.max_bytes {
             return Err(format!(
                 "Response exceeds max_bytes limit: {} > {}",
@@ -439,10 +448,10 @@ impl SkillsServer {
         result: crate::core::ToolResult,
         record: &crate::core::CallableRecord,
         trace: Option<&TraceArgs>,
-    ) -> ExecOutput {
-        let include_route = trace.map(|t| t.include_route).unwrap_or(false);
-        let include_timing = trace.map(|t| t.include_timing).unwrap_or(false);
-        let include_steps = trace.map(|t| t.include_steps).unwrap_or(false);
+    ) -> Result<ExecOutput, String> {
+        let include_route = trace.is_some_and(|t| t.include_route);
+        let include_timing = trace.is_some_and(|t| t.include_timing);
+        let include_steps = trace.is_some_and(|t| t.include_steps);
 
         let trace_value = result
             .structured_content
@@ -468,20 +477,25 @@ impl SkillsServer {
             })
             .flatten();
 
-        ExecOutput {
+        Ok(ExecOutput {
             content: result
                 .content
                 .into_iter()
-                .map(|content| serde_json::to_value(content).unwrap())
-                .collect(),
+                .map(|content| {
+                    serde_json::to_value(content)
+                        .map_err(|error| format!("Failed to serialize tool content: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             structured_content: result.structured_content,
             is_error: result.is_error,
             route: include_route.then(|| record.fq_name.clone()),
             timing,
             steps,
-        }
+        })
     }
 
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn exec_callable(&self, input: ExecInput) -> Result<ExecResponse, String> {
         debug!("exec called for: {}", input.id);
 
@@ -491,7 +505,7 @@ impl SkillsServer {
         let record = self
             .registry
             .get(&callable_id)
-            .ok_or_else(|| format!("Callable not found: {}", callable_id))?;
+            .ok_or_else(|| format!("Callable not found: {callable_id}"))?;
 
         if input.describe {
             let describe = DescribeOptions {
@@ -513,24 +527,23 @@ impl SkillsServer {
 
         self.runtime
             .validate_callable_arguments(&callable_id, &input.arguments)
-            .map_err(|e| format!("Validation failed: {}", e))?;
+            .map_err(|e| format!("Validation failed: {e}"))?;
 
         let consent_level = input
             .consent
             .as_ref()
             .and_then(|c| c.level.as_deref())
-            .map(|s| match s {
+            .map_or(ConsentLevel::None, |s| match s {
                 "user_confirmed" => ConsentLevel::UserConfirmed,
                 "admin_confirmed" => ConsentLevel::AdminConfirmed,
                 _ => ConsentLevel::None,
-            })
-            .unwrap_or(ConsentLevel::None);
+            });
 
         let policy_result = self
             .policy_engine
             .authorize(&record, &input.arguments, consent_level)
             .await
-            .map_err(|e| format!("Policy check failed: {}", e))?;
+            .map_err(|e| format!("Policy check failed: {e}"))?;
 
         if !policy_result.allowed {
             warn!("Execution denied: {}", policy_result.reason);
@@ -554,8 +567,7 @@ impl SkillsServer {
         let trace_enabled = input
             .trace
             .as_ref()
-            .map(|t| t.include_route || t.include_timing || t.include_steps)
-            .unwrap_or(false);
+            .is_some_and(|t| t.include_route || t.include_timing || t.include_steps);
 
         let ctx = ExecContext {
             callable_id: callable_id.clone(),
@@ -568,7 +580,7 @@ impl SkillsServer {
             .runtime
             .execute(ctx)
             .await
-            .map_err(|e| format!("Execution failed: {}", e))?;
+            .map_err(|e| format!("Execution failed: {e}"))?;
 
         info!("exec completed for {}", record.fq_name);
 
@@ -581,7 +593,7 @@ impl SkillsServer {
                 result,
                 &record,
                 input.trace.as_ref(),
-            )),
+            )?),
         })
     }
 }
@@ -613,16 +625,20 @@ impl SkillsServer {
             .search_engine
             .search(&query)
             .await
-            .map_err(|e| format!("Search failed: {}", e))?;
+            .map_err(|e| format!("Search failed: {e}"))?;
 
         let stats = self.registry.stats();
 
+        let matches = results
+            .matches
+            .into_iter()
+            .map(|search_match| {
+                serde_json::to_value(search_match)
+                    .map_err(|error| format!("Failed to serialize search result: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let output = SearchOutput {
-            matches: results
-                .matches
-                .into_iter()
-                .map(|m| serde_json::to_value(m).unwrap())
-                .collect(),
+            matches,
             next_cursor: results.next_cursor,
             stats: SearchStats {
                 total_callables: stats.total_callables,
@@ -639,7 +655,7 @@ impl SkillsServer {
     }
 
     /// Describe, validate, or execute a callable with policy enforcement.
-    /// Use describe for schema/signature details, dry_run to validate without execution.
+    /// Use describe for schema/signature details, `dry_run` to validate without execution.
     #[tool(
         name = "exec",
         description = "Describe, validate, or execute a callable with policy enforcement. Set describe for schema/signature details or dry_run to validate without execution."
@@ -691,7 +707,7 @@ impl SkillsServer {
                     .skill_store
                     .create_skill(request)
                     .await
-                    .map_err(|e| format!("Failed to create skill: {}", e))?;
+                    .map_err(|e| format!("Failed to create skill: {e}"))?;
 
                 info!("Created skill: {} ({})", name, id.as_str());
 
@@ -725,7 +741,7 @@ impl SkillsServer {
                     let file_content = self
                         .skill_store
                         .load_skill_file(&skill_name, &filename)
-                        .map_err(|e| format!("Failed to load file: {}", e))?;
+                        .map_err(|e| format!("Failed to load file: {e}"))?;
                     return Ok(Json(ManageOutput {
                         operation: "get".to_string(),
                         skill_id: Some(skill_id),
@@ -738,36 +754,35 @@ impl SkillsServer {
                 let content = self
                     .skill_store
                     .load_skill_content(&skill_name)
-                    .map_err(|e| format!("Failed to load skill content: {}", e))?;
+                    .map_err(|e| format!("Failed to load skill content: {e}"))?;
 
-                let mut response = format!("# Skill: {}\n\n", skill_id);
+                let mut response = format!("# Skill: {skill_id}\n\n");
                 response.push_str(&content.skill_md);
                 response.push_str("\n\n---\n\n");
                 response.push_str("## Metadata\n\n");
-                response.push_str(&format!(
-                    "- Uses tools: {}\n",
-                    content.uses_tools.join(", ")
-                ));
-                response.push_str(&format!(
-                    "- Bundled tools: {}\n",
-                    content
+                response.push_str("- Uses tools: ");
+                response.push_str(&content.uses_tools.join(", "));
+                response.push('\n');
+                response.push_str("- Bundled tools: ");
+                response.push_str(
+                    &content
                         .bundled_tools
                         .iter()
-                        .map(|t| t.name.as_str())
+                        .map(|tool| tool.name.as_str())
                         .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                response.push_str(&format!(
-                    "- Additional files: {}\n",
-                    content.additional_files.join(", ")
-                ));
+                        .join(", "),
+                );
+                response.push('\n');
+                response.push_str("- Additional files: ");
+                response.push_str(&content.additional_files.join(", "));
+                response.push('\n');
 
                 info!("Returned content for skill: {}", skill_id);
 
                 Ok(Json(ManageOutput {
                     operation: "get".to_string(),
-                    skill_id: Some(skill_id.clone()),
-                    name: Some(skill_name.clone()),
+                    skill_id: Some(skill_id),
+                    name: Some(skill_name),
                     message: response,
                     data: Some(serde_json::json!({
                         "uses_tools": content.uses_tools,
@@ -816,7 +831,7 @@ impl SkillsServer {
                     .skill_store
                     .update_skill(&skill_name, request)
                     .await
-                    .map_err(|e| format!("Failed to update skill: {}", e))?;
+                    .map_err(|e| format!("Failed to update skill: {e}"))?;
 
                 info!("Updated skill: {} ({})", skill_id, id.as_str());
 
@@ -846,7 +861,7 @@ impl SkillsServer {
 
                 self.skill_store
                     .delete_skill(&skill_name)
-                    .map_err(|e| format!("Failed to delete skill: {}", e))?;
+                    .map_err(|e| format!("Failed to delete skill: {e}"))?;
 
                 info!("Deleted skill: {}", skill_id);
 
@@ -854,7 +869,7 @@ impl SkillsServer {
                     operation: "delete".to_string(),
                     skill_id: Some(skill_id.clone()),
                     name: Some(skill_name),
-                    message: format!("Skill {} deleted successfully", skill_id),
+                    message: format!("Skill {skill_id} deleted successfully"),
                     data: None,
                 }))
             }
@@ -871,7 +886,7 @@ impl SkillsServer {
                     "stdio" => crate::execution::upstream::Transport::Stdio,
                     "http" => crate::execution::upstream::Transport::Http,
                     "http_sse" | "http+sse" => crate::execution::upstream::Transport::HttpSse,
-                    _ => return Err(format!("Invalid transport type: {}", transport_str)),
+                    _ => return Err(format!("Invalid transport type: {transport_str}")),
                 };
 
                 let config = crate::execution::upstream::UpstreamConfig {
@@ -893,18 +908,12 @@ impl SkillsServer {
                     upstream_manager
                         .add_upstream(config)
                         .await
-                        .map_err(|e| format!("Failed to add upstream: {}", e))?;
+                        .map_err(|e| format!("Failed to add upstream: {e}"))?;
 
                     if input.test_connection {
-                        format!(
-                            "Upstream MCP server '{}' added and connected successfully",
-                            alias
-                        )
+                        format!("Upstream MCP server '{alias}' added and connected successfully")
                     } else {
-                        format!(
-                            "Upstream MCP server '{}' added (connection test skipped)",
-                            alias
-                        )
+                        format!("Upstream MCP server '{alias}' added (connection test skipped)")
                     }
                 } else {
                     return Err("Upstream manager not available".to_string());
@@ -930,7 +939,7 @@ impl SkillsServer {
                     upstream_manager
                         .disconnect(&alias)
                         .await
-                        .map_err(|e| format!("Failed to remove upstream: {}", e))?;
+                        .map_err(|e| format!("Failed to remove upstream: {e}"))?;
                 } else {
                     return Err("Upstream manager not available".to_string());
                 }
@@ -941,7 +950,7 @@ impl SkillsServer {
                     operation: "remove_upstream".to_string(),
                     skill_id: None,
                     name: Some(alias.clone()),
-                    message: format!("Upstream MCP server '{}' removed successfully", alias),
+                    message: format!("Upstream MCP server '{alias}' removed successfully"),
                     data: None,
                 }))
             }
@@ -983,7 +992,7 @@ impl SkillsServer {
                     let current = upstream_manager
                         .get_config(&alias)
                         .await
-                        .ok_or(format!("Upstream '{}' not found", alias))?;
+                        .ok_or_else(|| format!("Upstream '{alias}' not found"))?;
 
                     crate::execution::upstream::UpstreamConfig {
                         alias: alias.clone(),
@@ -1015,7 +1024,7 @@ impl SkillsServer {
                     upstream_manager
                         .update_upstream(&alias, updates)
                         .await
-                        .map_err(|e| format!("Failed to update upstream: {}", e))?;
+                        .map_err(|e| format!("Failed to update upstream: {e}"))?;
                 }
 
                 info!("Updated upstream: {}", alias);
@@ -1024,7 +1033,7 @@ impl SkillsServer {
                     operation: "update_upstream".to_string(),
                     skill_id: None,
                     name: Some(alias.clone()),
-                    message: format!("Upstream MCP server '{}' updated successfully", alias),
+                    message: format!("Upstream MCP server '{alias}' updated successfully"),
                     data: Some(serde_json::json!({ "alias": alias })),
                 }))
             }
@@ -1126,7 +1135,7 @@ pub enum ManageOperation {
 /// Unified input for skill management operations
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ManageInput {
-    /// Operation to perform: create, get, update, delete, add_upstream, remove_upstream, list_upstreams
+    /// Operation to perform: create, get, update, delete, `add_upstream`, `remove_upstream`, `list_upstreams`
     pub operation: ManageOperation,
     /// Skill ID (required for get, update, delete; optional for create)
     #[serde(default)]
@@ -1164,10 +1173,10 @@ pub struct ManageInput {
     /// Specific filename to load when getting content (optional)
     #[serde(default)]
     pub filename: Option<String>,
-    /// Upstream alias (required for add_upstream, remove_upstream)
+    /// Upstream alias (required for `add_upstream`, `remove_upstream`)
     #[serde(default)]
     pub upstream_alias: Option<String>,
-    /// Transport type for upstream: stdio, http, http_sse (required for add_upstream)
+    /// Transport type for upstream: stdio, http, `http_sse` (required for `add_upstream`)
     #[serde(default)]
     pub transport: Option<String>,
     /// URL for HTTP transport (required for http transport)
@@ -1206,7 +1215,7 @@ pub struct ManageOutput {
 impl ServerHandler for SkillsServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            protocol_version: Default::default(),
+            protocol_version: rmcp::model::ProtocolVersion::default(),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
                 name: "skillsrs".to_string(),

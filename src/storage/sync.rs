@@ -49,6 +49,8 @@ pub struct AgentSkillsSync {
 
 impl AgentSkillsSync {
     /// Create a new synchronizer
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn new(skills_root: impl AsRef<Path>) -> Result<Self> {
         let skills_root = skills_root.as_ref().to_path_buf();
         let metadata_path = skills_root.join(".agent-skills-sync.json");
@@ -69,11 +71,13 @@ impl AgentSkillsSync {
     }
 
     /// Sync all Agent Skills repositories from config
+    /// # Errors
+    /// Returns an error if the operation cannot be completed.
     pub async fn sync_all(&mut self, repos: &[AgentSkillsRepoConfig]) -> Result<SyncReport> {
         let mut report = SyncReport::default();
 
         // Get current repo aliases from config
-        let config_aliases: HashSet<String> = repos.iter().map(|r| self.repo_alias(r)).collect();
+        let config_aliases: HashSet<String> = repos.iter().map(Self::repo_alias).collect();
 
         // Find repos that were removed from config
         let removed_aliases: Vec<String> = self
@@ -91,13 +95,13 @@ impl AgentSkillsSync {
                     let skill_path = self.skills_root.join(skill_name);
                     if skill_path.exists() {
                         match tokio::fs::remove_dir_all(&skill_path).await {
-                            Ok(_) => {
+                            Ok(()) => {
                                 report.removed.push(skill_name.clone());
                                 info!("Removed skill: {}", skill_name);
                             }
                             Err(e) => {
                                 warn!("Failed to remove skill {}: {}", skill_name, e);
-                                report.errors.push(format!("Remove {}: {}", skill_name, e));
+                                report.errors.push(format!("Remove {skill_name}: {e}"));
                             }
                         }
                     }
@@ -108,7 +112,7 @@ impl AgentSkillsSync {
 
         // Sync each configured repo
         for repo_config in repos {
-            let alias = self.repo_alias(repo_config);
+            let alias = Self::repo_alias(repo_config);
             info!(
                 "Syncing Agent Skills from: {} ({})",
                 repo_config.repo, alias
@@ -132,6 +136,10 @@ impl AgentSkillsSync {
     }
 
     /// Sync a single repository
+    #[expect(
+        clippy::too_many_lines,
+        reason = "repository synchronization is a single transactional workflow"
+    )]
     async fn sync_repo(
         &mut self,
         config: &AgentSkillsRepoConfig,
@@ -156,7 +164,7 @@ impl AgentSkillsSync {
         };
 
         // Check if already synced with same commit
-        let needs_sync = if let Some(meta) = self.metadata.get(alias) {
+        let needs_sync = self.metadata.get(alias).map_or(true, |meta| {
             // Check if config changed (different git_ref or skill filter)
             meta.git_ref != config.git_ref || {
                 match (&config.skills, !meta.synced_skills.is_empty()) {
@@ -169,9 +177,7 @@ impl AgentSkillsSync {
                     _ => false,
                 }
             }
-        } else {
-            true
-        };
+        });
 
         if !needs_sync {
             debug!("Repo {} already up-to-date", alias);
@@ -218,11 +224,9 @@ impl AgentSkillsSync {
             discovered_skills
                 .into_iter()
                 .filter(|path| {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        skill_filter.contains(&name.to_string())
-                    } else {
-                        false
-                    }
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| skill_filter.iter().any(|skill| skill == name))
                 })
                 .collect()
         } else {
@@ -240,8 +244,7 @@ impl AgentSkillsSync {
                 if !skills_to_import.iter().any(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| n == old_skill)
-                        .unwrap_or(false)
+                        .is_some_and(|n| n == old_skill)
                 }) {
                     let skill_path = self.skills_root.join(old_skill);
                     if skill_path.exists() {
@@ -279,7 +282,7 @@ impl AgentSkillsSync {
                 }
                 Err(e) => {
                     warn!("Failed to parse skill {}: {}", skill_name, e);
-                    report.errors.push(format!("{}: {}", skill_name, e));
+                    report.errors.push(format!("{skill_name}: {e}"));
                 }
             }
         }
@@ -298,18 +301,17 @@ impl AgentSkillsSync {
     }
 
     /// Generate a unique alias for a repo
-    fn repo_alias(&self, config: &AgentSkillsRepoConfig) -> String {
+    fn repo_alias(config: &AgentSkillsRepoConfig) -> String {
         if let Some(ref alias) = config.alias {
             return alias.clone();
         }
 
         // Generate from repo URL
         let repo = &config.repo;
-        if let Some(last) = repo.split('/').next_back() {
-            last.trim_end_matches(".git").to_string()
-        } else {
-            repo.replace(['/', ':'], "-")
-        }
+        repo.split('/').next_back().map_or_else(
+            || repo.replace(['/', ':'], "-"),
+            |last| last.trim_end_matches(".git").to_string(),
+        )
     }
 
     /// Get current commit SHA from a cloned repo
@@ -389,13 +391,14 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
-    pub fn merge(&mut self, other: SyncReport) {
+    pub fn merge(&mut self, other: Self) {
         self.added.extend(other.added);
         self.updated.extend(other.updated);
         self.removed.extend(other.removed);
         self.errors.extend(other.errors);
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.updated.is_empty()
@@ -403,7 +406,11 @@ impl SyncReport {
             && self.errors.is_empty()
     }
 
+    #[must_use]
     pub fn total_changes(&self) -> usize {
-        self.added.len() + self.updated.len() + self.removed.len()
+        self.added
+            .len()
+            .saturating_add(self.updated.len())
+            .saturating_add(self.removed.len())
     }
 }

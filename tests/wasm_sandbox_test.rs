@@ -3,8 +3,8 @@
 //! Comprehensive tests covering:
 //! - WASM sandbox creation and execution
 //! - Sandbox configuration (default, override, per-tool/server)
-//! - UpstreamConfig with sandbox_config
-//! - CallableRecord with sandbox_config
+//! - `UpstreamConfig` with `sandbox_config`
+//! - `CallableRecord` with `sandbox_config`
 //! - Integration tests
 
 use skillsrs::core::registry::Registry;
@@ -25,6 +25,10 @@ use std::sync::Arc;
 // ============================================================================
 
 /// Create a test tool record for use in tests
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
     let schema = serde_json::json!({
         "type": "object",
@@ -37,9 +41,9 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
     let id = CallableId::tool(server, name, digest.as_str());
 
     CallableRecord {
-        id: id.clone(),
+        id,
         kind: CallableKind::Tool,
-        fq_name: format!("{}.{}", server, name),
+        fq_name: format!("{server}.{name}"),
         name: name.to_string(),
         title: Some("Test Tool".to_string()),
         description: Some("A test tool".to_string()),
@@ -62,6 +66,10 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
 }
 
 /// Create a test skill record with bundled tool
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn create_test_skill_with_bundled_tool(name: &str, tool_name: &str) -> CallableRecord {
     let schema = serde_json::json!({
         "type": "object",
@@ -80,7 +88,7 @@ fn create_test_skill_with_bundled_tool(name: &str, tool_name: &str) -> CallableR
     };
 
     CallableRecord {
-        id: id.clone(),
+        id,
         kind: CallableKind::Skill,
         fq_name: name.to_string(),
         name: name.to_string(),
@@ -116,6 +124,10 @@ fn create_wasm_test_module_path() -> PathBuf {
 // ============================================================================
 
 #[tokio::test]
+#[expect(
+    clippy::panic,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_wasm_sandbox_basic() {
     // Test WASM sandbox creation
     let config = SandboxConfig {
@@ -258,7 +270,7 @@ fn test_sandbox_config_with_full_override() {
     let base = SandboxConfig::default();
     let override_config = SandboxConfigOverride {
         preset: None,
-        timeout_ms: Some(120000),
+        timeout_ms: Some(120_000),
         backend: Some(SandboxBackend::Restricted),
         allow_network: Some(true),
         max_memory_bytes: Some(1024 * 1024 * 1024), // 1 GB
@@ -269,7 +281,7 @@ fn test_sandbox_config_with_full_override() {
 
     let merged = base.with_override(&override_config);
 
-    assert_eq!(merged.timeout_ms, 120000);
+    assert_eq!(merged.timeout_ms, 120_000);
     assert_eq!(merged.backend, SandboxBackend::Restricted);
     assert!(merged.allow_network);
     assert_eq!(merged.max_memory_bytes, 1024 * 1024 * 1024);
@@ -354,7 +366,7 @@ fn test_sandbox_config_for_tool_precedence() {
 
     let tool_override = SandboxConfigOverride {
         preset: None,
-        timeout_ms: Some(120000),
+        timeout_ms: Some(120_000),
         max_memory_bytes: Some(2048 * 1024 * 1024),
         ..Default::default()
     };
@@ -362,7 +374,7 @@ fn test_sandbox_config_for_tool_precedence() {
     let merged = base.for_tool(Some(&tool_override), Some(&server_override));
 
     // Tool should take precedence for both
-    assert_eq!(merged.timeout_ms, 120000);
+    assert_eq!(merged.timeout_ms, 120_000);
     assert_eq!(merged.max_memory_bytes, 2048 * 1024 * 1024);
 }
 
@@ -371,8 +383,12 @@ fn test_sandbox_config_for_tool_precedence() {
 // ============================================================================
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_sandbox_config_override_deserialization() {
-    let yaml = r#"
+    let yaml = r"
         backend: wasm
         timeout_ms: 60000
         allow_network: true
@@ -383,20 +399,24 @@ fn test_sandbox_config_override_deserialization() {
           - /tmp/readonly
         allow_write:
           - /tmp
-    "#;
+    ";
 
     let config: SandboxConfigOverride = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(config.backend, Some(SandboxBackend::Wasm));
     assert_eq!(config.timeout_ms, Some(60000));
     assert_eq!(config.allow_network, Some(true));
-    assert_eq!(config.max_memory_bytes, Some(536870912));
+    assert_eq!(config.max_memory_bytes, Some(536_870_912));
     assert_eq!(config.max_cpu_seconds, Some(30));
     assert_eq!(config.allow_read.len(), 2);
     assert_eq!(config.allow_write.len(), 1);
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_sandbox_config_override_serialization() {
     let config = SandboxConfigOverride {
         preset: None,
@@ -422,6 +442,10 @@ fn test_sandbox_config_override_serialization() {
 // ============================================================================
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_upstream_config_with_sandbox() {
     let yaml = r#"
         alias: test-server
@@ -444,11 +468,15 @@ fn test_upstream_config_with_sandbox() {
     assert_eq!(sandbox.timeout_ms, Some(60000));
     assert_eq!(sandbox.backend, Some(SandboxBackend::Restricted));
     assert_eq!(sandbox.allow_network, Some(false));
-    assert_eq!(sandbox.max_memory_bytes, Some(536870912));
+    assert_eq!(sandbox.max_memory_bytes, Some(536_870_912));
     assert_eq!(sandbox.allow_read.len(), 1);
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_upstream_config_with_bubblewrap_sandbox() {
     let yaml = r#"
         alias: bubblewrap-server
@@ -471,13 +499,17 @@ fn test_upstream_config_with_bubblewrap_sandbox() {
     assert!(config.sandbox_config.is_some());
     let sandbox = config.sandbox_config.unwrap();
     assert_eq!(sandbox.backend, Some(SandboxBackend::Bubblewrap));
-    assert_eq!(sandbox.timeout_ms, Some(120000));
+    assert_eq!(sandbox.timeout_ms, Some(120_000));
     assert_eq!(sandbox.allow_network, Some(true));
     assert_eq!(sandbox.allow_read.len(), 2);
     assert_eq!(sandbox.allow_write.len(), 1);
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_upstream_config_with_wasm_sandbox() {
     let yaml = r#"
         alias: wasm-server
@@ -496,10 +528,14 @@ fn test_upstream_config_with_wasm_sandbox() {
     let sandbox = config.sandbox_config.unwrap();
     assert_eq!(sandbox.backend, Some(SandboxBackend::Wasm));
     assert_eq!(sandbox.timeout_ms, Some(30000));
-    assert_eq!(sandbox.max_memory_bytes, Some(268435456));
+    assert_eq!(sandbox.max_memory_bytes, Some(268_435_456));
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_upstream_config_without_sandbox() {
     let yaml = r#"
         alias: plain-server
@@ -531,6 +567,10 @@ async fn test_server_config_retrieval() {
 // ============================================================================
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_callable_record_with_sandbox_config() {
     // Test that CallableRecord can have sandbox_config
     let mut record = create_test_tool_record("test-tool", "test-server");
@@ -549,6 +589,10 @@ fn test_callable_record_with_sandbox_config() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_callable_record_sandbox_serialization() {
     // Test serialization/deserialization of CallableRecord with sandbox
     let mut record = create_test_tool_record("test-tool", "test-server");
@@ -574,6 +618,10 @@ fn test_callable_record_sandbox_serialization() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_skill_with_bundled_tool_sandbox() {
     // Test skill with bundled tool and sandbox config
     let mut record = create_test_skill_with_bundled_tool("test-skill", "bundled-tool");
@@ -624,6 +672,10 @@ fn test_sandbox_backend_variants() {
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 fn test_sandbox_backend_serialization() {
     // Test that all backends serialize/deserialize correctly
     let backends = vec![
@@ -636,7 +688,7 @@ fn test_sandbox_backend_serialization() {
 
     for (backend, expected_str) in backends {
         let json = serde_json::to_string(&backend).unwrap();
-        assert_eq!(json, format!("\"{}\"", expected_str));
+        assert_eq!(json, format!("\"{expected_str}\""));
 
         let deserialized: SandboxBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, backend);
@@ -648,6 +700,10 @@ fn test_sandbox_backend_serialization() {
 // ============================================================================
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_sandbox_execute_timeout() {
     let config = SandboxConfig {
         backend: SandboxBackend::Timeout,
@@ -670,6 +726,10 @@ async fn test_sandbox_execute_timeout() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_sandbox_execute_with_env_vars() {
     let config = SandboxConfig::default();
     let sandbox = Sandbox::new(config);
@@ -724,7 +784,7 @@ async fn test_runtime_with_custom_sandbox_config() {
         ..Default::default()
     };
 
-    let _runtime = Runtime::with_sandbox_config(registry.clone(), upstream_manager, custom_config);
+    let _runtime = Runtime::with_sandbox_config(registry, upstream_manager, custom_config);
 
     // Runtime was created successfully
     // We can't easily verify internal config without getter methods
