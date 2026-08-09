@@ -68,6 +68,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[derive(Parser)]
 #[command(name = "skills")]
+#[command(version)]
 #[command(about = "skills.rs - Infinite Skills. Finite Context.", long_about = None)]
 #[command(before_help = r#"
  ███████╗██╗  ██╗██╗██╗     ██╗     ███████╗
@@ -265,7 +266,7 @@ enum Commands {
         tags: Vec<String>,
 
         /// Test connection after adding
-        #[arg(short, long, default_value = "true")]
+        #[arg(long, default_value = "true")]
         test: bool,
 
         #[arg(short, long)]
@@ -1168,7 +1169,7 @@ use_global:
                     .filter(|c| {
                         server
                             .as_ref()
-                            .map_or(true, |srv| c.server_alias.as_deref() == Some(srv))
+                            .is_none_or(|srv| c.server_alias.as_deref() == Some(srv))
                     })
                     .map(|c| {
                         serde_json::json!({
@@ -2207,4 +2208,15 @@ agent_skills_repos:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_has_no_conflicting_arguments() {
+        Cli::command().debug_assert();
+    }
 }

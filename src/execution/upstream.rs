@@ -21,6 +21,61 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
+const MCP_CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
+const MCP_CLIENT_NAME: &str = "skills.rs";
+const MCP_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn current_request_meta() -> JsonValue {
+    serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": MCP_CURRENT_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+            "name": MCP_CLIENT_NAME,
+            "version": MCP_CLIENT_VERSION
+        }
+    })
+}
+
+fn current_request_params(mut params: JsonValue) -> JsonValue {
+    let Some(object) = params.as_object_mut() else {
+        return serde_json::json!({ "_meta": current_request_meta() });
+    };
+    object.insert("_meta".to_string(), current_request_meta());
+    params
+}
+
+fn mcp_http_endpoint(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    if url.ends_with("/mcp") {
+        url.to_string()
+    } else {
+        format!("{url}/mcp")
+    }
+}
+
+fn parse_mcp_http_response(content_type: &str, body: &str) -> Result<McpResponse> {
+    let payload = if content_type.starts_with("text/event-stream") || body.starts_with("data:") {
+        let data = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(str::trim)
+            .rfind(|line| !line.is_empty() && *line != "[DONE]")
+            .ok_or_else(|| {
+                UpstreamError::ProtocolError("MCP SSE response has no data frame".to_string())
+            })?;
+        serde_json::from_str(data).map_err(|error| {
+            UpstreamError::ProtocolError(format!("Failed to parse MCP SSE response: {error}"))
+        })?
+    } else {
+        serde_json::from_str(body).map_err(|error| {
+            UpstreamError::ProtocolError(format!("Failed to parse MCP response: {error}"))
+        })?
+    };
+    serde_json::from_value(payload).map_err(|error| {
+        UpstreamError::ProtocolError(format!("Invalid MCP JSON-RPC response: {error}"))
+    })
+}
+
 #[derive(Error, Debug)]
 pub enum UpstreamError {
     #[error("Connection failed: {0}")]
@@ -397,13 +452,11 @@ impl UpstreamManager {
             id: JsonValue::from(1),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
+                "protocolVersion": MCP_CURRENT_PROTOCOL_VERSION,
+                "capabilities": {},
                 "clientInfo": {
-                    "name": "skills.rs",
-                    "version": "0.1.0"
+                    "name": MCP_CLIENT_NAME,
+                    "version": MCP_CLIENT_VERSION
                 }
             })),
         };
@@ -455,47 +508,29 @@ impl UpstreamManager {
     }
 
     /// Connect via HTTP
-    #[expect(
-        clippy::unused_async,
-        reason = "HTTP connector retains the async transport interface while initialization is mocked"
-    )]
     async fn connect_http(&self, config: &UpstreamConfig) -> Result<()> {
-        let url = config
-            .url
-            .as_ref()
-            .ok_or_else(|| UpstreamError::ConnectionFailed("No URL specified".to_string()))?;
-
-        debug!("Connecting to HTTP endpoint: {}", url);
-
-        // In full implementation:
-        // - POST to /mcp/initialize
-        // - Handle session tokens
-        // - Store connection state
-
-        // Mock for now
+        let result = self
+            .send_current_http_request(config, 1, "server/discover", serde_json::json!({}))
+            .await?;
+        let supported = result
+            .get("supportedVersions")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|version| version.as_str() == Some(MCP_CURRENT_PROTOCOL_VERSION))
+            });
+        if !supported {
+            return Err(UpstreamError::ProtocolError(format!(
+                "Upstream server does not advertise MCP {MCP_CURRENT_PROTOCOL_VERSION}"
+            )));
+        }
         Ok(())
     }
 
     /// Connect via HTTP+SSE (legacy)
-    #[expect(
-        clippy::unused_async,
-        reason = "SSE connector retains the async transport interface while initialization is mocked"
-    )]
     async fn connect_http_sse(&self, config: &UpstreamConfig) -> Result<()> {
-        let url = config
-            .url
-            .as_ref()
-            .ok_or_else(|| UpstreamError::ConnectionFailed("No URL specified".to_string()))?;
-
-        debug!("Connecting to HTTP+SSE endpoint: {}", url);
-
-        // In full implementation:
-        // - POST to initialize endpoint
-        // - Open SSE connection for notifications
-        // - Handle bidirectional communication
-
-        // Mock for now
-        Ok(())
+        self.connect_http(config).await
     }
 
     /// Refresh tools from an upstream server
@@ -603,7 +638,7 @@ impl UpstreamManager {
             jsonrpc: "2.0".to_string(),
             id: request_id.clone(),
             method: "tools/list".to_string(),
-            params: None,
+            params: Some(current_request_params(serde_json::json!({}))),
         };
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -665,57 +700,9 @@ impl UpstreamManager {
                 .clone()
         };
 
-        let url = config
-            .url
-            .as_ref()
-            .ok_or_else(|| UpstreamError::ConnectionFailed("No URL configured".to_string()))?;
-
-        let endpoint = format!("{}/mcp/tools/list", url.trim_end_matches('/'));
-
-        let mut request = self.http_client.post(&endpoint);
-
-        // Add auth if configured
-        if let Some(auth) = &config.auth {
-            if let Some(token) = &auth.token {
-                request = request.bearer_auth(token);
-            } else if let Some(env_var) = &auth.env {
-                if let Ok(token) = std::env::var(env_var) {
-                    request = request.bearer_auth(token);
-                }
-            }
-        }
-
-        let response = request
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/list"
-            }))
-            .send()
-            .await
-            .map_err(|e| UpstreamError::RequestFailed(format!("HTTP request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(UpstreamError::RequestFailed(format!(
-                "HTTP {} response",
-                response.status()
-            )));
-        }
-
-        let response_json: McpResponse = response
-            .json()
-            .await
-            .map_err(|e| UpstreamError::ProtocolError(format!("Failed to parse response: {e}")))?;
-
-        if let Some(error) = response_json.error {
-            return Err(UpstreamError::RequestFailed(format!(
-                "Server error: {error}"
-            )));
-        }
-
-        let result = response_json
-            .result
-            .ok_or_else(|| UpstreamError::ProtocolError("No result in response".to_string()))?;
+        let result = self
+            .send_current_http_request(&config, 2, "tools/list", serde_json::json!({}))
+            .await?;
 
         let tools_array = result
             .get("tools")
@@ -809,7 +796,8 @@ impl UpstreamManager {
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({
                 "name": tool_name,
-                "arguments": arguments
+                "arguments": arguments,
+                "_meta": current_request_meta()
             })),
         };
 
@@ -844,16 +832,40 @@ impl UpstreamManager {
                 .clone()
         };
 
+        self.send_current_http_request(
+            &config,
+            2,
+            "tools/call",
+            serde_json::json!({ "name": tool_name, "arguments": arguments }),
+        )
+        .await
+    }
+
+    async fn send_current_http_request(
+        &self,
+        config: &UpstreamConfig,
+        id: u64,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<JsonValue> {
         let url = config
             .url
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| UpstreamError::ConnectionFailed("No URL configured".to_string()))?;
+        let endpoint = mcp_http_endpoint(url);
+        debug!("Sending MCP {method} to {endpoint}");
 
-        let endpoint = format!("{}/mcp/tools/call", url.trim_end_matches('/'));
-
-        let mut request = self.http_client.post(&endpoint);
-
-        // Add auth if configured
+        let mut request = self
+            .http_client
+            .post(&endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", MCP_CURRENT_PROTOCOL_VERSION)
+            .header("Mcp-Method", method);
+        if method == "tools/call" {
+            if let Some(name) = params.get("name").and_then(JsonValue::as_str) {
+                request = request.header("Mcp-Name", name);
+            }
+        }
         if let Some(auth) = &config.auth {
             if let Some(token) = &auth.token {
                 request = request.bearer_auth(token);
@@ -867,38 +879,39 @@ impl UpstreamManager {
         let response = request
             .json(&serde_json::json!({
                 "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": arguments
-                }
+                "id": id,
+                "method": method,
+                "params": current_request_params(params)
             }))
             .send()
             .await
-            .map_err(|e| UpstreamError::RequestFailed(format!("HTTP request failed: {e}")))?;
-
-        if !response.status().is_success() {
+            .map_err(|error| {
+                UpstreamError::RequestFailed(format!("MCP {method} request failed: {error}"))
+            })?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = response.text().await.map_err(|error| {
+            UpstreamError::ProtocolError(format!("Failed to read MCP {method} response: {error}"))
+        })?;
+        if !status.is_success() {
             return Err(UpstreamError::RequestFailed(format!(
-                "HTTP {} response",
-                response.status()
+                "MCP {method} returned {status}: {body}"
             )));
         }
-
-        let response_json: McpResponse = response
-            .json()
-            .await
-            .map_err(|e| UpstreamError::ProtocolError(format!("Failed to parse response: {e}")))?;
-
-        if let Some(error) = response_json.error {
+        let response = parse_mcp_http_response(&content_type, &body)?;
+        if let Some(error) = response.error {
             return Err(UpstreamError::RequestFailed(format!(
-                "Server error: {error}"
+                "MCP {method} server error: {error}"
             )));
         }
-
-        response_json
-            .result
-            .ok_or_else(|| UpstreamError::ProtocolError("No result in response".to_string()))
+        response.result.ok_or_else(|| {
+            UpstreamError::ProtocolError(format!("MCP {method} response has no result"))
+        })
     }
 
     /// Get upstream config for a server
@@ -1016,5 +1029,149 @@ impl UpstreamManager {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        reason = "protocol fixture assertions should fail loudly"
+    )]
+
+    use super::*;
+    use axum::{
+        extract::Json,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Router,
+    };
+
+    async fn current_mcp_handler(
+        headers: HeaderMap,
+        Json(payload): Json<JsonValue>,
+    ) -> (StatusCode, Json<JsonValue>) {
+        let method = payload
+            .get("method")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        let valid = headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            == Some(MCP_CURRENT_PROTOCOL_VERSION)
+            && headers
+                .get("mcp-method")
+                .and_then(|value| value.to_str().ok())
+                == Some(method)
+            && payload
+                .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+                .and_then(JsonValue::as_str)
+                == Some(MCP_CURRENT_PROTOCOL_VERSION)
+            && payload
+                .pointer("/params/_meta/io.modelcontextprotocol~1clientCapabilities")
+                .is_some()
+            && payload
+                .pointer("/params/_meta/io.modelcontextprotocol~1clientInfo/name")
+                .and_then(JsonValue::as_str)
+                == Some(MCP_CLIENT_NAME)
+            && (method != "tools/call"
+                || headers
+                    .get("mcp-name")
+                    .and_then(|value| value.to_str().ok())
+                    == payload.pointer("/params/name").and_then(JsonValue::as_str));
+        if !valid {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id").cloned().unwrap_or(JsonValue::Null),
+                    "error": { "code": -32600, "message": "current MCP request required" }
+                })),
+            );
+        }
+
+        let result = match method {
+            "server/discover" => serde_json::json!({
+                "resultType": "complete",
+                "supportedVersions": [MCP_CURRENT_PROTOCOL_VERSION],
+                "capabilities": { "tools": {} },
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+            "tools/call" => serde_json::json!({
+                "resultType": "complete",
+                "structuredContent": { "ok": true }
+            }),
+            _ => serde_json::json!({ "resultType": "complete" }),
+        };
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": payload.get("id").cloned().unwrap_or(JsonValue::Null),
+                "result": result
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn current_http_requests_include_protocol_metadata_and_standard_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/mcp", post(current_mcp_handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = UpstreamManager::new(Arc::new(Registry::new()));
+        let config = UpstreamConfig {
+            alias: "current".to_string(),
+            transport: Transport::Http,
+            command: None,
+            url: Some(format!("http://{addr}")),
+            auth: None,
+            repo: None,
+            git_ref: None,
+            skills: None,
+            roots: None,
+            tags: vec![],
+            sandbox_config: None,
+            description: None,
+        };
+
+        manager.connect_http(&config).await.unwrap();
+        let result = manager
+            .send_current_http_request(
+                &config,
+                2,
+                "tools/call",
+                serde_json::json!({ "name": "test", "arguments": {} }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn current_http_helpers_normalize_endpoint_and_parse_sse() {
+        assert_eq!(
+            mcp_http_endpoint("https://example.test"),
+            "https://example.test/mcp"
+        );
+        assert_eq!(
+            mcp_http_endpoint("https://example.test/mcp/"),
+            "https://example.test/mcp"
+        );
+        let response = parse_mcp_http_response(
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        )
+        .unwrap();
+        assert_eq!(response.result.unwrap()["ok"], true);
     }
 }

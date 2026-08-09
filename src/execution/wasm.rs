@@ -14,8 +14,11 @@ use std::path::Path;
 use std::time::Instant;
 use tokio::task;
 use tracing::debug;
-use wasi_common::sync::WasiCtxBuilder;
 use wasmtime::{Config, Engine, Linker, Memory, Module, Store};
+use wasmtime_wasi::{
+    p1::{self, WasiP1Ctx},
+    DirPerms, FilePerms, WasiCtxBuilder,
+};
 
 /// WASM sandbox for executing WebAssembly modules
 pub struct WasmSandbox {
@@ -33,15 +36,15 @@ pub struct WasmIo {
     pub error: Option<String>,
 }
 
-/// WASM execution context using wasi-common
+/// WASM execution context using Wasmtime's `WASIp1` adapter.
 pub struct WasmContext {
-    wasi_ctx: wasi_common::WasiCtx,
+    wasi_ctx: WasiP1Ctx,
 }
 
 impl WasmContext {
     /// Create a new context with the given WASI configuration
     #[must_use]
-    pub const fn new(wasi_ctx: wasi_common::WasiCtx) -> Self {
+    pub const fn new(wasi_ctx: WasiP1Ctx) -> Self {
         Self { wasi_ctx }
     }
 }
@@ -134,9 +137,7 @@ impl WasmSandbox {
         let mut wasi_builder = WasiCtxBuilder::new();
 
         // Inherit stdio - stdout/stderr will be captured
-        wasi_builder.inherit_stdin();
-        wasi_builder.inherit_stdout();
-        wasi_builder.inherit_stderr();
+        wasi_builder.inherit_stdio();
 
         // Add preopens for allowed paths
         // Note: For wasi-common, we need to open directories as cap_std::fs::Dir
@@ -144,15 +145,11 @@ impl WasmSandbox {
         for path in &config.allow_read {
             if path.exists() && path.is_dir() {
                 debug!("Adding preopen for read: {:?}", path);
-                // Open directory using cap_std
-                match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()) {
-                    Ok(dir) => {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            let _ = wasi_builder.preopened_dir(dir, name);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Failed to open directory {:?}: {}", path, e);
+                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    if let Err(error) =
+                        wasi_builder.preopened_dir(path, name, DirPerms::READ, FilePerms::READ)
+                    {
+                        debug!("Failed to preopen directory {:?}: {}", path, error);
                     }
                 }
             }
@@ -162,20 +159,17 @@ impl WasmSandbox {
         for path in &config.allow_write {
             if path.exists() && path.is_dir() {
                 debug!("Adding preopen for write: {:?}", path);
-                match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()) {
-                    Ok(dir) => {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            let _ = wasi_builder.preopened_dir(dir, name);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Failed to open directory {:?}: {}", path, e);
+                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    if let Err(error) =
+                        wasi_builder.preopened_dir(path, name, DirPerms::all(), FilePerms::all())
+                    {
+                        debug!("Failed to preopen directory {:?}: {}", path, error);
                     }
                 }
             }
         }
 
-        let wasi_ctx = wasi_builder.build();
+        let wasi_ctx = wasi_builder.build_p1();
 
         // Create WASM context
         let wasm_ctx = WasmContext::new(wasi_ctx);
@@ -197,9 +191,9 @@ impl WasmSandbox {
                 .map_err(|e| SandboxError::ExecutionFailed(format!("Failed to set fuel: {e}")))?;
         }
 
-        // Create linker and add WASI using wasi_common
+        // Create linker and add the current Wasmtime WASIp1 adapter.
         let mut linker = Linker::new(&engine);
-        wasi_common::sync::add_to_linker(&mut linker, |ctx: &mut WasmContext| &mut ctx.wasi_ctx)
+        p1::add_to_linker_sync(&mut linker, |ctx: &mut WasmContext| &mut ctx.wasi_ctx)
             .map_err(|e| SandboxError::ExecutionFailed(format!("Failed to link WASI: {e}")))?;
 
         // Instantiate module

@@ -9,11 +9,12 @@
 //! - WASM: WebAssembly-based sandboxing (wasmtime runtime)
 
 use crate::execution::wasm::WasmSandbox;
-use bollard::container::{
-    Config, CreateContainerOptions, KillContainerOptions, LogOutput, LogsOptions,
-    StartContainerOptions, WaitContainerOptions,
+use bollard::container::LogOutput;
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
+use bollard::query_parameters::{
+    CreateContainerOptions, KillContainerOptions, LogsOptions, StartContainerOptions,
+    WaitContainerOptions,
 };
-use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -766,7 +767,7 @@ impl Sandbox {
                             rlim_cur: max_cpu_seconds,
                             rlim_max: max_cpu_seconds,
                         };
-                        setrlimit(RLIMIT_CPU, &cpu_limit);
+                        setrlimit(RLIMIT_CPU, &raw const cpu_limit);
                     }
 
                     // Limit memory
@@ -775,7 +776,7 @@ impl Sandbox {
                             rlim_cur: max_memory_bytes,
                             rlim_max: max_memory_bytes,
                         };
-                        setrlimit(RLIMIT_AS, &mem_limit);
+                        setrlimit(RLIMIT_AS, &raw const mem_limit);
                     }
 
                     // Limit open files
@@ -783,7 +784,7 @@ impl Sandbox {
                         rlim_cur: 64,
                         rlim_max: 64,
                     };
-                    setrlimit(RLIMIT_NOFILE, &file_limit);
+                    setrlimit(RLIMIT_NOFILE, &raw const file_limit);
 
                     Ok(())
                 });
@@ -1088,7 +1089,7 @@ impl Sandbox {
         mounts.push(Mount {
             target: Some(self.config.docker.working_dir.clone()),
             source: Some(working_dir.to_string_lossy().to_string()),
-            typ: Some(MountTypeEnum::BIND),
+            typ: Some(MountType::BIND),
             read_only: Some(false),
             ..Default::default()
         });
@@ -1103,7 +1104,7 @@ impl Sandbox {
                         path.file_name().unwrap_or_default().to_string_lossy()
                     )),
                     source: Some(path.to_string_lossy().to_string()),
-                    typ: Some(MountTypeEnum::BIND),
+                    typ: Some(MountType::BIND),
                     read_only: Some(true),
                     ..Default::default()
                 });
@@ -1120,7 +1121,7 @@ impl Sandbox {
                         path.file_name().unwrap_or_default().to_string_lossy()
                     )),
                     source: Some(path.to_string_lossy().to_string()),
-                    typ: Some(MountTypeEnum::BIND),
+                    typ: Some(MountType::BIND),
                     read_only: Some(false),
                     ..Default::default()
                 });
@@ -1132,7 +1133,7 @@ impl Sandbox {
             mounts.push(Mount {
                 target: Some(mount.target.clone()),
                 source: Some(mount.source.to_string_lossy().to_string()),
-                typ: Some(MountTypeEnum::BIND),
+                typ: Some(MountType::BIND),
                 read_only: Some(mount.read_only),
                 ..Default::default()
             });
@@ -1168,8 +1169,8 @@ impl Sandbox {
             ..Default::default()
         };
 
-        // Create container configuration using Config struct
-        let config = Config::<String> {
+        // Create container configuration using the current Docker API model.
+        let config = ContainerCreateBody {
             image: Some(self.config.docker.image.clone()),
             cmd: Some(vec![
                 "sh".to_string(),
@@ -1189,8 +1190,8 @@ impl Sandbox {
 
         // Create the container
         let create_opts = CreateContainerOptions {
-            name: format!("skills-sandbox-{}", uuid::Uuid::new_v4()),
-            platform: None,
+            name: Some(format!("skills-sandbox-{}", uuid::Uuid::new_v4())),
+            platform: String::new(),
         };
 
         let container = docker
@@ -1205,7 +1206,7 @@ impl Sandbox {
 
         // Start the container
         docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .start_container(&container_id, None::<StartContainerOptions>)
             .await
             .map_err(|e| {
                 SandboxError::ExecutionFailed(format!("Failed to start container: {e}"))
@@ -1219,7 +1220,7 @@ impl Sandbox {
             let mut stream = docker.wait_container(
                 &container_id,
                 Some(WaitContainerOptions {
-                    condition: "not-running",
+                    condition: "not-running".to_string(),
                 }),
             );
             stream.next().await
@@ -1236,7 +1237,9 @@ impl Sandbox {
             let _ = docker
                 .kill_container(
                     &container_id,
-                    Some(KillContainerOptions { signal: "SIGKILL" }),
+                    Some(KillContainerOptions {
+                        signal: "SIGKILL".to_string(),
+                    }),
                 )
                 .await;
             warn!(
@@ -1249,7 +1252,7 @@ impl Sandbox {
         let mut stdout = String::new();
         let mut stderr = String::new();
 
-        let logs_options = LogsOptions::<String> {
+        let logs_options = LogsOptions {
             stdout: true,
             stderr: true,
             timestamps: false,

@@ -22,7 +22,10 @@ use crate::storage::{CreateSkillRequest, SkillStore};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CacheScope, CallToolResponse, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerInfo,
+    },
     service::RequestContext,
     tool, tool_router, Json, RoleServer, ServerHandler,
 };
@@ -1214,25 +1217,20 @@ pub struct ManageOutput {
 
 impl ServerHandler for SkillsServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: rmcp::model::ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "skillsrs".to_string(),
-                title: Some("Infinite Skills. Finite Context.".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                website_url: Some("https://github.com/labiium/skills".to_string()),
-                icons: None,
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_server_info(
+                Implementation::new("skillsrs", env!("CARGO_PKG_VERSION"))
+                    .with_title("Infinite Skills. Finite Context.")
+                    .with_website_url("https://github.com/labiium/skills"),
+            )
+            .with_instructions(
                 "Unified MCP server that aggregates upstream MCP tools and Skills into a unified registry. \
                 Exposes exactly 3 tools: search (discovery), exec (description, validation, execution), \
                 and manage (skill lifecycle). Usage: (1) search to find callables, \
                 (2) exec with describe to get parameters, (3) exec to validate or execute, \
                 (4) manage to create/update/delete skills."
-                    .to_string(),
-            ),
-        }
+            )
     }
 
     async fn initialize(
@@ -1249,18 +1247,16 @@ impl ServerHandler for SkillsServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
         let tools = self.tool_router.list_all();
-        Ok(rmcp::model::ListToolsResult {
-            tools,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Public))
     }
 
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::model::ErrorData> {
         use rmcp::handler::server::tool::ToolCallContext;
 
         let tool_context = ToolCallContext::new(self, request, context);

@@ -283,19 +283,19 @@ impl AgentSkill {
 
     /// Check if skill has scripts
     #[must_use]
-    pub fn has_scripts(&self) -> bool {
+    pub const fn has_scripts(&self) -> bool {
         !self.scripts.is_empty()
     }
 
     /// Check if skill has references
     #[must_use]
-    pub fn has_references(&self) -> bool {
+    pub const fn has_references(&self) -> bool {
         !self.references.is_empty()
     }
 
     /// Check if skill has assets
     #[must_use]
-    pub fn has_assets(&self) -> bool {
+    pub const fn has_assets(&self) -> bool {
         !self.assets.is_empty()
     }
 

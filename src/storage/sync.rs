@@ -164,7 +164,7 @@ impl AgentSkillsSync {
         };
 
         // Check if already synced with same commit
-        let needs_sync = self.metadata.get(alias).map_or(true, |meta| {
+        let needs_sync = self.metadata.get(alias).is_none_or(|meta| {
             // Check if config changed (different git_ref or skill filter)
             meta.git_ref != config.git_ref || {
                 match (&config.skills, !meta.synced_skills.is_empty()) {
@@ -399,7 +399,7 @@ impl SyncReport {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.updated.is_empty()
             && self.removed.is_empty()
@@ -407,7 +407,7 @@ impl SyncReport {
     }
 
     #[must_use]
-    pub fn total_changes(&self) -> usize {
+    pub const fn total_changes(&self) -> usize {
         self.added
             .len()
             .saturating_add(self.updated.len())

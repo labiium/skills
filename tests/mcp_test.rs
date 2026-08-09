@@ -1,5 +1,6 @@
 //! Tests for MCP module: `SkillsServer`
 
+use rmcp::ServerHandler;
 use skillsrs::core::policy::PolicyConfig;
 use skillsrs::core::registry::Registry;
 use skillsrs::execution::upstream::UpstreamManager;
@@ -118,7 +119,12 @@ fn test_server_exposes_exec_not_schema() {
 #[test]
 fn test_server_creation() {
     // This should not panic
-    let _server = create_empty_server().0;
+    let server = create_empty_server().0;
+    let info = server.get_info();
+    assert_eq!(info.protocol_version.as_str(), "2026-07-28");
+    assert!(server
+        .supported_protocol_versions()
+        .contains(&rmcp::model::ProtocolVersion::V_2026_07_28));
 }
 
 #[tokio::test]
