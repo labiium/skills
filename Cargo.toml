@@ -9,7 +9,7 @@ description = "Infinite Skills. Finite Context. - Unified MCP server aggregating
 readme = "README.md"
 keywords = ["mcp", "skills", "tools", "ai", "llm"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.88"
+rust-version = "1.94"
 
 [lib]
 name = "skillsrs"
