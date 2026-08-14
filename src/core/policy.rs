@@ -174,6 +174,20 @@ impl PolicyConfig {
         Self::from_selector(config, std::env::var("SKILLS_POLICY").ok().as_deref())
     }
 
+    /// Resolve the immutable source identity injected by the Mesurii Bench.
+    /// Open-profile servers require an exact Git object name; standard
+    /// consumers may omit it for backwards compatibility.
+    pub fn mesurii_source_revision(require: bool) -> Result<Option<String>> {
+        let configured = std::env::var("MESURII_SKILLS_SOURCE_REVISION").ok();
+        let value = exact_source_revision(configured.as_deref());
+        if require && value.is_none() {
+            return Err(PolicyError::ConfigError(
+                "MESURII_SKILLS_SOURCE_REVISION must be a non-empty exact 40-hex revision for the open profile".to_string(),
+            ));
+        }
+        Ok(value)
+    }
+
     #[must_use]
     pub fn from_selector(mut config: Self, selector: Option<&str>) -> Self {
         if selector.is_some_and(|value| value.trim().eq_ignore_ascii_case("open")) {
@@ -187,6 +201,37 @@ impl PolicyConfig {
             config.max_exec_ms = u64::MAX;
         }
         config
+    }
+}
+
+fn exact_source_revision(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod source_revision_tests {
+    use super::exact_source_revision;
+
+    #[test]
+    fn exact_source_revision_accepts_only_forty_hex_characters() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            exact_source_revision(Some(revision)).as_deref(),
+            Some(revision)
+        );
+        assert_eq!(
+            exact_source_revision(Some(&format!("  {revision}  "))).as_deref(),
+            Some(revision)
+        );
+        assert_eq!(exact_source_revision(None), None);
+        assert_eq!(exact_source_revision(Some("not-a-revision")), None);
+        assert_eq!(
+            exact_source_revision(Some("0123456789abcdef0123456789abcdef012345678")),
+            None
+        );
     }
 }
 

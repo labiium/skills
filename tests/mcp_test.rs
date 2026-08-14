@@ -162,6 +162,7 @@ async fn test_open_register_component_profile_is_versioned_and_gate_free() {
     assert!(!profile.ready);
     assert!(profile.gates.is_empty());
     assert_eq!(profile.sandbox, "none");
+    assert!(profile.source_revision.is_none());
 }
 
 #[tokio::test]

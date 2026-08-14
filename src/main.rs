@@ -747,6 +747,8 @@ async fn init_server(
 
     // Create policy engine
     let policy = PolicyConfig::from_environment(config.policy.clone());
+    PolicyConfig::mesurii_source_revision(policy.mode == PolicyMode::Open)
+        .context("invalid Mesurii Skills source identity")?;
     let policy_engine = Arc::new(PolicyEngine::new(policy)?);
 
     // Create upstream manager and connect to upstreams

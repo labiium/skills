@@ -181,6 +181,8 @@ pub struct ComponentProfile {
     pub ready: bool,
     pub gates: Vec<String>,
     pub sandbox: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
     pub upstreams: Vec<crate::execution::upstream::UpstreamStatus>,
 }
 
@@ -447,6 +449,9 @@ impl SkillsServer {
     #[must_use]
     pub async fn component_profile(&self) -> ComponentProfile {
         let open = self.policy_engine.is_open();
+        let source_revision = crate::core::policy::PolicyConfig::mesurii_source_revision(false)
+            .ok()
+            .flatten();
         let upstreams = if let Some(manager) = &self.upstream_manager {
             manager.status().await
         } else {
@@ -467,7 +472,9 @@ impl SkillsServer {
             schema: "mesurii.component-profile.v1".to_string(),
             component: "register".to_string(),
             profile: self.policy_engine.state().mode,
-            ready: upstreams_ready && (!open || self.runtime.sandbox_backend().as_str() == "none"),
+            ready: upstreams_ready
+                && (!open || self.runtime.sandbox_backend().as_str() == "none")
+                && (!open || source_revision.is_some()),
             gates: if open {
                 Vec::new()
             } else {
@@ -482,6 +489,7 @@ impl SkillsServer {
                 ]
             },
             sandbox: self.runtime.sandbox_backend().as_str().to_string(),
+            source_revision,
             upstreams,
         }
     }
