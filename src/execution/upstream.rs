@@ -11,9 +11,11 @@ use crate::core::{
     CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest, ToolDefinition,
 };
 use crate::execution::sandbox::SandboxConfigOverride;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -116,6 +118,9 @@ pub enum Transport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub alias: String,
+    /// Explicitly required for Bench readiness; semantic core aliases are also required in open mode.
+    #[serde(default)]
+    pub required: bool,
     pub transport: Transport,
 
     // For stdio
@@ -175,13 +180,35 @@ struct McpResponse {
 }
 
 /// Upstream connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
     Degraded,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UpstreamStatus {
+    pub alias: String,
+    pub state: ConnectionState,
+    pub tool_count: usize,
+    pub required: bool,
+}
+
+impl ConnectionState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Request tracker for correlating responses
@@ -203,6 +230,7 @@ pub struct UpstreamManager {
     sessions: Arc<RwLock<HashMap<String, UpstreamSession>>>,
     registry: Arc<Registry>,
     http_client: reqwest::Client,
+    unrestricted: AtomicBool,
 }
 
 impl UpstreamManager {
@@ -212,7 +240,13 @@ impl UpstreamManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             registry,
             http_client: reqwest::Client::new(),
+            unrestricted: AtomicBool::new(false),
         }
+    }
+
+    /// Remove the fixed stdio tool-call timeout for the open workspace profile.
+    pub fn set_unrestricted(&self) {
+        self.unrestricted.store(true, Ordering::Release);
     }
 
     /// Add an upstream server
@@ -806,12 +840,18 @@ impl UpstreamManager {
             .send((request_id, request, response_tx))
             .map_err(|_| UpstreamError::ConnectionFailed("Failed to send request".to_string()))?;
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(60), response_rx)
-            .await
-            .map_err(|_| UpstreamError::Timeout("tools/call request timed out".to_string()))?
-            .map_err(|_| {
+        let response = if self.unrestricted.load(Ordering::Acquire) {
+            response_rx.await.map_err(|_| {
                 UpstreamError::ConnectionFailed("Response channel closed".to_string())
-            })??;
+            })?
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(60), response_rx)
+                .await
+                .map_err(|_| UpstreamError::Timeout("tools/call request timed out".to_string()))?
+                .map_err(|_| {
+                    UpstreamError::ConnectionFailed("Response channel closed".to_string())
+                })?
+        }?;
 
         Ok(response)
     }
@@ -930,6 +970,22 @@ impl UpstreamManager {
     pub async fn get_state(&self, alias: &str) -> Option<ConnectionState> {
         let sessions = self.sessions.read().await;
         sessions.get(alias).map(|s| s.state)
+    }
+
+    /// Return the live state and discovered tool count for every configured upstream.
+    pub async fn status(&self) -> Vec<UpstreamStatus> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .map(|session| UpstreamStatus {
+                alias: session.config.alias.clone(),
+                state: session.state,
+                tool_count: session.tools.len(),
+                required: session.config.required
+                    || (self.unrestricted.load(Ordering::Acquire)
+                        && matches!(session.config.alias.as_str(), "codiium" | "dociium")),
+            })
+            .collect()
     }
 
     pub async fn get_config(&self, alias: &str) -> Option<UpstreamConfig> {
@@ -1131,6 +1187,7 @@ mod tests {
         let manager = UpstreamManager::new(Arc::new(Registry::new()));
         let config = UpstreamConfig {
             alias: "current".to_string(),
+            required: false,
             transport: Transport::Http,
             command: None,
             url: Some(format!("http://{addr}")),

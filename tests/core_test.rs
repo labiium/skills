@@ -232,6 +232,39 @@ async fn test_policy_engine_require_consent_for_writes() {
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
+async fn test_open_policy_is_machine_readable_and_unconditionally_invokes_off_panel_tools() {
+    let engine = PolicyEngine::new(PolicyConfig::open()).unwrap();
+    let mut record = create_test_tool_record("off-panel-write", "untrusted-provider");
+    record.risk_tier = RiskTier::Admin;
+    record.tags = vec!["blocked".to_string()];
+    record.fq_name = "unlisted.off-panel-write".to_string();
+
+    let result = engine
+        .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
+        .await
+        .unwrap();
+    assert!(result.allowed);
+
+    let state = engine.state();
+    assert_eq!(state.mode, "open");
+    assert!(state.unconditional);
+    assert_eq!(state.max_calls_per_skill, None);
+}
+
+#[test]
+fn test_skills_policy_open_selector_overlays_standard_config() {
+    let config = PolicyConfig::from_selector(PolicyConfig::default(), Some("OPEN"));
+    assert_eq!(config.mode.to_string(), "open");
+    assert!(config.require_consent_for.is_empty());
+    assert!(config.deny_tags.is_empty());
+    assert_eq!(config.max_calls_per_skill, usize::MAX);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_persistence_lifecycle() {
     let temp_file = NamedTempFile::new().unwrap();
     let db_path = temp_file.path();

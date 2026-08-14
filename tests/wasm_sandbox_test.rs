@@ -730,6 +730,30 @@ async fn test_sandbox_execute_timeout() {
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
+async fn test_unsandboxed_zero_timeout_does_not_apply_timeout_gate() {
+    let sandbox = Sandbox::new(SandboxConfig {
+        backend: SandboxBackend::None,
+        timeout_ms: 0,
+        ..Default::default()
+    });
+    let output = sandbox
+        .execute(
+            "printf",
+            &["open".to_string()],
+            std::path::Path::new("."),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, "open");
+    assert!(!output.timed_out);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
 async fn test_sandbox_execute_with_env_vars() {
     let config = SandboxConfig::default();
     let sandbox = Sandbox::new(config);

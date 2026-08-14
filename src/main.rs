@@ -22,7 +22,7 @@ use rmcp::{
     ServiceExt,
 };
 use skillsrs::core::persistence::PersistenceLayer;
-use skillsrs::core::policy::{PolicyConfig, PolicyEngine};
+use skillsrs::core::policy::{PolicyConfig, PolicyEngine, PolicyMode};
 use skillsrs::core::registry::Registry;
 use skillsrs::core::CallableKind;
 use skillsrs::execution::upstream::UpstreamManager;
@@ -464,7 +464,8 @@ fn is_default_server_config(cfg: &ServerConfig) -> bool {
 
 fn is_default_policy_config(cfg: &PolicyConfig) -> bool {
     let default = PolicyConfig::default();
-    cfg.default_risk == default.default_risk
+    cfg.mode == default.mode
+        && cfg.default_risk == default.default_risk
         && cfg.require_consent_for == default.require_consent_for
         && cfg.trusted_servers == default.trusted_servers
         && cfg.deny_tags == default.deny_tags
@@ -745,13 +746,26 @@ async fn init_server(
     let search_engine = Arc::new(SearchEngine::new(registry.clone()));
 
     // Create policy engine
-    let policy_engine = Arc::new(PolicyEngine::new(config.policy.clone())?);
+    let policy = PolicyConfig::from_environment(config.policy.clone());
+    let policy_engine = Arc::new(PolicyEngine::new(policy)?);
 
     // Create upstream manager and connect to upstreams
     let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+    if policy_engine.is_open() {
+        upstream_manager.set_unrestricted();
+    }
     for upstream_config in &config.upstreams {
         info!("Connecting to upstream: {}", upstream_config.alias);
         if let Err(e) = upstream_manager.add_upstream(upstream_config.clone()).await {
+            if policy_engine.is_open()
+                && (upstream_config.required
+                    || matches!(upstream_config.alias.as_str(), "codiium" | "dociium"))
+            {
+                return Err(anyhow::anyhow!(
+                    "Required open-profile upstream {} failed readiness: {e}",
+                    upstream_config.alias
+                ));
+            }
             error!(
                 "Failed to connect to upstream {}: {}",
                 upstream_config.alias, e
@@ -764,14 +778,15 @@ async fn init_server(
 
     // Create runtime (after upstream_manager is initialized)
     let mut sandbox_config = config.sandbox.clone();
-    if no_sandbox {
+    if no_sandbox || policy_engine.is_open() {
         sandbox_config.backend = SandboxBackend::None;
     }
-    let runtime = Arc::new(Runtime::with_sandbox_config(
-        registry.clone(),
-        upstream_manager.clone(),
-        sandbox_config,
-    ));
+    let mut runtime_config =
+        Runtime::with_sandbox_config(registry.clone(), upstream_manager.clone(), sandbox_config);
+    if policy_engine.is_open() {
+        runtime_config.set_unrestricted();
+    }
+    let runtime = Arc::new(runtime_config);
 
     // Sync Agent Skills from config before loading
     if !config.agent_skills_repos.is_empty() {
@@ -1071,6 +1086,7 @@ use_global:
 
                     let server = init_server(&config, &paths, no_sandbox).await?;
 
+                    let health_server = server.clone();
                     let mcp_service = StreamableHttpService::new(
                         move || Ok(server.clone()),
                         LocalSessionManager::default().into(),
@@ -1104,12 +1120,22 @@ use_global:
                         )
                         .route(
                             "/health",
-                            axum::routing::get(|| async {
-                                axum::response::Json(serde_json::json!({
-                                    "status": "healthy",
-                                    "service": "skills.rs",
-                                    "version": env!("CARGO_PKG_VERSION")
-                                }))
+                            axum::routing::get(move || {
+                                let server = health_server.clone();
+                                async move {
+                                    let profile = server.component_profile().await;
+                                    let status = if profile.ready {
+                                        axum::http::StatusCode::OK
+                                    } else {
+                                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                    };
+                                    (status, axum::response::Json(serde_json::json!({
+                                        "status": if profile.ready { "healthy" } else { "unready" },
+                                        "service": "skills.rs",
+                                        "version": env!("CARGO_PKG_VERSION"),
+                                        "profile": profile
+                                    })))
+                                }
                             }),
                         )
                         .nest_service("/mcp", mcp_service);
@@ -1241,6 +1267,11 @@ use_global:
             // Initialize components (CLI mode uses no sandbox by default)
             let registry = Arc::new(Registry::new());
             let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+            let open_policy =
+                PolicyConfig::from_environment(config.policy.clone()).mode == PolicyMode::Open;
+            if open_policy {
+                upstream_manager.set_unrestricted();
+            }
             let skill_store = Arc::new(SkillStore::new(&paths.skills_root, registry.clone())?);
 
             // Load local skills first
@@ -1250,14 +1281,18 @@ use_global:
 
             // Create sandbox config with no sandboxing for CLI mode
             let mut sandbox_config = SandboxConfig::default();
-            if no_sandbox {
+            if no_sandbox || open_policy {
                 sandbox_config.backend = SandboxBackend::None;
             }
-            let runtime = Arc::new(Runtime::with_sandbox_config(
+            let mut runtime_config = Runtime::with_sandbox_config(
                 registry.clone(),
                 upstream_manager.clone(),
                 sandbox_config,
-            ));
+            );
+            if open_policy {
+                runtime_config.set_unrestricted();
+            }
+            let runtime = Arc::new(runtime_config);
 
             // Connect to upstreams
             for upstream_config in &config.upstreams {
@@ -1368,6 +1403,11 @@ use_global:
             // Initialize components (CLI mode uses no sandbox by default)
             let registry = Arc::new(Registry::new());
             let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
+            let open_policy =
+                PolicyConfig::from_environment(config.policy.clone()).mode == PolicyMode::Open;
+            if open_policy {
+                upstream_manager.set_unrestricted();
+            }
             let skill_store = Arc::new(SkillStore::new(&paths.skills_root, registry.clone())?);
 
             // Load local skills first
@@ -1377,14 +1417,18 @@ use_global:
 
             // Create sandbox config with no sandboxing for CLI mode
             let mut sandbox_config = SandboxConfig::default();
-            if no_sandbox {
+            if no_sandbox || open_policy {
                 sandbox_config.backend = SandboxBackend::None;
             }
-            let runtime = Arc::new(Runtime::with_sandbox_config(
+            let mut runtime_config = Runtime::with_sandbox_config(
                 registry.clone(),
                 upstream_manager.clone(),
                 sandbox_config,
-            ));
+            );
+            if open_policy {
+                runtime_config.set_unrestricted();
+            }
+            let runtime = Arc::new(runtime_config);
 
             // Connect to upstreams
             for upstream_config in &config.upstreams {
@@ -2089,6 +2133,7 @@ agent_skills_repos:
             let upstream_config = match transport {
                 TransportType::Http => skillsrs::execution::upstream::UpstreamConfig {
                     alias: alias.clone(),
+                    required: false,
                     transport: skillsrs::execution::upstream::Transport::Http,
                     url: Some(endpoint.clone()),
                     command: None,
@@ -2109,6 +2154,7 @@ agent_skills_repos:
 
                     skillsrs::execution::upstream::UpstreamConfig {
                         alias: alias.clone(),
+                        required: false,
                         transport: skillsrs::execution::upstream::Transport::Stdio,
                         url: None,
                         command: Some(command_parts),

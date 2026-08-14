@@ -65,6 +65,7 @@ async fn test_add_upstream_stdio() {
 
     let config = UpstreamConfig {
         alias: "test-server".to_string(),
+        required: false,
         transport: Transport::Stdio,
         command: Some(vec!["echo".to_string(), "test".to_string()]),
         url: None,

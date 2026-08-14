@@ -118,6 +118,7 @@ pub struct Runtime {
     registry: Arc<Registry>,
     upstream_manager: Arc<UpstreamManager>,
     sandbox_config: sandbox::SandboxConfig,
+    unrestricted: bool,
 }
 
 impl Runtime {
@@ -127,6 +128,7 @@ impl Runtime {
             registry,
             upstream_manager,
             sandbox_config: sandbox::SandboxConfig::default(),
+            unrestricted: false,
         }
     }
 
@@ -141,7 +143,19 @@ impl Runtime {
             registry,
             upstream_manager,
             sandbox_config,
+            unrestricted: false,
         }
+    }
+
+    pub const fn set_unrestricted(&mut self) {
+        self.unrestricted = true;
+        self.sandbox_config.backend = sandbox::SandboxBackend::None;
+        self.sandbox_config.timeout_ms = 0;
+    }
+
+    #[must_use]
+    pub const fn sandbox_backend(&self) -> sandbox::SandboxBackend {
+        self.sandbox_config.backend
     }
 
     /// Execute a callable
@@ -165,7 +179,7 @@ impl Runtime {
         // Execute based on callable kind
         let result = match record.kind {
             CallableKind::Tool => {
-                if let Some(timeout_ms) = ctx.timeout_ms {
+                if let Some(timeout_ms) = (!self.unrestricted).then_some(ctx.timeout_ms).flatten() {
                     tokio::time::timeout(
                         Duration::from_millis(timeout_ms),
                         self.execute_tool(&ctx, &record),
@@ -177,7 +191,7 @@ impl Runtime {
                 }
             }
             CallableKind::Skill => {
-                if let Some(timeout_ms) = ctx.timeout_ms {
+                if let Some(timeout_ms) = (!self.unrestricted).then_some(ctx.timeout_ms).flatten() {
                     tokio::time::timeout(
                         Duration::from_millis(timeout_ms),
                         self.execute_skill(&ctx, &record, trace.as_mut()),
@@ -404,8 +418,16 @@ impl Runtime {
                     .execute_bundled_tool(
                         bundled_tool,
                         &ctx.arguments,
-                        ctx.timeout_ms,
-                        tool_override,
+                        if self.unrestricted {
+                            None
+                        } else {
+                            ctx.timeout_ms
+                        },
+                        if self.unrestricted {
+                            None
+                        } else {
+                            tool_override
+                        },
                     )
                     .await?;
 
@@ -530,6 +552,10 @@ impl Runtime {
 
         // Apply timeout override if provided
         let mut sandbox_config = sandbox_config;
+        if self.unrestricted {
+            sandbox_config.backend = sandbox::SandboxBackend::None;
+            sandbox_config.timeout_ms = 0;
+        }
         if let Some(timeout) = timeout_ms {
             sandbox_config.timeout_ms = timeout;
         }

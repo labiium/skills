@@ -305,6 +305,115 @@ async fn test_search_engine() {
 
 #[tokio::test]
 #[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
+async fn test_exhaustive_search_enumerates_every_record_once_in_stable_pages() {
+    let registry = Arc::new(Registry::new());
+    let search_engine = SearchEngine::new(registry.clone());
+    let schema = serde_json::json!({"type": "object"});
+    let digest = skillsrs::core::SchemaDigest::from_schema(&schema).unwrap();
+
+    for index in 0..53 {
+        let name = format!("instrument-{index:02}");
+        let id = skillsrs::core::CallableId::tool("provider", &name, digest.as_str());
+        registry
+            .register(skillsrs::core::CallableRecord {
+                id,
+                kind: skillsrs::core::CallableKind::Tool,
+                fq_name: format!("provider.{name}"),
+                name: name.clone(),
+                title: None,
+                description: None,
+                tags: if index % 2 == 0 {
+                    vec!["even".to_string()]
+                } else {
+                    vec!["odd".to_string()]
+                },
+                input_schema: schema.clone(),
+                output_schema: None,
+                schema_digest: digest.clone(),
+                server_alias: Some("provider".to_string()),
+                upstream_tool_name: Some(name),
+                skill_version: None,
+                uses: vec![],
+                skill_directory: None,
+                bundled_tools: vec![],
+                additional_files: vec![],
+                cost_hints: skillsrs::core::CostHints::default(),
+                risk_tier: skillsrs::core::RiskTier::ReadOnly,
+                last_seen: chrono::Utc::now(),
+                sandbox_config: None,
+            })
+            .unwrap();
+    }
+    search_engine.rebuild();
+
+    let first = search_engine
+        .search(&SearchQuery {
+            q: "*".to_string(),
+            kind: "tools".to_string(),
+            limit: 50,
+            filters: None,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    let second = search_engine
+        .search(&SearchQuery {
+            q: "*".to_string(),
+            kind: "tools".to_string(),
+            limit: 50,
+            filters: None,
+            cursor: first.next_cursor.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(first.total_matches, 53);
+    assert_eq!(first.matches.len(), 50);
+    assert_eq!(second.matches.len(), 3);
+    assert!(second.next_cursor.is_none());
+    let mut names: Vec<_> = first
+        .matches
+        .into_iter()
+        .chain(second.matches)
+        .map(|item| item.name)
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 53);
+
+    let filtered = search_engine
+        .search(&SearchQuery {
+            q: "*".to_string(),
+            kind: "tools".to_string(),
+            limit: 50,
+            filters: Some(skillsrs::storage::search::SearchFilters {
+                server: None,
+                tags: Some(vec!["odd".to_string()]),
+                requires: None,
+                capability: None,
+            }),
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total_matches, 26);
+    assert!(filtered.matches.iter().all(|item| {
+        item.name.ends_with('1')
+            || item.name.ends_with('3')
+            || item.name.ends_with('5')
+            || item.name.ends_with('7')
+            || item.name.ends_with('9')
+    }));
+}
+
+#[tokio::test]
+#[expect(
     clippy::indexing_slicing,
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"

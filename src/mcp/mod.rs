@@ -13,7 +13,7 @@
 //! - 1 management tool (manage) for skill lifecycle, keeping the context minimal while enabling full CRUD
 //! - This balance achieves "Infinite Skills. Finite Context." - agents can manage skills without tool bloat
 
-use crate::core::policy::{ConsentLevel, PolicyEngine};
+use crate::core::policy::{ConsentLevel, PolicyEngine, PolicyState};
 use crate::core::registry::Registry;
 use crate::core::CallableId;
 use crate::execution::{ExecContext, Runtime};
@@ -50,12 +50,14 @@ pub struct SkillsServer {
 /// Input schema for search
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchInput {
-    /// Search query
+    /// Search query. Use `*` for exhaustive deterministic Registry enumeration.
     pub q: String,
 
     /// Filter by callable kind
     #[serde(default = "default_kind")]
-    #[schemars(description = "Filter by callable kind: any, tools, or skills")]
+    #[schemars(
+        description = "Filter by callable kind: any, tools, or skills. Query '*' enumerates the full Registry."
+    )]
     pub kind: String,
 
     /// Maximum results to return
@@ -165,6 +167,39 @@ pub struct SearchOutput {
     pub matches: Vec<JsonValue>,
     pub next_cursor: Option<String>,
     pub stats: SearchStats,
+    pub policy: PolicyState,
+    pub profile: ComponentProfile,
+}
+
+/// Versioned runtime profile for the Mesurii Register component.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComponentProfile {
+    #[serde(rename = "schema")]
+    pub schema: String,
+    pub component: String,
+    pub profile: String,
+    pub ready: bool,
+    pub gates: Vec<String>,
+    pub sandbox: String,
+    pub upstreams: Vec<crate::execution::upstream::UpstreamStatus>,
+}
+
+fn open_dependencies_ready(upstreams: &[crate::execution::upstream::UpstreamStatus]) -> bool {
+    ["codiium", "dociium"].iter().all(|required_alias| {
+        upstreams.iter().any(|upstream| {
+            upstream.alias == *required_alias
+                && matches!(
+                    upstream.state,
+                    crate::execution::upstream::ConnectionState::Connected
+                )
+        })
+    }) && upstreams.iter().all(|upstream| {
+        !upstream.required
+            || matches!(
+                upstream.state,
+                crate::execution::upstream::ConnectionState::Connected
+            )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -203,6 +238,31 @@ pub struct SchemaOutput {
     pub output_schema: Option<JsonValue>,
     #[schemars(schema_with = "json_value_schema")]
     pub signature: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<CallableDescriptorV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReplayMetadata {
+    /// Explicit replay contract; `never` is the conservative default until an
+    /// instrument advertises authoritative idempotency metadata.
+    pub mode: String,
+    pub schema_digest: String,
+}
+
+/// Canonical on-demand callable descriptor. Survey responses remain compact;
+/// this exact schema is returned only by `exec.describe`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CallableDescriptorV1 {
+    #[serde(rename = "$schema")]
+    pub schema: String,
+    pub instrument_id: String,
+    pub provider: Option<String>,
+    #[schemars(schema_with = "json_value_schema")]
+    pub input_schema: JsonValue,
+    #[schemars(schema_with = "optional_json_value_schema")]
+    pub output_schema: Option<JsonValue>,
+    pub replay: ReplayMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -384,6 +444,48 @@ impl SkillsServer {
             .collect()
     }
 
+    #[must_use]
+    pub async fn component_profile(&self) -> ComponentProfile {
+        let open = self.policy_engine.is_open();
+        let upstreams = if let Some(manager) = &self.upstream_manager {
+            manager.status().await
+        } else {
+            Vec::new()
+        };
+        let upstreams_ready = if open {
+            open_dependencies_ready(&upstreams)
+        } else {
+            upstreams.iter().all(|upstream| {
+                !upstream.required
+                    || matches!(
+                        upstream.state,
+                        crate::execution::upstream::ConnectionState::Connected
+                    )
+            })
+        };
+        ComponentProfile {
+            schema: "mesurii.component-profile.v1".to_string(),
+            component: "register".to_string(),
+            profile: self.policy_engine.state().mode,
+            ready: upstreams_ready && (!open || self.runtime.sandbox_backend().as_str() == "none"),
+            gates: if open {
+                Vec::new()
+            } else {
+                vec![
+                    "consent".to_string(),
+                    "allowlist".to_string(),
+                    "trust".to_string(),
+                    "deny".to_string(),
+                    "risk".to_string(),
+                    "call".to_string(),
+                    "timeout".to_string(),
+                ]
+            },
+            sandbox: self.runtime.sandbox_backend().as_str().to_string(),
+            upstreams,
+        }
+    }
+
     fn callable_info(record: &crate::core::CallableRecord) -> CallableInfo {
         CallableInfo {
             id: record.id.as_str().to_string(),
@@ -392,6 +494,32 @@ impl SkillsServer {
             fq_name: record.fq_name.clone(),
             server: record.server_alias.clone(),
             version: record.skill_version.clone(),
+        }
+    }
+
+    fn stable_instrument_id(record: &crate::core::CallableRecord) -> String {
+        match record.kind {
+            crate::core::CallableKind::Tool => format!(
+                "bench.{}.{}",
+                record.server_alias.as_deref().unwrap_or("local"),
+                record.upstream_tool_name.as_deref().unwrap_or(&record.name)
+            ),
+            crate::core::CallableKind::Skill => format!("bench.skill.{}", record.name),
+        }
+    }
+
+    fn descriptor(record: &crate::core::CallableRecord) -> CallableDescriptorV1 {
+        let schema_digest = record.schema_digest.as_str().to_string();
+        CallableDescriptorV1 {
+            schema: "skills.callable-descriptor.v1".to_string(),
+            instrument_id: Self::stable_instrument_id(record),
+            provider: record.server_alias.clone(),
+            input_schema: record.input_schema.clone(),
+            output_schema: record.output_schema.clone(),
+            replay: ReplayMetadata {
+                mode: "never".to_string(),
+                schema_digest,
+            },
         }
     }
 
@@ -406,6 +534,7 @@ impl SkillsServer {
             input_schema: None,
             output_schema: None,
             signature: None,
+            descriptor: Some(Self::descriptor(record)),
         };
 
         if format == "json_schema" || format == "both" {
@@ -616,6 +745,8 @@ impl SkillsServer {
     ) -> Result<Json<SearchOutput>, String> {
         debug!("search called with query: {}", input.q);
 
+        let include = input.include.clone();
+
         let query = SearchQuery {
             q: input.q,
             kind: input.kind,
@@ -635,9 +766,35 @@ impl SkillsServer {
         let matches = results
             .matches
             .into_iter()
-            .map(|search_match| {
-                serde_json::to_value(search_match)
-                    .map_err(|error| format!("Failed to serialize search result: {error}"))
+            .map(|search_match| -> Result<JsonValue, String> {
+                let mut value = serde_json::to_value(search_match)
+                    .map_err(|error| format!("Failed to serialize search result: {error}"))?;
+                if !include
+                    .as_ref()
+                    .and_then(|options| options.signature)
+                    .unwrap_or(false)
+                {
+                    value
+                        .as_object_mut()
+                        .map(|object| object.remove("signature_short"));
+                }
+                if !include
+                    .as_ref()
+                    .and_then(|options| options.schema_digest)
+                    .unwrap_or(false)
+                {
+                    value
+                        .as_object_mut()
+                        .map(|object| object.remove("schema_digest"));
+                }
+                if !include
+                    .as_ref()
+                    .and_then(|options| options.uses)
+                    .unwrap_or(false)
+                {
+                    value.as_object_mut().map(|object| object.remove("uses"));
+                }
+                Ok(value)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output = SearchOutput {
@@ -650,6 +807,8 @@ impl SkillsServer {
                 searched_servers: stats.servers.len(),
                 stale_servers: stats.stale_servers,
             },
+            policy: self.policy_engine.state(),
+            profile: self.component_profile().await,
         };
 
         info!("search returned {} matches", output.matches.len());
@@ -676,7 +835,7 @@ impl SkillsServer {
     /// the "Finite Context" principle while enabling full CRUD functionality.
     #[tool(
         name = "manage",
-        description = "Manage skill and upstream lifecycle. Operations: create/get/update/delete skills, add_upstream/remove_upstream/list_upstreams. For add_upstream: requires upstream_alias, transport, url|command, optional description and tags."
+        description = "Manage skills, upstreams, and the Mesurii Register profile. Operations: profile/create/get/update/delete, add_upstream/remove_upstream/list_upstreams."
     )]
     async fn manage(
         &self,
@@ -685,6 +844,16 @@ impl SkillsServer {
         debug!("manage called with operation: {:?}", input.operation);
 
         match input.operation {
+            ManageOperation::Profile => Ok(Json(ManageOutput {
+                operation: "profile".to_string(),
+                skill_id: None,
+                name: Some("register".to_string()),
+                message: "Mesurii Register component profile".to_string(),
+                data: Some(
+                    serde_json::to_value(self.component_profile().await)
+                        .map_err(|e| format!("Failed to serialize component profile: {e}"))?,
+                ),
+            })),
             ManageOperation::Create => {
                 let name = input.name.ok_or("name is required for create operation")?;
                 let description = input
@@ -894,6 +1063,7 @@ impl SkillsServer {
 
                 let config = crate::execution::upstream::UpstreamConfig {
                     alias: alias.clone(),
+                    required: false,
                     transport,
                     command: input.command,
                     url: input.url,
@@ -999,6 +1169,7 @@ impl SkillsServer {
 
                     crate::execution::upstream::UpstreamConfig {
                         alias: alias.clone(),
+                        required: current.required,
                         transport: current.transport,
                         command: input.command.or(current.command),
                         url: input.url.or(current.url),
@@ -1117,6 +1288,8 @@ pub struct DeleteSkillInput {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ManageOperation {
+    /// Return the resolved Mesurii Register component profile
+    Profile,
     /// Create a new skill
     Create,
     /// Get skill content
@@ -1261,5 +1434,49 @@ impl ServerHandler for SkillsServer {
 
         let tool_context = ToolCallContext::new(self, request, context);
         self.tool_router.call(tool_context).await
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::open_dependencies_ready;
+    use crate::execution::upstream::{ConnectionState, UpstreamStatus};
+
+    fn status(alias: &str, state: ConnectionState, required: bool) -> UpstreamStatus {
+        UpstreamStatus {
+            alias: alias.to_string(),
+            state,
+            tool_count: 1,
+            required,
+        }
+    }
+
+    #[test]
+    fn open_register_requires_both_core_upstreams() {
+        assert!(!open_dependencies_ready(&[]));
+        assert!(!open_dependencies_ready(&[status(
+            "codiium",
+            ConnectionState::Connected,
+            true,
+        )]));
+        assert!(open_dependencies_ready(&[
+            status("codiium", ConnectionState::Connected, true),
+            status("dociium", ConnectionState::Connected, true),
+        ]));
+        assert!(open_dependencies_ready(&[
+            status("codiium", ConnectionState::Connected, true),
+            status("dociium", ConnectionState::Connected, true),
+            status("aux-http", ConnectionState::Disconnected, false),
+        ]));
+        assert!(!open_dependencies_ready(&[
+            status("codiium", ConnectionState::Connected, true),
+            status("dociium", ConnectionState::Connected, true),
+            status("required-stdio", ConnectionState::Disconnected, true),
+        ]));
+        assert!(open_dependencies_ready(&[
+            status("codiium", ConnectionState::Connected, true),
+            status("dociium", ConnectionState::Connected, true),
+            status("required-stdio", ConnectionState::Connected, true),
+        ]));
     }
 }

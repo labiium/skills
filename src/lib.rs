@@ -9,7 +9,7 @@ pub mod mcp;
 pub mod paths;
 pub mod storage;
 
-pub use core::policy::{ConsentLevel, PolicyConfig, PolicyEngine};
+pub use core::policy::{ConsentLevel, PolicyConfig, PolicyEngine, PolicyMode, PolicyState};
 pub use core::registry::{Registry, ServerHealth, ServerInfo};
 pub use core::{
     BundledTool, CallableId, CallableKind, CallableRecord, CallableSignature, CostHints,
@@ -17,7 +17,7 @@ pub use core::{
 };
 
 pub use execution::upstream::{
-    ConnectionState, Transport, UpstreamConfig, UpstreamError, UpstreamManager,
+    ConnectionState, Transport, UpstreamConfig, UpstreamError, UpstreamManager, UpstreamStatus,
 };
 pub use execution::{
     sandbox::{

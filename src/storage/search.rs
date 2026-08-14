@@ -78,6 +78,12 @@ pub struct SearchMatch {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uses: Option<Vec<String>>,
+
+    /// Stable Mesurii instrument contract, additive to the existing search wire shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrument_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Search results
@@ -92,6 +98,17 @@ pub struct SearchResults {
 pub struct SearchEngine {
     registry: Arc<Registry>,
     index: Arc<RwLock<InMemoryIndex>>,
+}
+
+fn stable_instrument_id(record: &CallableRecord) -> String {
+    match record.kind {
+        CallableKind::Tool => format!(
+            "bench.{}.{}",
+            record.server_alias.as_deref().unwrap_or("local"),
+            record.upstream_tool_name.as_deref().unwrap_or(&record.name)
+        ),
+        CallableKind::Skill => format!("bench.skill.{}", record.name),
+    }
 }
 
 impl SearchEngine {
@@ -134,6 +151,10 @@ impl SearchEngine {
     /// # Errors
     /// Returns an error if the operation cannot be completed.
     #[expect(
+        clippy::too_many_lines,
+        reason = "search keeps filtering, exhaustive enumeration, ranking, and pagination together"
+    )]
+    #[expect(
         clippy::unused_async,
         reason = "search remains async as part of the public server interface"
     )]
@@ -144,7 +165,8 @@ impl SearchEngine {
             ));
         }
 
-        debug!("Search query: {:?}", query.q);
+        let exhaustive = query.q == "*";
+        debug!("Search query: {:?} (exhaustive={exhaustive})", query.q);
 
         // Detect query intent
 
@@ -172,25 +194,37 @@ impl SearchEngine {
         }
 
         // Score and rank matches using field-weighted, separator-insensitive matching.
-        let mut scored: Vec<(CallableRecord, f64)> = candidates
-            .into_iter()
-            .filter_map(|record| {
-                let body = {
-                    let index = self.index.read();
-                    index.body_texts.get(record.id.as_str()).cloned()
-                };
-                let score = score_record(&query.q, &record, body.as_deref());
+        let mut scored: Vec<(CallableRecord, f64)> = if exhaustive {
+            candidates.into_iter().map(|record| (record, 0.0)).collect()
+        } else {
+            candidates
+                .into_iter()
+                .filter_map(|record| {
+                    let body = {
+                        let index = self.index.read();
+                        index.body_texts.get(record.id.as_str()).cloned()
+                    };
+                    let score = score_record(&query.q, &record, body.as_deref());
 
-                if score > 0.0 {
-                    Some((record, score))
-                } else {
-                    None
-                }
-            })
-            .collect();
+                    if score > 0.0 {
+                        Some((record, score))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
 
         // Sort by score descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if exhaustive {
+            scored.sort_by(|(left, _), (right, _)| {
+                stable_instrument_id(left)
+                    .cmp(&stable_instrument_id(right))
+                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+            });
+        } else {
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
 
         let total_matches = scored.len();
 
@@ -237,6 +271,8 @@ impl SearchEngine {
                     } else {
                         None
                     },
+                    instrument_id: Some(stable_instrument_id(&record)),
+                    provider: record.server_alias.clone(),
                 }
             })
             .collect();

@@ -8,6 +8,7 @@
 
 use crate::{CallableRecord, RiskTier};
 use glob::Pattern;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -40,6 +41,26 @@ pub enum ConsentLevel {
     AdminConfirmed,
 }
 
+/// Effective authorization profile. `Open` is intended for a Mesurii workspace
+/// (the workspace boundary is the trust boundary); the historical profile stays
+/// the default for other consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    #[default]
+    Standard,
+    Open,
+}
+
+impl std::fmt::Display for PolicyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Standard => "standard",
+            Self::Open => "open",
+        })
+    }
+}
+
 impl FromStr for ConsentLevel {
     type Err = (); // Infallible - defaults to None
 
@@ -65,6 +86,9 @@ impl std::fmt::Display for ConsentLevel {
 /// Policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
+    /// Authorization profile. `SKILLS_POLICY=open` selects the open profile at runtime.
+    #[serde(default)]
+    pub mode: PolicyMode,
     /// Default risk tier for unknown callables
     #[serde(default = "default_risk")]
     pub default_risk: String,
@@ -113,6 +137,7 @@ const fn default_max_exec_ms() -> u64 {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            mode: PolicyMode::Standard,
             default_risk: default_risk(),
             require_consent_for: vec![
                 "writes".to_string(),
@@ -127,6 +152,52 @@ impl Default for PolicyConfig {
             deny_patterns: vec![],
         }
     }
+}
+
+impl PolicyConfig {
+    /// Return the explicitly open profile used by Mesurii workspaces.
+    #[must_use]
+    pub fn open() -> Self {
+        Self {
+            mode: PolicyMode::Open,
+            require_consent_for: vec![],
+            trusted_servers: vec!["*".to_string()],
+            max_calls_per_skill: usize::MAX,
+            max_exec_ms: u64::MAX,
+            ..Self::default()
+        }
+    }
+
+    /// Apply the process-level policy selector without changing non-open configs.
+    #[must_use]
+    pub fn from_environment(config: Self) -> Self {
+        Self::from_selector(config, std::env::var("SKILLS_POLICY").ok().as_deref())
+    }
+
+    #[must_use]
+    pub fn from_selector(mut config: Self, selector: Option<&str>) -> Self {
+        if selector.is_some_and(|value| value.trim().eq_ignore_ascii_case("open")) {
+            config.mode = PolicyMode::Open;
+            config.require_consent_for.clear();
+            config.trusted_servers = vec!["*".to_string()];
+            config.allow_patterns = vec!["*".to_string()];
+            config.deny_patterns.clear();
+            config.deny_tags.clear();
+            config.max_calls_per_skill = usize::MAX;
+            config.max_exec_ms = u64::MAX;
+        }
+        config
+    }
+}
+
+/// Machine-readable effective policy state exposed by the MCP façade.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyState {
+    pub mode: String,
+    pub unconditional: bool,
+    /// `None` denotes an intentional unbounded limit in the open workspace profile.
+    pub max_calls_per_skill: Option<usize>,
+    pub max_exec_ms: Option<u64>,
 }
 
 /// Authorization result
@@ -169,6 +240,7 @@ impl AuthorizationResult {
 /// Policy engine
 pub struct PolicyEngine {
     config: PolicyConfig,
+    mode: PolicyMode,
     consent_required_tiers: HashSet<RiskTier>,
     trusted_servers: HashSet<String>,
     deny_tags: HashSet<String>,
@@ -180,7 +252,11 @@ impl PolicyEngine {
     /// Create new policy engine from config
     /// # Errors
     /// Returns an error if the operation cannot be completed.
-    pub fn new(config: PolicyConfig) -> Result<Self> {
+    pub fn new(mut config: PolicyConfig) -> Result<Self> {
+        if config.mode == PolicyMode::Open {
+            config.max_calls_per_skill = usize::MAX;
+            config.max_exec_ms = u64::MAX;
+        }
         let consent_required_tiers: HashSet<RiskTier> = config
             .require_consent_for
             .iter()
@@ -202,8 +278,10 @@ impl PolicyEngine {
             .filter_map(|p| Pattern::new(p).ok())
             .collect();
 
+        let mode = config.mode;
         Ok(Self {
             config,
+            mode,
             consent_required_tiers,
             trusted_servers,
             deny_tags,
@@ -216,6 +294,7 @@ impl PolicyEngine {
     #[must_use]
     pub fn new_permissive() -> Self {
         let config = PolicyConfig {
+            mode: PolicyMode::Open,
             default_risk: "read_only".to_string(),
             require_consent_for: vec![],
             trusted_servers: vec!["*".to_string()],
@@ -233,6 +312,7 @@ impl PolicyEngine {
             allow_patterns: Pattern::new("*").into_iter().collect(),
             deny_patterns: Vec::new(),
             config,
+            mode: PolicyMode::Open,
         }
     }
 
@@ -250,6 +330,12 @@ impl PolicyEngine {
         consent: ConsentLevel,
     ) -> Result<AuthorizationResult> {
         debug!("Authorizing callable: {}", callable.id.as_str());
+
+        // Open means the workspace is the trust boundary. Deliberately bypass
+        // consent, trust, allowlist, denylist, and risk-tier gates.
+        if self.mode == PolicyMode::Open {
+            return Ok(AuthorizationResult::allow());
+        }
 
         // Check deny tags
         for tag in &callable.tags {
@@ -345,6 +431,22 @@ impl PolicyEngine {
     #[must_use]
     pub const fn max_calls_per_skill(&self) -> usize {
         self.config.max_calls_per_skill
+    }
+
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.mode == PolicyMode::Open
+    }
+
+    #[must_use]
+    pub fn state(&self) -> PolicyState {
+        PolicyState {
+            mode: self.mode.to_string(),
+            unconditional: self.is_open(),
+            max_calls_per_skill: (self.mode != PolicyMode::Open)
+                .then_some(self.config.max_calls_per_skill),
+            max_exec_ms: (self.mode != PolicyMode::Open).then_some(self.config.max_exec_ms),
+        }
     }
 
     /// Check if a server is trusted

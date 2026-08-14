@@ -11,17 +11,33 @@ use skillsrs::storage::SkillStore;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
+    create_empty_server_with_policy(PolicyConfig::default())
+}
+
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
+fn create_empty_server_with_policy(
+    policy: PolicyConfig,
+) -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
     let registry = Arc::new(Registry::new());
     let search_engine = Arc::new(SearchEngine::new(registry.clone()));
-    let policy_engine =
-        Arc::new(skillsrs::core::policy::PolicyEngine::new(PolicyConfig::default()).unwrap());
+    let open = policy.mode == skillsrs::core::policy::PolicyMode::Open;
+    let policy_engine = Arc::new(skillsrs::core::policy::PolicyEngine::new(policy).unwrap());
     let upstream_manager = Arc::new(UpstreamManager::new(registry.clone()));
-    let runtime = Arc::new(Runtime::new(registry.clone(), upstream_manager));
+    let runtime = if open {
+        let mut sandbox = skillsrs::execution::sandbox::SandboxConfig::default();
+        sandbox.backend = skillsrs::execution::sandbox::SandboxBackend::None;
+        Arc::new(Runtime::with_sandbox_config(
+            registry.clone(),
+            upstream_manager,
+            sandbox,
+        ))
+    } else {
+        Arc::new(Runtime::new(registry.clone(), upstream_manager))
+    };
     let temp_dir = TempDir::new().unwrap();
     let skill_store = Arc::new(
         SkillStore::with_search_engine(temp_dir.path(), registry.clone(), search_engine.clone())
@@ -41,12 +57,17 @@ fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
     )
 }
 
+fn create_server_with_test_tool() -> (SkillsServer, String) {
+    create_server_with_test_tool_policy(PolicyConfig::default())
+}
+
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-fn create_server_with_test_tool() -> (SkillsServer, String) {
-    let (server, registry, search_engine) = create_empty_server();
+fn create_server_with_test_tool_policy(policy: PolicyConfig) -> (SkillsServer, String) {
+    let open = policy.mode == skillsrs::core::policy::PolicyMode::Open;
+    let (server, registry, search_engine) = create_empty_server_with_policy(policy);
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -78,7 +99,11 @@ fn create_server_with_test_tool() -> (SkillsServer, String) {
             bundled_tools: vec![],
             additional_files: vec![],
             cost_hints: skillsrs::core::CostHints::default(),
-            risk_tier: skillsrs::core::RiskTier::ReadOnly,
+            risk_tier: if open {
+                skillsrs::core::RiskTier::Admin
+            } else {
+                skillsrs::core::RiskTier::ReadOnly
+            },
             last_seen: chrono::Utc::now(),
             sandbox_config: None,
         })
@@ -128,6 +153,35 @@ fn test_server_creation() {
 }
 
 #[tokio::test]
+async fn test_open_register_component_profile_is_versioned_and_gate_free() {
+    let (server, _, _) = create_empty_server_with_policy(PolicyConfig::open());
+    let profile = server.component_profile().await;
+    assert_eq!(profile.schema, "mesurii.component-profile.v1");
+    assert_eq!(profile.component, "register");
+    assert_eq!(profile.profile, "open");
+    assert!(!profile.ready);
+    assert!(profile.gates.is_empty());
+    assert_eq!(profile.sandbox, "none");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast with source-local context"
+)]
+async fn test_open_profile_reaches_registered_off_panel_instrument() {
+    let (server, id) = create_server_with_test_tool_policy(PolicyConfig::open());
+    let response = server
+        .exec_callable(ExecInput {
+            dry_run: true,
+            ..exec_input(id, serde_json::json!({"path": "workspace"}))
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.mode, "dry_run");
+}
+
+#[tokio::test]
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
@@ -147,6 +201,10 @@ async fn test_exec_describe_returns_schema() {
     assert_eq!(response.mode, "describe");
     assert_eq!(response.callable.name, "test-tool");
     let description = response.description.unwrap();
+    assert_eq!(
+        description.descriptor.as_ref().unwrap().schema,
+        "skills.callable-descriptor.v1"
+    );
     assert!(description.input_schema.is_some());
     assert!(description.signature.is_none());
     assert!(response.dry_run.is_none());

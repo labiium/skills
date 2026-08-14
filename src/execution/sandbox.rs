@@ -268,6 +268,20 @@ pub enum SandboxBackend {
     Wasm,
 }
 
+impl SandboxBackend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Timeout => "timeout",
+            Self::Restricted => "restricted",
+            Self::Bubblewrap => "bubblewrap",
+            Self::Docker => "docker",
+            Self::Wasm => "wasm",
+        }
+    }
+}
+
 /// Docker container configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerConfig {
@@ -641,6 +655,16 @@ impl Sandbox {
         }
 
         let start = std::time::Instant::now();
+        if self.config.timeout_ms == 0 {
+            let output = cmd.output().await.map_err(SandboxError::Io)?;
+            return Ok(SandboxResult {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                exit_code: output.status.code(),
+                duration_ms: elapsed_millis(start),
+                timed_out: false,
+            });
+        }
         let timeout = Duration::from_millis(self.config.timeout_ms);
 
         let output = match tokio::time::timeout(timeout, cmd.output()).await {
