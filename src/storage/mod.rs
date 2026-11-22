@@ -746,7 +746,10 @@ impl SkillStore {
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
                 // Reads generate access events; reloading them would create a feedback loop.
-                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+                if matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                ) {
                     let _ = event_tx.send(event);
                 }
             }
@@ -776,7 +779,6 @@ impl SkillStore {
                 }
             }
         });
-
 
         info!("Started filesystem watcher on: {:?}", root);
         Ok(reload_rx)

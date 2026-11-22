@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Local skill search and activation no longer connect to upstreams. Mixed CLI discovery skips unavailable optional upstreams; targeted commands connect only to the named upstream.
 - `add-mcp` leaves config unchanged on failed discovery unless `--no-test` is supplied. Stdio registration and editing preserve individual arguments after `--`.
 - Skill import uses the tracked source form for both discovery and installation. A config save failure rolls back package and ownership changes.
+- CI, coverage, benchmarks, and Docker workflows now target `master`, the repository’s default branch.
 
 ### Removed
 - Placeholder workflow execution, unenforced policy fields, and unsupported performance and compatibility claims. Unknown configuration fields now fail validation.
