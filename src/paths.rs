@@ -158,6 +158,7 @@ impl Default for SkillsPaths {
 
 /// Configuration overrides for paths
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathsConfig {
     /// Override data directory
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +190,15 @@ impl PathsConfig {
     pub fn apply_to(&self, mut paths: SkillsPaths) -> SkillsPaths {
         if let Some(ref data_dir) = self.data_dir {
             paths.data_dir.clone_from(data_dir);
+            if self.database_path.is_none() {
+                paths.database_path = data_dir.join("skills.db");
+            }
+            if self.cache_dir.is_none() {
+                paths.cache_dir = data_dir.join("cache");
+            }
+            if self.logs_dir.is_none() {
+                paths.logs_dir = data_dir.join("logs");
+            }
         }
         if let Some(ref config_dir) = self.config_dir {
             paths.config_dir.clone_from(config_dir);
@@ -224,11 +234,30 @@ pub fn paths_from_env() -> PathsConfig {
             let base = PathBuf::from(path);
             PathsConfig {
                 data_dir: Some(base.clone()),
-                config_dir: None,
+                config_dir: Some(base.join("config")),
                 cache_dir: Some(base.join("cache")),
                 database_path: Some(base.join("skills.db")),
                 logs_dir: Some(base.join("logs")),
             }
         },
     )
+}
+
+/// Ordered native skill locations: trusted project scopes, then user scopes.
+#[must_use]
+pub fn shared_skill_roots(project: Option<&Path>, home: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(project) = project {
+        let git_root = project.ancestors().find(|path| path.join(".git").exists());
+        for directory in project.ancestors() {
+            roots.push(directory.join(".agents/skills"));
+            roots.push(directory.join(".claude/skills"));
+            if git_root.is_none() || git_root == Some(directory) {
+                break;
+            }
+        }
+    }
+    roots.push(home.join(".agents/skills"));
+    roots.push(home.join(".claude/skills"));
+    roots
 }

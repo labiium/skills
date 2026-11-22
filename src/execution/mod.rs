@@ -11,14 +11,17 @@ pub mod upstream;
 pub mod wasm;
 
 use crate::core::registry::Registry;
-use crate::core::{BundledTool, CallableId, CallableKind, ToolResult, ToolResultContent};
+use crate::core::{
+    BundledTool, CallableId, CallableKind, ExecutionStatus, ToolResult, ToolResultContent,
+};
 use crate::execution::sandbox::SandboxConfigOverride;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use upstream::UpstreamManager;
 use uuid::Uuid;
 
@@ -65,8 +68,8 @@ pub struct ExecContext {
 pub struct TraceStep {
     pub step_index: usize,
     pub callable_id: String,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
     pub duration_ms: Option<u64>,
     pub success: bool,
     pub error: Option<String>,
@@ -76,8 +79,8 @@ pub struct TraceStep {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionTrace {
     pub execution_id: String,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
     pub total_duration_ms: Option<u64>,
     pub steps: Vec<TraceStep>,
 }
@@ -86,7 +89,7 @@ impl ExecutionTrace {
     fn new() -> Self {
         Self {
             execution_id: Uuid::new_v4().to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: Timestamp::now(),
             completed_at: None,
             total_duration_ms: None,
             steps: Vec::new(),
@@ -94,23 +97,14 @@ impl ExecutionTrace {
     }
 
     fn complete(&mut self) {
-        self.completed_at = Some(chrono::Utc::now());
-        if let Some(completed) = self.completed_at {
-            self.total_duration_ms = Some(duration_ms(self.started_at, completed));
-        }
+        let completed_at = Timestamp::now();
+        self.completed_at = Some(completed_at);
+        self.total_duration_ms = Some(duration_ms(self.started_at, completed_at));
     }
 }
 
-fn duration_ms(
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: chrono::DateTime<chrono::Utc>,
-) -> u64 {
-    u64::try_from(
-        completed_at
-            .signed_duration_since(started_at)
-            .num_milliseconds(),
-    )
-    .unwrap_or(0)
+fn duration_ms(started_at: Timestamp, completed_at: Timestamp) -> u64 {
+    u64::try_from(completed_at.duration_since(started_at).as_millis()).unwrap_or(0)
 }
 
 /// Runtime executor
@@ -147,10 +141,15 @@ impl Runtime {
         }
     }
 
-    pub const fn set_unrestricted(&mut self) {
+    pub fn set_unrestricted(&mut self) {
         self.unrestricted = true;
         self.sandbox_config.backend = sandbox::SandboxBackend::None;
         self.sandbox_config.timeout_ms = 0;
+        self.sandbox_config.allow_network = true;
+        self.sandbox_config.allow_read.clear();
+        self.sandbox_config.allow_write.clear();
+        self.sandbox_config.max_memory_bytes = 0;
+        self.sandbox_config.max_cpu_seconds = 0;
     }
 
     #[must_use]
@@ -162,69 +161,173 @@ impl Runtime {
     /// # Errors
     /// Returns an error if the operation cannot be completed.
     pub async fn execute(&self, ctx: ExecContext) -> Result<ToolResult> {
-        let mut trace = if ctx.trace_enabled {
-            Some(ExecutionTrace::new())
+        self.execute_with_continuation(ctx, None, None).await
+    }
+
+    /// Resume an upstream tool without modifying its opaque continuation payload.
+    /// # Errors
+    /// Returns validation, upstream, or effective-deadline errors.
+    pub async fn execute_with_continuation(
+        &self,
+        ctx: ExecContext,
+        input_responses: Option<serde_json::Value>,
+        request_state: Option<serde_json::Value>,
+    ) -> Result<ToolResult> {
+        let record = self.get_callable_record(&ctx.callable_id)?;
+        self.validate_callable_arguments(&ctx.callable_id, &ctx.arguments)?;
+        if record.kind == CallableKind::Skill
+            && (input_responses.is_some() || request_state.is_some())
+        {
+            return Err(RuntimeError::ValidationFailed(
+                "Only upstream tools accept continuation data".to_string(),
+            ));
+        }
+        let mut trace = ctx.trace_enabled.then(ExecutionTrace::new);
+        let operation = async {
+            match record.kind {
+                CallableKind::Tool => {
+                    self.execute_tool(&ctx, &record, input_responses, request_state)
+                        .await
+                }
+                CallableKind::Skill => self.execute_skill(&ctx, &record, trace.as_mut()).await,
+            }
+        };
+        let mut result = if let Some(timeout) = self.effective_timeout(&ctx, &record) {
+            tokio::time::timeout(Duration::from_millis(timeout), operation)
+                .await
+                .map_err(|_| RuntimeError::Timeout(timeout))??
+        } else {
+            operation.await?
+        };
+        if let Some(mut trace) = trace {
+            if result.status == ExecutionStatus::Completed {
+                trace.complete();
+            }
+            result.trace = Some(
+                serde_json::to_value(trace).map_err(|e| RuntimeError::Internal(e.to_string()))?,
+            );
+        }
+        Ok(result)
+    }
+
+    fn effective_timeout(
+        &self,
+        ctx: &ExecContext,
+        record: &crate::core::CallableRecord,
+    ) -> Option<u64> {
+        if self.unrestricted {
+            return None;
+        }
+        let config = record.sandbox_config.as_ref().map_or_else(
+            || self.sandbox_config.clone(),
+            |overrides| self.sandbox_config.with_override(overrides),
+        );
+        match (config.timeout_ms, ctx.timeout_ms.filter(|value| *value > 0)) {
+            (0, timeout) => timeout,
+            (configured, Some(requested)) => Some(configured.min(requested)),
+            (configured, None) => Some(configured),
+        }
+    }
+
+    /// Run only an explicitly selected bundled helper, by name or skill-relative path.
+    /// # Errors
+    /// Rejects unknown/ambiguous helpers and returns validation or process failures.
+    pub async fn execute_script(&self, ctx: ExecContext, script: &str) -> Result<ToolResult> {
+        let record = self.get_callable_record(&ctx.callable_id)?;
+        let (tool, root) = Self::selected_script(&record, script)?;
+        Self::validate_arguments(&tool.schema, &ctx.arguments)?;
+        let started_at = Timestamp::now();
+        let mut result = self
+            .execute_bundled_tool(
+                tool,
+                &ctx.arguments,
+                &root,
+                self.effective_timeout(&ctx, &record),
+                if self.unrestricted {
+                    None
+                } else {
+                    record.sandbox_config.as_ref()
+                },
+            )
+            .await?;
+        if ctx.trace_enabled {
+            let mut trace = ExecutionTrace::new();
+            trace.started_at = started_at;
+            trace.complete();
+            result.trace = Some(
+                serde_json::to_value(trace)
+                    .map_err(|error| RuntimeError::Internal(error.to_string()))?,
+            );
+        }
+        Ok(result)
+    }
+
+    /// Validate an explicit helper selection without starting a process.
+    /// # Errors
+    /// Rejects missing/ambiguous helpers and arguments missing required fields.
+    pub fn validate_script_arguments(
+        &self,
+        callable_id: &CallableId,
+        script: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<()> {
+        let record = self.get_callable_record(callable_id)?;
+        let (tool, _) = Self::selected_script(&record, script)?;
+        Self::validate_arguments(&tool.schema, arguments)
+    }
+
+    fn selected_script<'a>(
+        record: &'a crate::core::CallableRecord,
+        script: &str,
+    ) -> Result<(&'a BundledTool, std::path::PathBuf)> {
+        if record.kind != CallableKind::Skill {
+            return Err(RuntimeError::ValidationFailed(
+                "Script selection requires a skill".to_string(),
+            ));
+        }
+        let root = record
+            .skill_directory
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::ExecutionFailed("Skill directory is unavailable".to_string())
+            })?
+            .canonicalize()?;
+        let relative = Path::new(script);
+        let selected_path = if !script.is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            root.join(relative)
+                .canonicalize()
+                .ok()
+                .filter(|path| path.starts_with(&root))
         } else {
             None
         };
-
-        info!("Executing callable: {}", ctx.callable_id.as_str());
-
-        let record = self.get_callable_record(&ctx.callable_id)?;
-
-        // Validate arguments against schema
-        self.validate_callable_arguments(&ctx.callable_id, &ctx.arguments)?;
-
-        // Apply timeout
-        // Execute based on callable kind
-        let result = match record.kind {
-            CallableKind::Tool => {
-                if let Some(timeout_ms) = (!self.unrestricted).then_some(ctx.timeout_ms).flatten() {
-                    tokio::time::timeout(
-                        Duration::from_millis(timeout_ms),
-                        self.execute_tool(&ctx, &record),
-                    )
-                    .await
-                    .map_err(|_| RuntimeError::Timeout(timeout_ms))?
-                } else {
-                    self.execute_tool(&ctx, &record).await
-                }
-            }
-            CallableKind::Skill => {
-                if let Some(timeout_ms) = (!self.unrestricted).then_some(ctx.timeout_ms).flatten() {
-                    tokio::time::timeout(
-                        Duration::from_millis(timeout_ms),
-                        self.execute_skill(&ctx, &record, trace.as_mut()),
-                    )
-                    .await
-                    .map_err(|_| RuntimeError::Timeout(timeout_ms))?
-                } else {
-                    self.execute_skill(&ctx, &record, trace.as_mut()).await
-                }
-            }
-        }?;
-
-        // Complete trace
-        if let Some(ref mut trace) = trace {
-            trace.complete();
+        let mut matches = record.bundled_tools.iter().filter(|tool| {
+            tool.name == script
+                || selected_path.as_ref().is_some_and(|selected| {
+                    tool.command.iter().any(|part| {
+                        let path = Path::new(part);
+                        let path = if path.is_absolute() {
+                            path.to_path_buf()
+                        } else {
+                            root.join(path)
+                        };
+                        path.canonicalize().is_ok_and(|path| path == *selected)
+                    })
+                })
+        });
+        let tool = matches.next().ok_or_else(|| {
+            RuntimeError::ValidationFailed(format!("Unknown bundled helper: {script}"))
+        })?;
+        if matches.next().is_some() {
+            return Err(RuntimeError::ValidationFailed(format!(
+                "Ambiguous bundled helper: {script}"
+            )));
         }
-
-        // Add trace to result if enabled
-        if let Some(trace) = trace {
-            let mut result_with_trace = result;
-            if let Some(ref mut structured) = result_with_trace.structured_content {
-                if let Some(obj) = structured.as_object_mut() {
-                    let trace = serde_json::to_value(trace)
-                        .map_err(|error| RuntimeError::Internal(error.to_string()))?;
-                    obj.insert("trace".to_string(), trace);
-                }
-            } else {
-                result_with_trace.structured_content = Some(serde_json::json!({ "trace": trace }));
-            }
-            return Ok(result_with_trace);
-        }
-
-        Ok(result)
+        Ok((tool, root))
     }
 
     /// Validate arguments for a registered callable without executing it.
@@ -236,6 +339,9 @@ impl Runtime {
         arguments: &serde_json::Value,
     ) -> Result<()> {
         let record = self.get_callable_record(callable_id)?;
+        if record.kind == CallableKind::Skill {
+            return Ok(());
+        }
         Self::validate_arguments(&record.input_schema, arguments)
     }
 
@@ -276,6 +382,8 @@ impl Runtime {
         &self,
         ctx: &ExecContext,
         record: &crate::core::CallableRecord,
+        input_responses: Option<serde_json::Value>,
+        request_state: Option<serde_json::Value>,
     ) -> Result<ToolResult> {
         debug!("Executing tool: {}", record.fq_name);
 
@@ -294,98 +402,18 @@ impl Runtime {
             server, tool_name
         );
 
-        // Call upstream server
-        let result = self
+        let raw = self
             .upstream_manager
-            .call_tool(server, tool_name, ctx.arguments.clone())
+            .call_tool_with_continuation(
+                server,
+                tool_name,
+                ctx.arguments.clone(),
+                input_responses,
+                request_state,
+            )
             .await
-            .map_err(|e| RuntimeError::UpstreamError(e.to_string()))?;
-
-        // Convert upstream JSON response to ToolResult
-        // MCP tools/call returns { content: [...], isError?: bool }
-        let is_error = result
-            .get("isError")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        let content = result
-            .get("content")
-            .and_then(serde_json::Value::as_array)
-            .map_or_else(
-                || {
-                    vec![ToolResultContent::Text {
-                        text: result.to_string(),
-                    }]
-                },
-                |content_array| {
-                    content_array
-                        .iter()
-                        .filter_map(|item| {
-                            item.get("type")
-                                .and_then(serde_json::Value::as_str)
-                                .and_then(|item_type| match item_type {
-                                    "text" => {
-                                        let text =
-                                            item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                        Some(ToolResultContent::Text {
-                                            text: text.to_string(),
-                                        })
-                                    }
-                                    "image" => {
-                                        let data =
-                                            item.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                                        let mime_type = item
-                                            .get("mimeType")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("image/png")
-                                            .to_string();
-                                        Some(ToolResultContent::Image {
-                                            data: data.to_string(),
-                                            mime_type,
-                                        })
-                                    }
-                                    "resource" => {
-                                        let uri =
-                                            item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                                        let mime_type: Option<&str> =
-                                            item.get("mimeType").and_then(|v| v.as_str());
-                                        let text: Option<&str> =
-                                            item.get("text").and_then(|v| v.as_str());
-                                        let blob: Option<&str> =
-                                            item.get("blob").and_then(|v| v.as_str());
-
-                                        Some(ToolResultContent::Resource {
-                                            resource: crate::core::ResourceContent {
-                                                uri: uri.to_string(),
-                                                mime_type: mime_type.map(|s: &str| s.to_string()),
-                                                text: text.map(|s: &str| s.to_string()),
-                                                blob: blob.map(|s: &str| s.to_string()),
-                                            },
-                                        })
-                                    }
-                                    _ => None,
-                                })
-                        })
-                        .collect()
-                },
-            );
-
-        if content.is_empty() && !is_error {
-            error!("Tool returned empty content, treating as error");
-            return Ok(ToolResult {
-                content: vec![ToolResultContent::Text {
-                    text: "Tool returned no content".to_string(),
-                }],
-                structured_content: Some(result),
-                is_error: true,
-            });
-        }
-
-        Ok(ToolResult {
-            content,
-            structured_content: Some(result),
-            is_error,
-        })
+            .map_err(|error| RuntimeError::UpstreamError(error.to_string()))?;
+        Ok(ToolResult::from_upstream(raw))
     }
 
     /// Execute a skill (workflow orchestration)
@@ -395,84 +423,41 @@ impl Runtime {
         record: &crate::core::CallableRecord,
         trace: Option<&mut ExecutionTrace>,
     ) -> Result<ToolResult> {
-        debug!("Executing skill: {}", record.fq_name);
-
-        let step_start = chrono::Utc::now();
-
-        // Skills are instructions for agents (progressive disclosure)
-        // This implementation handles skills with bundled tools
-        // For skills that only reference MCP tools, the agent loads SKILL.md and calls them
-
-        info!("Executing skill workflow: {}", record.fq_name);
-
-        // Check if this skill has bundled tools
-        if !record.bundled_tools.is_empty() {
-            // For now, execute the first bundled tool as the entrypoint
-            // In a full implementation, SKILL.md would specify which tool to run
-            if let Some(bundled_tool) = record.bundled_tools.first() {
-                info!("Executing bundled tool: {}", bundled_tool.name);
-
-                // Extract tool-level sandbox config from skill record
-                let tool_override = record.sandbox_config.as_ref();
-                let result = self
-                    .execute_bundled_tool(
-                        bundled_tool,
-                        &ctx.arguments,
-                        if self.unrestricted {
-                            None
-                        } else {
-                            ctx.timeout_ms
-                        },
-                        if self.unrestricted {
-                            None
-                        } else {
-                            tool_override
-                        },
-                    )
-                    .await?;
-
-                // Record trace step
-                if let Some(trace) = trace {
-                    let step_end = chrono::Utc::now();
-                    let duration = duration_ms(step_start, step_end);
-
-                    trace.steps.push(TraceStep {
-                        step_index: trace.steps.len(),
-                        callable_id: ctx.callable_id.as_str().to_string(),
-                        started_at: step_start,
-                        completed_at: Some(step_end),
-                        duration_ms: Some(duration),
-                        success: !result.is_error,
-                        error: None,
-                    });
-                }
-
-                return Ok(result);
-            }
+        let step_start = Timestamp::now();
+        let root = record
+            .skill_directory
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::ExecutionFailed("Skill directory is unavailable".to_string())
+            })?
+            .canonicalize()?;
+        let document_path = root.join("SKILL.md").canonicalize()?;
+        if !document_path.starts_with(&root) {
+            return Err(RuntimeError::ExecutionFailed(
+                "SKILL.md escapes the skill directory".to_string(),
+            ));
         }
-
-        // Return skill info for agent to load SKILL.md
-        let result = ToolResult {
-            content: vec![ToolResultContent::Text {
-                text: format!(
-                    "Skill {} provides instructions for agent. Load SKILL.md for details.",
-                    record.fq_name
-                ),
-            }],
-            structured_content: Some(serde_json::json!({
-                "skill": record.name,
-                "version": record.skill_version,
-                "uses_tools": record.uses.iter().map(super::core::CallableId::as_str).collect::<Vec<_>>(),
-                "bundled_tools": record.bundled_tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
-                "additional_files": &record.additional_files,
-                "message": "Load SKILL.md to see instructions"
-            })),
-            is_error: false,
+        let document = tokio::fs::read_to_string(document_path).await?;
+        let body = if document.starts_with("---\n") || document.starts_with("---\r\n") {
+            crate::storage::agent_skills::parse_frontmatter_public(&document)
+                .map_err(|error| RuntimeError::ExecutionFailed(error.to_string()))?
+                .1
+        } else {
+            document
         };
+        let result = ToolResult::success(body.clone()).with_structured(serde_json::json!({
+            "skill": record.name,
+            "version": record.skill_version,
+            "body": body,
+            "resources_root": root,
+            "uses_tools": record.uses.iter().map(CallableId::as_str).collect::<Vec<_>>(),
+            "bundled_tools": record.bundled_tools.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            "additional_files": record.additional_files,
+        }));
 
         // Record trace step
         if let Some(trace) = trace {
-            let step_end = chrono::Utc::now();
+            let step_end = Timestamp::now();
             let duration = duration_ms(step_start, step_end);
 
             trace.steps.push(TraceStep {
@@ -498,6 +483,7 @@ impl Runtime {
         &self,
         tool: &BundledTool,
         arguments: &serde_json::Value,
+        working_dir: &Path,
         timeout_ms: Option<u64>,
         tool_sandbox_override: Option<&SandboxConfigOverride>,
     ) -> Result<ToolResult> {
@@ -509,7 +495,7 @@ impl Runtime {
             .command
             .first()
             .ok_or_else(|| RuntimeError::BundledToolError("Empty command".to_string()))?;
-        let args = tool.command.get(1..).unwrap_or_default().to_vec();
+        let args = tool.command.get(1..).unwrap_or_default();
 
         debug!(
             "Executing bundled tool: {} with command: {:?}",
@@ -521,20 +507,9 @@ impl Runtime {
             RuntimeError::BundledToolError(format!("Failed to serialize arguments: {e}"))
         })?;
 
-        // Determine working directory from script path
-        let working_dir = if args.is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        } else {
-            Path::new(args.first().map_or("", String::as_str))
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-
-        // Prepare environment variables
-        let temp_dir = std::env::temp_dir();
-        let args_file = temp_dir.join(format!("skill_args_{}.json", Uuid::new_v4()));
-        std::fs::write(&args_file, &args_json)?;
+        let invocation = tempfile::tempdir()?;
+        let args_file = invocation.path().join("arguments.json");
+        tokio::fs::write(&args_file, &args_json).await?;
 
         let env_vars = vec![
             (
@@ -556,23 +531,28 @@ impl Runtime {
             sandbox_config.backend = sandbox::SandboxBackend::None;
             sandbox_config.timeout_ms = 0;
         }
-        if let Some(timeout) = timeout_ms {
-            sandbox_config.timeout_ms = timeout;
+        if !self.unrestricted {
+            if let Some(timeout) = timeout_ms {
+                sandbox_config.timeout_ms = timeout;
+            }
         }
 
-        // Add working directory to allowed paths
-        sandbox_config.allow_read.push(working_dir.clone());
-        sandbox_config.allow_write.push(temp_dir);
+        if matches!(
+            sandbox_config.backend,
+            sandbox::SandboxBackend::Bubblewrap
+                | sandbox::SandboxBackend::Docker
+                | sandbox::SandboxBackend::Wasm
+        ) {
+            sandbox_config.allow_read.push(working_dir.to_path_buf());
+            sandbox_config
+                .allow_write
+                .push(invocation.path().to_path_buf());
+        }
 
         let sandbox = sandbox::Sandbox::new(sandbox_config);
 
         // Execute in sandbox
-        let result = sandbox
-            .execute(program, &args, &working_dir, &env_vars)
-            .await;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&args_file);
+        let result = sandbox.execute(program, args, working_dir, &env_vars).await;
 
         let sandbox_result = result.map_err(|e| match e {
             sandbox::SandboxError::Timeout(ms) => RuntimeError::Timeout(ms),
@@ -620,16 +600,12 @@ impl Runtime {
             });
         }
 
-        if content.is_empty() {
+        if content.is_empty() && !success {
             content.push(ToolResultContent::Text {
-                text: if success {
-                    "Command completed successfully with no output".to_string()
-                } else {
-                    format!(
-                        "Command failed with exit code: {:?}",
-                        sandbox_result.exit_code
-                    )
-                },
+                text: format!(
+                    "Command failed with exit code: {:?}",
+                    sandbox_result.exit_code
+                ),
             });
         }
 
@@ -637,47 +613,9 @@ impl Runtime {
             content,
             structured_content,
             is_error: !success,
-        })
-    }
-}
-
-/// Workflow DSL interpreter (placeholder)
-pub struct WorkflowEngine {
-    #[allow(dead_code)]
-    registry: Arc<Registry>,
-}
-
-impl WorkflowEngine {
-    #[must_use]
-    pub const fn new(registry: Arc<Registry>) -> Self {
-        Self { registry }
-    }
-
-    /// Execute a workflow definition
-    /// # Errors
-    /// Returns an error if the operation cannot be completed.
-    #[expect(
-        clippy::unused_async,
-        reason = "workflow execution is async by contract before the implementation gains awaits"
-    )]
-    pub async fn execute(
-        &self,
-        _workflow: &serde_json::Value,
-        _arguments: &serde_json::Value,
-    ) -> Result<ToolResult> {
-        // Full implementation would:
-        // - Parse workflow YAML/JSON
-        // - Execute steps in order
-        // - Handle call, assign, map, branch, retry, validate, emit constructs
-        // - Maintain variable context
-        // - Enforce tool allowlists
-
-        Ok(ToolResult {
-            content: vec![ToolResultContent::Text {
-                text: "Workflow executed (placeholder)".to_string(),
-            }],
-            structured_content: None,
-            is_error: false,
+            status: ExecutionStatus::Completed,
+            raw_output: None,
+            trace: None,
         })
     }
 }

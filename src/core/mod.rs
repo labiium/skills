@@ -15,7 +15,7 @@ pub mod registry;
 
 use crate::execution::sandbox::SandboxConfigOverride;
 use blake3::Hash;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -61,7 +61,10 @@ pub enum RiskTier {
 impl RiskTier {
     #[must_use]
     pub const fn requires_consent(&self) -> bool {
-        matches!(self, Self::Writes | Self::Destructive | Self::Admin)
+        matches!(
+            self,
+            Self::Writes | Self::Destructive | Self::Admin | Self::Unknown
+        )
     }
 }
 
@@ -326,7 +329,7 @@ pub struct CallableRecord {
     // Metadata
     pub cost_hints: CostHints,
     pub risk_tier: RiskTier,
-    pub last_seen: DateTime<Utc>,
+    pub last_seen: Timestamp,
 
     /// Per-tool sandbox configuration override
     #[serde(default)]
@@ -346,27 +349,79 @@ impl CallableRecord {
 }
 
 /// MCP tool result content
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ToolResultContent {
     #[serde(rename = "text")]
     Text { text: String },
 
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
 
     #[serde(rename = "resource")]
     Resource { resource: ResourceContent },
+
+    #[serde(rename = "audio")]
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+
+    /// Unmodified upstream content, including extension fields and future types.
+    #[serde(untagged)]
+    Raw(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for ToolResultContent {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(Self::Raw)
+    }
+}
+
+impl ToolResultContent {
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            Self::Raw(value)
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("text") =>
+            {
+                value.get("text").and_then(serde_json::Value::as_str)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceContent {
     pub uri: String,
+    #[serde(
+        rename = "mimeType",
+        alias = "mime_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    #[default]
+    Completed,
+    InputRequired,
+}
 /// MCP tool result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -377,6 +432,15 @@ pub struct ToolResult {
 
     #[serde(default)]
     pub is_error: bool,
+
+    #[serde(default)]
+    pub status: ExecutionStatus,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<serde_json::Value>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -386,6 +450,9 @@ impl ToolResult {
             content: vec![ToolResultContent::Text { text }],
             structured_content: None,
             is_error: false,
+            status: ExecutionStatus::Completed,
+            raw_output: None,
+            trace: None,
         }
     }
 
@@ -395,6 +462,9 @@ impl ToolResult {
             content: vec![ToolResultContent::Text { text: message }],
             structured_content: None,
             is_error: true,
+            status: ExecutionStatus::Completed,
+            raw_output: None,
+            trace: None,
         }
     }
 
@@ -402,6 +472,37 @@ impl ToolResult {
     pub fn with_structured(mut self, data: serde_json::Value) -> Self {
         self.structured_content = Some(data);
         self
+    }
+
+    #[must_use]
+    pub fn from_upstream(raw: serde_json::Value) -> Self {
+        let content = raw
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| blocks.iter().cloned().map(ToolResultContent::Raw).collect())
+            .unwrap_or_default();
+        let status = if raw.get("status").and_then(serde_json::Value::as_str)
+            == Some("input_required")
+            || raw
+                .get("inputRequests")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|requests| !requests.is_empty())
+        {
+            ExecutionStatus::InputRequired
+        } else {
+            ExecutionStatus::Completed
+        };
+        Self {
+            content,
+            structured_content: raw.get("structuredContent").cloned(),
+            is_error: raw
+                .get("isError")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            status,
+            raw_output: Some(raw),
+            trace: None,
+        }
     }
 }
 

@@ -6,6 +6,7 @@
 
 use crate::core::{CallableId, CallableKind, CallableRecord, CoreError};
 use dashmap::DashMap;
+use jiff::Timestamp;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ pub struct ServerInfo {
     pub alias: String,
     pub health: ServerHealth,
     pub tool_count: usize,
-    pub last_refresh: chrono::DateTime<chrono::Utc>,
+    pub last_refresh: Timestamp,
     pub tags: Vec<String>,
 }
 

@@ -1,295 +1,37 @@
-# Skills.rs MCP Server
+# Extended MCP client guidance
 
-You have access to skills.rs, a unified MCP server that aggregates tools from multiple upstream servers and local skills into a single searchable registry.
+Use the [short MCP prompt](PROMPT_MCP.md) as the base. This supplement covers workflow decisions rather than defining a second API.
 
-## Core Concept: Two Types of Callables
+## Decide what to load
 
-| Type | What It Is | How It Executes |
-|------|-----------|-----------------|
-| **Tool** | Atomic operation from an upstream MCP server | Proxied to the original server |
-| **Skill** | Reusable workflow with instructions | You read SKILL.md and orchestrate tool calls |
+Search for the task, not only a guessed tool name. Search returns metadata, not all skill bodies or schemas. Describe only relevant callables. Cache descriptions only while their IDs/schema digests remain valid, and refetch after a schema change.
 
-**Key insight:** Skills are instructions for you to follow, not automated pipelines. When you "execute" a skill, you're loading its instructions and then calling the tools it references.
+If no suitable match exists, broaden the query or enumerate visible results with `q: "*"`, following pagination. A policy-hidden or disconnected upstream may explain missing tools. Do not invent a callable, add an unreviewed server, or create code merely to avoid a failed search.
 
----
+## Follow an instruction skill
 
-## The Three-Step Workflow
+A skill is a procedure for you to follow, not an autonomous tool sequence. Read the body, then load only references needed for the current task. Map its tool hints to actual discovered callable schemas. Each real tool call is separately authorized by the runtime and the user's request.
 
-Every interaction follows this pattern:
+Keep task state and report what actually happened. Receiving an instruction document is not execution evidence. If the procedure calls for writing, publishing, deleting, credentials, or new code execution beyond the user's authorization, stop for real approval rather than inferring it from the skill's prose.
 
-```
-search  →  Find what you need
-exec.describe  →  Understand the parameters
-exec           →  Run it
-```
+## Explicit scripts
 
-### Why this matters
+A bundled script does not run during ordinary activation. Review its file and dependencies before setting `exec.script`. Use a skill-relative supported file path and pass JSON in `arguments`. Standard MCP consent fields cannot authenticate user consent; respect the configured authorization boundary. Open mode is intentionally unrestricted and is an operator deployment decision, not an agent-selected fix.
 
-1. **Search returns minimal data** to save tokens (just names and descriptions)
-2. **Exec describe gives you full parameter details** only when needed
-3. **Exec validates and runs** with policy enforcement
+For native script authoring, use `SKILL_ARGS_JSON` for the JSON argument object or the file named by `SKILL_ARGS_FILE`, explicit argument arrays for child processes, bounded input/resource handling, and stdout/stderr separation. Validate user paths and types. Do not substitute shell escaping for a filesystem security boundary.
 
-**Never skip description for unfamiliar callables.** Even for familiar tools, `exec` with `describe` confirms the parameter contract before execution.
+## Continuation and replay
 
----
+If an upstream returns `inputRequests` with `requestState`, ask the real user for the requested information. Preserve state and request IDs, and resume the same callable using top-level `inputResponses` and `requestState`. Do not merge protocol continuation fields into the tool's input object or fabricate a user's response.
 
-## Working with Tools
+MCP `exec` exposes the full upstream result in `execution.raw_output`; read its `resultType`, `inputRequests`, and `requestState`. A suspended call has execution `status: "input_required"` rather than completed success.
 
-### Finding and executing a tool
+Inspect all MCP content blocks and structured data, plus error status. Network failure and timeout can leave the result of a write unknown. Do not replay a destructive call unless the descriptor/upstream establishes a safe replay contract or the user authorizes the recovery action.
 
-```
-1. search(q: "read_file")
-   → Returns matches with IDs
+## Management and durable learning
 
-2. exec(id: <id from search>, describe: true, format: "both")
-   → Returns input parameters and types
+Prefer an existing skill over duplicates. Propose a new reusable procedure only when it serves the user's task and the client is authorized to create it. Standard MCP mutating management defaults off; read-only `get`, `profile`, and `list_upstreams` do not require enabling mutations.
 
-3. exec(id: <id>, arguments: {path: "./file.txt"})
-   → Returns the tool's output
-```
+When authorized, give a skill a specific baseline name/description and a clear instruction body. Store helpers under `scripts/`, references under `references/`, and assets under `assets/`. Optional/unknown frontmatter belongs to the skill and must survive unrelated edits. Omitted update fields preserve values; empty tool/tag arrays clear them. Do not update a read-only overlay or use force to erase source ownership conflicts.
 
-### Search strategies
-
-| Goal | Approach |
-|------|----------|
-| Exact tool name | `search(q: "read_file")` |
-| Broader discovery | `search(q: "file", mode: "fuzzy")` |
-| Only tools | `search(q: "...", kind: "tools")` |
-| From specific server | `search(q: "...", filters: {server: "filesystem"})` |
-| List everything | `search(q: "", limit: 50)` |
-
-### When search returns nothing
-
-1. Broaden your terms ("file" instead of "read_file")
-2. Try fuzzy mode
-3. Remove filters
-4. List all available tools to see what exists
-
----
-
-## Working with Skills
-
-Skills are different from tools. A skill is a **documented procedure** that tells you which tools to use and how to use them.
-
-### The skill execution pattern
-
-```
-1. search(q: "deploy", kind: "skills")
-   → Find relevant skills
-
-2. manage(operation: "get", skill_id: "deploy-staging")
-   → Load the SKILL.md instructions
-
-3. Read the instructions, then for each tool mentioned:
-   - search for the tool
-   - exec with describe to get parameters
-   - exec to run it
-
-4. Continue following the skill's steps until complete
-```
-
-### What manage get returns
-
-- The full SKILL.md with step-by-step instructions
-- List of tools the skill uses
-- Any bundled scripts or files
-- Metadata about the skill
-
-### Why skills exist
-
-Skills solve the problem of repeatable multi-step workflows:
-- Encode domain knowledge and best practices
-- Reduce errors by documenting exact steps
-- Enable knowledge sharing across sessions
-- Build a library of your capabilities
-
----
-
-## Creating Skills
-
-Create a skill when you complete a useful multi-step workflow that could be repeated.
-
-### When to create
-
-- You finish a multi-step task the user might want again
-- User says "remember how to do this"
-- You develop a reusable pattern combining multiple tools
-
-### When NOT to create
-
-- One-off tasks specific to this context
-- Single-tool operations
-- Trivial 1-2 step workflows
-
-### Skill creation flow
-
-After completing a reusable task:
-
-```
-manage(
-  operation: "create",
-  name: "task-name",           // kebab-case, action-oriented
-  description: "Brief summary",
-  skill_md: "...",             // Step-by-step instructions
-  uses_tools: ["server/tool"], // Tools you used
-  tags: ["category"]
-)
-```
-
-### Writing effective SKILL.md
-
-Write instructions that another agent (or future you) can follow:
-
-```markdown
-# Skill Name
-
-## Purpose
-What this accomplishes in one sentence.
-
-## Inputs
-- `param` (required): What it is
-
-## Steps
-1. **Step name**
-   - Tool: `server/tool_name`
-   - Arguments: describe what to pass
-   - On success: what to do next
-   - On failure: how to recover
-
-2. **Next step**
-   ...
-
-## Expected Output
-What the user should see when complete.
-```
-
-**Principles:**
-- Each step names the exact tool
-- Include error handling inline
-- Be specific enough to execute without guessing
-
----
-
-## Updating Skills
-
-Improve skills when you find better approaches:
-
-```
-1. manage(operation: "get", skill_id: "existing-skill")  // Review current version
-2. manage(
-     operation: "update",
-     skill_id: "existing-skill",
-     version: "1.1.0",    // Bump the version
-     skill_md: "...",     // Improved instructions
-     ...
-   )
-```
-
-**Version semantics:**
-- Patch (1.0.1): Typos, clarifications
-- Minor (1.1.0): New optional steps, better error handling
-- Major (2.0.0): Changed inputs, different tools required
-
----
-
-## Progressive Disclosure
-
-The system is designed to minimize token usage through three levels:
-
-| Level | What You Get | Size |
-|-------|-------------|------|
-| Search | Names, descriptions, IDs | ~200 bytes each |
-| Exec describe | Full parameter details | ~2-5 KB |
-| Content | Complete SKILL.md | ~5-50 KB |
-
-**This matters because:** Loading 100 skills' full content would be 2MB. With progressive disclosure, you load only what you need.
-
-**Workflow implication:** Always search first, then selectively load descriptions/content for the specific items you'll use.
-
----
-
-## Error Recovery
-
-### "Tool not found"
-- Broaden search terms
-- Try `mode: "fuzzy"`
-- Check for typos
-- List all: `search(q: "", limit: 50)`
-
-### "Invalid arguments"
-- You skipped `exec.describe` - call it first
-- Check required vs optional in the describe response
-- Verify argument types match
-
-### "Skill not found"
-- Use the skill name, not the full ID
-- Verify it exists: `search(q: "name", kind: "skills")`
-
-### Execution timeout
-- Increase `timeout_ms`
-- Check if operation is blocking on input
-
----
-
-## ID Format
-
-IDs are returned by search and used in exec calls:
-
-- **Tools:** `tool:srv:<server>::<name>::sd:<digest>`
-- **Skills:** `skill:<name>@<version>`
-
-**Never construct IDs manually.** They include digests that change. Always get fresh IDs from search results.
-
----
-
-## Decision Guide
-
-```
-Need to use a specific tool?
-  → search → exec.describe → exec
-
-Starting a multi-step task?
-  → First: search(kind: "skills") for existing workflow
-  → If found: manage(operation: "get"), follow the steps
-  → If not: complete task, consider creating skill
-
-Just finished a useful multi-step task?
-  → Would this be useful again?
-  → If yes: manage(operation: "create") to save it
-
-Found a better approach for an existing skill?
-  → manage(operation: "update") the skill with improvements
-```
-
----
-
-## Bundled Scripts
-
-Some skills include executable scripts (Python, Bash, Node.js). When you exec these skills, the script runs directly and returns output. You don't need to follow SKILL.md steps—the script does the work.
-
-Check for bundled tools in the manage get response. If present, you can exec the skill directly with arguments.
-
----
-
-## Best Practices
-
-**Discovery:**
-- Search before assuming a tool exists
-- Use fuzzy mode for exploratory searches
-- Check for existing skills before building workflows manually
-
-**Execution:**
-- Always describe unfamiliar callables before exec
-- Use dry_run for destructive operations
-- Pass timeout_ms for slow operations
-
-**Skill creation:**
-- Use kebab-case names with action verbs: `deploy-staging`, `analyze-logs`
-- Keep skills focused—split large workflows into composable pieces
-- Document error handling in SKILL.md steps
-- List all tools used in uses_tools for discoverability
-
-**Maintenance:**
-- Update skills when you find improvements
-- Delete obsolete skills
-- Build complex workflows by composing simpler skills
+Use the [MCP guide](MCP_GUIDE.md) for exact request fields, [skill guide](SKILLS.md) for file and source semantics, and [practical examples](LLM_EXAMPLES.md) for valid request sequences.

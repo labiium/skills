@@ -20,7 +20,8 @@ use crate::core::{
     BundledTool, CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest,
 };
 use crate::storage::search::SearchEngine;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use jiff::Timestamp;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -152,6 +153,11 @@ pub struct Skill {
 /// Skill content for progressive disclosure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillContent {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub directory: PathBuf,
+    pub frontmatter: serde_yaml::Value,
     pub skill_md: String,
     pub additional_files: Vec<String>,
     pub bundled_tools: Vec<BundledTool>,
@@ -173,6 +179,23 @@ pub struct CreateSkillRequest {
     /// Asset files to be placed in assets/ subdirectory
     pub assets: Vec<(String, String)>, // (filename, content)
     pub tags: Vec<String>,
+}
+
+/// Omitted fields preserve the installed skill; supplied empty values are explicit edits.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateSkillRequest {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub skill_md_content: Option<String>,
+    pub uses_tools: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub scripts: Vec<(String, String)>,
+    #[serde(default)]
+    pub references: Vec<(String, String)>,
+    #[serde(default)]
+    pub assets: Vec<(String, String)>,
 }
 
 /// Skill validation result
@@ -215,6 +238,7 @@ impl ValidationResult {
 /// Skill store manager
 pub struct SkillStore {
     root: PathBuf,
+    read_roots: Vec<PathBuf>,
     registry: Arc<Registry>,
     search_engine: Option<Arc<SearchEngine>>,
     watcher: Option<RecommendedWatcher>,
@@ -222,16 +246,53 @@ pub struct SkillStore {
 }
 
 impl SkillStore {
-    fn normalize_skill_body(content: &str) -> String {
-        if content.starts_with("---\n") {
-            return Self::parse_yaml_frontmatter(content).1;
+    fn document_parts(content: &str) -> Result<(serde_yaml::Mapping, String)> {
+        let normalized = content.replace("\r\n", "\n");
+        if let Some(after_first) = normalized.strip_prefix("---\n") {
+            let (yaml, body) = after_first
+                .split_once("\n---\n")
+                .ok_or_else(|| SkillStoreError::Parse("Unclosed YAML frontmatter".to_string()))?;
+            let mapping = serde_yaml::from_str(yaml)
+                .map_err(|error| SkillStoreError::Parse(error.to_string()))?;
+            Ok((mapping, body.trim().to_string()))
+        } else {
+            Ok((serde_yaml::Mapping::new(), content.trim().to_string()))
         }
-        content.trim().to_string()
+    }
+
+    fn serialize_document(frontmatter: &serde_yaml::Mapping, body: &str) -> Result<String> {
+        let yaml = serde_yaml::to_string(frontmatter)
+            .map_err(|error| SkillStoreError::Parse(error.to_string()))?;
+        let document = format!(
+            "---\n{}---\n\n{}",
+            yaml.trim_start_matches("---\n"),
+            body.trim()
+        );
+        agent_skills::parse_frontmatter_public(&document)?;
+        Ok(document)
+    }
+
+    fn set_field<T: Serialize>(
+        mapping: &mut serde_yaml::Mapping,
+        key: &str,
+        value: T,
+    ) -> Result<()> {
+        mapping.insert(
+            serde_yaml::Value::String(key.to_string()),
+            serde_yaml::to_value(value)
+                .map_err(|error| SkillStoreError::Parse(error.to_string()))?,
+        );
+        Ok(())
     }
 
     fn validate_filenames(files: &[(String, String)], kind: &str) -> Result<()> {
         for (filename, _) in files {
-            if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+            if filename.is_empty()
+                || !Path::new(filename)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                || filename.contains('\\')
+            {
                 return Err(SkillStoreError::ValidationError(format!(
                     "Invalid {kind} filename: {filename}"
                 )));
@@ -240,36 +301,23 @@ impl SkillStore {
         Ok(())
     }
 
-    fn build_skill_md_content(request: &CreateSkillRequest, body_content: &str) -> Result<String> {
-        #[derive(Serialize)]
-        struct SkillFrontmatter<'a> {
-            name: &'a str,
-            description: &'a str,
-            version: &'a str,
-            #[serde(rename = "allowed-tools", skip_serializing_if = "Option::is_none")]
-            allowed_tools: Option<&'a [String]>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            tags: Option<&'a [String]>,
+    fn build_skill_md_content(request: &CreateSkillRequest) -> Result<String> {
+        let (mut frontmatter, body) = Self::document_parts(&request.skill_md_content)?;
+        Self::set_field(&mut frontmatter, "name", &request.name)?;
+        Self::set_field(&mut frontmatter, "description", &request.description)?;
+        Self::set_field(&mut frontmatter, "version", &request.version)?;
+        if !request.uses_tools.is_empty() {
+            Self::set_field(&mut frontmatter, "allowed-tools", &request.uses_tools)?;
         }
-
-        let frontmatter = SkillFrontmatter {
-            name: &request.name,
-            description: &request.description,
-            version: &request.version,
-            allowed_tools: (!request.uses_tools.is_empty()).then_some(&request.uses_tools),
-            tags: (!request.tags.is_empty()).then_some(&request.tags),
-        };
-
-        let yaml = serde_yaml::to_string(&frontmatter)
-            .map_err(|e| SkillStoreError::Parse(format!("Failed to serialize frontmatter: {e}")))?;
-        let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
-
-        Ok(format!("---\n{}---\n\n{}", yaml, body_content.trim()))
+        if !request.tags.is_empty() {
+            Self::set_field(&mut frontmatter, "tags", &request.tags)?;
+        }
+        Self::serialize_document(&frontmatter, &body)
     }
 
     /// Create new skill store
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error if the root cannot be created or canonicalized.
     pub fn new(root: impl AsRef<Path>, registry: Arc<Registry>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
 
@@ -280,7 +328,8 @@ impl SkillStore {
         }
 
         Ok(Self {
-            root,
+            root: root.canonicalize()?,
+            read_roots: Vec::new(),
             registry,
             search_engine: None,
             watcher: None,
@@ -290,7 +339,7 @@ impl SkillStore {
 
     /// Create new skill store with search engine for automatic index updates
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error if the root cannot be created or canonicalized.
     pub fn with_search_engine(
         root: impl AsRef<Path>,
         registry: Arc<Registry>,
@@ -301,113 +350,114 @@ impl SkillStore {
         Ok(store)
     }
 
+    /// Add an existing read-only package or collection after all higher-precedence roots.
+    pub fn add_read_root(&mut self, root: PathBuf) {
+        let root = root.canonicalize().unwrap_or(root);
+        if root != self.root && !self.read_roots.contains(&root) {
+            self.read_roots.push(root);
+        }
+    }
+
+    fn roots(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.root).chain(&self.read_roots)
+    }
+
+    fn package_directories(&self) -> (Vec<PathBuf>, Vec<String>) {
+        Self::package_directories_from(self.roots())
+    }
+
+    fn package_directories_from<'a>(
+        roots: impl Iterator<Item = &'a PathBuf>,
+    ) -> (Vec<PathBuf>, Vec<String>) {
+        let mut directories = Vec::new();
+        let mut errors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            let mut pending = vec![root.clone()];
+            while let Some(path) = pending.pop() {
+                let canonical = match path.canonicalize() {
+                    Ok(canonical) => canonical,
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", path.display()));
+                        continue;
+                    }
+                };
+                if !canonical.starts_with(root) || !seen.insert(canonical.clone()) {
+                    continue;
+                }
+                if path.join("SKILL.md").exists() {
+                    directories.push(canonical);
+                    continue;
+                }
+                let entries = match sorted_entries(&path) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        errors.push(format!("{}: {error}", path.display()));
+                        continue;
+                    }
+                };
+                let mut children = entries
+                    .into_iter()
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .filter(|entry| !excluded_directory(&entry.file_name()))
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>();
+                if children.is_empty() && path != *root {
+                    directories.push(canonical);
+                } else {
+                    children.reverse();
+                    pending.extend(children);
+                }
+            }
+        }
+        (directories, errors)
+    }
     /// Load all skills from disk
     /// # Errors
     /// Returns an error if the operation cannot be completed.
     pub async fn load_all(&self) -> Result<Vec<Skill>> {
-        info!("Loading skills from: {:?}", self.root);
-
         let mut skills = Vec::new();
-
-        if !self.root.exists() {
-            warn!("Skill store root does not exist, skipping load");
-            return Ok(skills);
+        let mut names = std::collections::HashSet::new();
+        let (paths, errors) = self.package_directories();
+        for error in errors {
+            error!("Failed to inspect skill root: {error}");
         }
-
-        let entries = std::fs::read_dir(&self.root)?;
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                match self.load_skill(&path).await {
-                    Ok(skill) => {
-                        debug!(
-                            "Loaded skill: {} v{}",
-                            skill.manifest.id, skill.manifest.version
-                        );
-                        skills.push(skill);
-                    }
-                    Err(e) => {
-                        error!("Failed to load skill from {:?}: {}", path, e);
-                    }
-                }
+        for path in paths {
+            match self.load_skill(&path).await {
+                Ok(skill) if names.insert(skill.manifest.id.clone()) => skills.push(skill),
+                Ok(_) => {}
+                Err(error) => error!("Failed to load skill from {:?}: {}", path, error),
             }
         }
-
-        info!("Loaded {} skills", skills.len());
         Ok(skills)
     }
 
     /// Load skill content for progressive disclosure
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error if the skill is missing, its document is invalid, or its resources
+    /// cannot be read safely within the package.
     pub fn load_skill_content(&self, skill_id: &str) -> Result<SkillContent> {
-        // Find the skill directory
         let skill_dir = self.find_skill_directory(skill_id)?;
-
-        // Load SKILL.md
-        let skill_md_path = skill_dir.join("SKILL.md");
-        let skill_document = if skill_md_path.exists() {
-            std::fs::read_to_string(&skill_md_path)?
-        } else {
-            return Err(SkillStoreError::FileNotFound(format!(
-                "SKILL.md not found for skill: {skill_id}"
-            )));
-        };
-
-        // Discover additional files (exclude SKILL.md and bundled scripts)
-        let mut additional_files = Vec::new();
-
-        // Helper to discover files from a subdirectory
-        let mut discover_subdir = |subdir: &str| {
-            let subdir_path = skill_dir.join(subdir);
-            if subdir_path.exists() && subdir_path.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&subdir_path) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                additional_files.push(format!("{subdir}/{name}"));
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        // Discover files from references/ and assets/ subdirectories
-        discover_subdir("references");
-        discover_subdir("assets");
-
-        // Discover files from root (legacy support)
-        if let Ok(entries) = std::fs::read_dir(&skill_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name != "SKILL.md" && !is_script_filename(name) {
-                            additional_files.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Discover bundled tools
-        let bundled_tools = Self::discover_bundled_tools(&skill_dir);
-
-        // Parse allowed_tools from SKILL.md frontmatter
-        let uses_tools = match crate::agent_skills::parse_frontmatter_public(&skill_document) {
-            Ok((frontmatter, _)) => frontmatter
-                .allowed_tools
-                .map(|tools| tools.to_vec())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(), // If no frontmatter or parse error, return empty vec
-        };
-
+        let skill_document = self.load_skill_file(skill_id, "SKILL.md")?;
+        let (frontmatter, _) = agent_skills::parse_frontmatter_public(&skill_document)?;
+        let files = inventory_files(&skill_dir)?;
+        let bundled_tools = Self::discover_bundled_tools(&skill_dir, &files);
+        let additional_files = resource_paths(&files, &bundled_tools);
+        let uses_tools = frontmatter
+            .allowed_tools
+            .as_ref()
+            .map(agent_skills::AllowedTools::to_vec)
+            .unwrap_or_default();
         Ok(SkillContent {
+            name: frontmatter.name.clone(),
+            version: frontmatter.version.clone(),
+            description: frontmatter.description.clone().unwrap_or_default(),
+            directory: skill_dir,
+            frontmatter: serde_yaml::to_value(&frontmatter)
+                .map_err(|error| SkillStoreError::Parse(error.to_string()))?,
             skill_md: skill_document,
             additional_files,
             bundled_tools,
@@ -420,166 +470,121 @@ impl SkillStore {
     /// Allows accessing files in subdirectories (e.g., "references/guide.md")
     /// while preventing path traversal attacks.
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error if the skill or file is missing, the path escapes its package,
+    /// the file cannot be read, or its contents are not UTF-8.
     pub fn load_skill_file(&self, skill_id: &str, filename: &str) -> Result<String> {
-        // Reject absolute paths
-        if filename.starts_with('/') || filename.starts_with('\\') {
-            return Err(SkillStoreError::InvalidManifest(format!(
-                "Absolute paths not allowed: {filename}"
-            )));
-        }
+        String::from_utf8(self.load_skill_file_bytes(skill_id, filename)?)
+            .map_err(|error| SkillStoreError::Parse(error.to_string()))
+    }
 
-        // Reject path traversal attempts
-        if filename.contains("..") {
-            return Err(SkillStoreError::InvalidManifest(format!(
-                "Path traversal not allowed: {filename}"
-            )));
-        }
-
+    /// Read a resource without assuming UTF-8 encoding.
+    /// # Errors
+    /// Returns an error if the skill or file is missing, the path escapes its package,
+    /// or the file cannot be read.
+    pub fn load_skill_file_bytes(&self, skill_id: &str, filename: &str) -> Result<Vec<u8>> {
         let skill_dir = self.find_skill_directory(skill_id)?;
-        let file_path = skill_dir.join(filename);
-
-        // Canonicalize and verify the path stays within skill directory
-        let canonical_file = file_path.canonicalize().map_err(|_| {
-            SkillStoreError::FileNotFound(format!("File {filename} not found in skill {skill_id}"))
-        })?;
-        let canonical_skill = skill_dir.canonicalize().map_err(|_| {
-            SkillStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Skill directory not found",
-            ))
-        })?;
-
-        if !canonical_file.starts_with(&canonical_skill) {
-            return Err(SkillStoreError::InvalidManifest(format!(
-                "File {filename} is outside skill directory"
-            )));
-        }
-
-        Ok(std::fs::read_to_string(&canonical_file)?)
+        let file = contained_file(&skill_dir, filename)?;
+        Ok(std::fs::read(file)?)
     }
 
     /// Find the directory for a given skill ID
     fn find_skill_directory(&self, skill_id: &str) -> Result<PathBuf> {
-        // Try direct match first
-        let direct_path = self.root.join(skill_id);
-        if direct_path.exists() && direct_path.is_dir() {
-            return Ok(direct_path);
+        Self::validate_skill_name(skill_id)?;
+        let (paths, errors) = self.package_directories();
+        for error in errors {
+            warn!("Failed to inspect skill root: {error}");
         }
-
-        // Search all skill directories by SKILL.md frontmatter name
-        if let Ok(entries) = std::fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let skill_md_path = path.join("SKILL.md");
-                    if skill_md_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&skill_md_path) {
-                            if let Ok((frontmatter, _)) =
-                                crate::agent_skills::parse_frontmatter_public(&content)
-                            {
-                                if frontmatter.name == skill_id {
-                                    return Ok(path);
-                                }
-                            }
-                        }
-                    }
+        for path in paths {
+            let Ok(document) = contained_file(&path, "SKILL.md").and_then(std::fs::read_to_string)
+            else {
+                continue;
+            };
+            if let Ok((frontmatter, _)) = agent_skills::parse_frontmatter_public(&document) {
+                if frontmatter.name == skill_id {
+                    return Ok(path);
                 }
             }
         }
-
-        Err(SkillStoreError::NotFound(format!(
-            "Skill not found: {skill_id}"
-        )))
+        Err(SkillStoreError::NotFound(skill_id.to_string()))
     }
 
-    /// Discover bundled tools (scripts) in a skill directory
-    ///
-    /// Looks for scripts in:
-    /// 1. scripts/ subdirectory (new format)
-    /// 2. skill root directory (legacy support)
-    fn discover_bundled_tools(skill_dir: &Path) -> Vec<BundledTool> {
-        let mut bundled_tools = Vec::new();
-
-        // Helper closure to process a directory and discover scripts
-        let mut discover_scripts_in_dir = |dir: &Path, prefix: &str| {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            let mut command = Vec::new();
-                            let extension = path.extension().and_then(|e| e.to_str());
-
-                            match extension {
-                                Some("py") => {
-                                    command.push("python3".to_string());
-                                    command.push(path.to_string_lossy().to_string());
-                                }
-                                Some("sh") => {
-                                    command.push("bash".to_string());
-                                    command.push(path.to_string_lossy().to_string());
-                                }
-                                Some("js") => {
-                                    command.push("node".to_string());
-                                    command.push(path.to_string_lossy().to_string());
-                                }
-                                _ => continue,
-                            }
-
-                            // Try to load schema from companion .schema.json file
-                            let schema_path = dir.join(format!("{name}.schema.json"));
-                            let schema = if schema_path.exists() {
-                                std::fs::read_to_string(&schema_path)
-                                    .ok()
-                                    .and_then(|content| serde_json::from_str(&content).ok())
-                                    .unwrap_or_else(|| serde_json::json!({"type": "object"}))
-                            } else {
-                                serde_json::json!({"type": "object"})
-                            };
-
-                            let tool_name = if prefix.is_empty() {
-                                name.to_string()
-                            } else {
-                                format!("{prefix}/{name}")
-                            };
-
-                            bundled_tools.push(BundledTool {
-                                name: tool_name,
-                                description: format!("Bundled tool: {name}"),
-                                command,
-                                schema,
-                            });
-                        }
-                    }
+    fn discover_bundled_tools(skill_dir: &Path, files: &[PathBuf]) -> Vec<BundledTool> {
+        files
+            .iter()
+            .filter_map(|relative| {
+                let name = relative.to_str()?;
+                let extension = relative
+                    .extension()
+                    .and_then(|extension| extension.to_str());
+                let interpreter = match extension {
+                    Some("py") => Some("python3"),
+                    Some("sh") => Some("bash"),
+                    Some("js" | "mjs" | "cjs") => Some("node"),
+                    _ => None,
+                };
+                let path = skill_dir.join(relative);
+                #[cfg(unix)]
+                let executable = interpreter.is_none() && {
+                    use std::os::unix::fs::PermissionsExt;
+                    path.metadata()
+                        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                };
+                #[cfg(not(unix))]
+                let executable =
+                    extension.is_some_and(|extension| matches!(extension, "exe" | "bat" | "cmd"));
+                if interpreter.is_none() && (!relative.starts_with("scripts") || !executable) {
+                    return None;
                 }
-            }
-        };
-
-        // First look in scripts/ subdirectory (new format)
-        let scripts_dir = skill_dir.join("scripts");
-        if scripts_dir.exists() {
-            discover_scripts_in_dir(&scripts_dir, "scripts");
-        }
-
-        // Then look in skill root (legacy support)
-        discover_scripts_in_dir(skill_dir, "");
-
-        bundled_tools
+                let mut command = Vec::new();
+                if let Some(interpreter) = interpreter {
+                    command.push(interpreter.to_string());
+                }
+                command.push(path.to_string_lossy().into_owned());
+                let schema_name = format!("{name}.schema.json");
+                let schema = contained_file(skill_dir, &schema_name)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                Some(BundledTool {
+                    name: name.to_string(),
+                    description: format!("Bundled script: {name}"),
+                    command,
+                    schema,
+                })
+            })
+            .collect()
     }
 
     /// Load a single skill from a directory.
     ///
     /// Supports only Agent Skills format (SKILL.md with YAML frontmatter).
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error if the directory is outside configured roots, the document is
+    /// missing or invalid, or package files cannot be read safely.
     pub async fn load_skill(&self, path: &Path) -> Result<Skill> {
+        let canonical = self.skill_directory(path)?;
+        let document = tokio::fs::read_to_string(contained_file(&canonical, "SKILL.md")?).await?;
+        Self::skill_from_document(&canonical, &document)
+    }
+
+    fn load_skill_directory(&self, path: &Path) -> Result<Skill> {
+        Self::load_agent_skill(&self.skill_directory(path)?)
+    }
+
+    fn skill_directory(&self, path: &Path) -> Result<PathBuf> {
+        let canonical = path.canonicalize()?;
+        if !self.roots().any(|root| canonical.starts_with(root)) {
+            return Err(SkillStoreError::InvalidManifest(
+                "Skill is outside configured roots".to_string(),
+            ));
+        }
         let skill_md_path = path.join("SKILL.md");
 
         // Only support Agent Skills format
         if skill_md_path.exists() {
             debug!("Loading Agent Skills format at {:?}", path);
-            return self.load_agent_skill(path).await;
+            return Ok(canonical);
         }
 
         // SKILL.md is required
@@ -590,8 +595,38 @@ impl SkillStore {
     }
 
     /// Load a skill in Agent Skills format (Vercel skills.sh compatible)
-    async fn load_agent_skill(&self, path: &Path) -> Result<Skill> {
-        let agent_skill = agent_skills::AgentSkill::from_directory(path).await?;
+    fn load_agent_skill(path: &Path) -> Result<Skill> {
+        let document = std::fs::read_to_string(contained_file(path, "SKILL.md")?)?;
+        Self::skill_from_document(path, &document)
+    }
+
+    fn skill_from_document(path: &Path, document: &str) -> Result<Skill> {
+        let (frontmatter, content) = agent_skills::parse_frontmatter_public(document)?;
+        let files = inventory_files(path)?;
+        let in_directory = |directory: &str| {
+            files
+                .iter()
+                .filter(|file| file.starts_with(directory))
+                .map(|file| path.join(file))
+                .collect()
+        };
+        let agent_skill = agent_skills::AgentSkill {
+            frontmatter,
+            content,
+            path: path.to_path_buf(),
+            scripts: in_directory("scripts"),
+            references: in_directory("references"),
+            assets: in_directory("assets"),
+        };
+        if path.file_name().and_then(|name| name.to_str())
+            != Some(agent_skill.frontmatter.name.as_str())
+        {
+            warn!(
+                "Skill '{}' does not match directory {}",
+                agent_skill.frontmatter.name,
+                path.display()
+            );
+        }
         let manifest = agent_skill.to_skill_manifest();
         let documentation = Some(agent_skill.content);
 
@@ -634,27 +669,9 @@ impl SkillStore {
         tags.extend(manifest.hints.outcomes.iter().cloned());
         tags.push("skill".to_string());
 
-        // Create callable record
-        // Discover bundled tools
-        let bundled_tools = Self::discover_bundled_tools(&skill.path);
-
-        // Discover additional files
-        let mut additional_files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&skill.path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name != "SKILL.md"
-                            && !is_script_filename(name)
-                            && !name.ends_with(".schema.json")
-                        {
-                            additional_files.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        let files = inventory_files(&skill.path)?;
+        let bundled_tools = Self::discover_bundled_tools(&skill.path, &files);
+        let additional_files = resource_paths(&files, &bundled_tools);
 
         let record = CallableRecord {
             id: id.clone(),
@@ -681,7 +698,7 @@ impl SkillStore {
                 filesystem_access: false,
             },
             risk_tier,
-            last_seen: chrono::Utc::now(),
+            last_seen: Timestamp::now(),
             sandbox_config: None,
         };
 
@@ -723,101 +740,163 @@ impl SkillStore {
     /// Returns an error if the operation cannot be completed.
     pub fn start_watch(&mut self) -> Result<tokio::sync::mpsc::Receiver<PathBuf>> {
         let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(100);
-        let (event_tx, mut event_rx) = mpsc::channel(100);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let root = self.root.clone();
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
-                let _ = event_tx.blocking_send(event);
+                // Reads generate access events; reloading them would create a feedback loop.
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+                    let _ = event_tx.send(event);
+                }
             }
         })
         .map_err(|e| SkillStoreError::Parse(format!("Failed to create watcher: {e}")))?;
 
-        watcher
-            .watch(&self.root, RecursiveMode::Recursive)
-            .map_err(|e| SkillStoreError::Parse(format!("Failed to watch directory: {e}")))?;
+        for root in self.roots().filter(|root| root.exists()) {
+            watcher
+                .watch(root, RecursiveMode::Recursive)
+                .map_err(|e| SkillStoreError::Parse(format!("Failed to watch directory: {e}")))?;
+        }
 
         self.watcher = Some(watcher);
         self.reload_tx = Some(reload_tx.clone());
-
-        // Spawn background task to detect SKILL.md changes and send reload requests
+        // Preserve both paths of directory renames as well as changes within packages.
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 for path in &event.paths {
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        if filename == "SKILL.md" {
-                            if let Some(skill_dir) = path.parent() {
-                                let skill_path = skill_dir.to_path_buf();
-                                let _ = reload_tx.send(skill_path).await;
-                            }
-                        }
-                    }
+                    let directory = if path.is_file()
+                        || path.file_name().is_some_and(|name| name == "SKILL.md")
+                    {
+                        path.parent().unwrap_or(path)
+                    } else {
+                        path
+                    };
+                    let _ = reload_tx.send(directory.to_path_buf()).await;
                 }
             }
         });
+
 
         info!("Started filesystem watcher on: {:?}", root);
         Ok(reload_rx)
     }
 
+    /// Reconcile packages beneath a changed or deleted directory against every root.
+    ///
+    /// Directory renames must refresh both the previous and destination paths. Existing
+    /// registry paths retain previous frontmatter names, so renames and version edits
+    /// remove stale callable IDs without reloading unrelated packages.
+    /// # Errors
+    /// Returns an error for paths outside the configured roots or unreadable winning packages.
+    pub fn refresh_directory(&self, path: &Path) -> Result<()> {
+        let mut scope = canonical_directory(path)?;
+        if !self.roots().any(|root| scope.starts_with(root)) {
+            return Err(SkillStoreError::InvalidManifest(
+                "Skill is outside configured roots".to_string(),
+            ));
+        }
+        if !self.roots().any(|root| {
+            scope.strip_prefix(root).is_ok_and(|relative| {
+                !relative
+                    .components()
+                    .any(|part| excluded_directory(part.as_os_str()))
+            })
+        }) {
+            return Ok(());
+        }
+        let mut package_scope = scope.clone();
+        for ancestor in scope.ancestors() {
+            if !self.roots().any(|root| ancestor.starts_with(root)) {
+                break;
+            }
+            if ancestor.join("SKILL.md").is_file() {
+                package_scope = ancestor.to_path_buf();
+            }
+        }
+        scope = package_scope;
+        let registered = self.registry.by_kind(CallableKind::Skill);
+        for record in &registered {
+            if let Some(directory) = &record.skill_directory {
+                if scope.starts_with(directory) {
+                    scope.clone_from(directory);
+                }
+            }
+        }
+        let mut names = registered
+            .into_iter()
+            .filter(|record| {
+                record
+                    .skill_directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.starts_with(&scope))
+            })
+            .map(|record| record.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let (directories, errors) = Self::package_directories_from(std::iter::once(&scope));
+        for error in errors {
+            warn!("Failed to inspect changed skill directory: {error}");
+        }
+        for directory in directories {
+            let Ok(document) =
+                contained_file(&directory, "SKILL.md").and_then(std::fs::read_to_string)
+            else {
+                continue;
+            };
+            if let Ok((frontmatter, _)) = agent_skills::parse_frontmatter_public(&document) {
+                names.insert(frontmatter.name);
+            }
+        }
+        self.reconcile_skill_names(names)
+    }
+
+    fn reconcile_skill_names(&self, names: impl IntoIterator<Item = String>) -> Result<()> {
+        for name in names {
+            let directory = self.find_skill_directory(&name);
+            self.remove_registered_skill(&name);
+            match directory {
+                Ok(directory) => {
+                    let skill = self.load_skill_directory(&directory)?;
+                    self.register_skill(&skill)?;
+                }
+                Err(SkillStoreError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new skill
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
-    pub async fn create_skill(&self, request: CreateSkillRequest) -> Result<CallableId> {
+    /// Returns an error for invalid metadata or resource paths, an existing destination,
+    /// filesystem failures, or a failure to register the created package.
+    pub fn create_skill(&self, request: CreateSkillRequest) -> Result<CallableId> {
         // Validate skill name
         Self::validate_skill_name(&request.name)?;
 
         // Check if skill already exists
         let skill_dir = self.root.join(&request.name);
         if skill_dir.exists() {
-            return Err(SkillStoreError::AlreadyExists(request.name.clone()));
+            return Err(SkillStoreError::AlreadyExists(request.name));
         }
 
-        // Create skill directory
-        std::fs::create_dir_all(&skill_dir)?;
+        let skill_md_content = Self::build_skill_md_content(&request)?;
 
         // Validate all filenames before writing anything to disk
         Self::validate_filenames(&request.scripts, "script")?;
         Self::validate_filenames(&request.references, "reference")?;
         Self::validate_filenames(&request.assets, "asset")?;
 
-        // Generate SKILL.md with YAML frontmatter (Agent Skills format)
-        let skill_body = Self::normalize_skill_body(&request.skill_md_content);
-        let skill_md_content = Self::build_skill_md_content(&request, &skill_body)?;
-
+        std::fs::create_dir(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), skill_md_content)?;
-
-        // Write scripts to scripts/ subdirectory
-        if !request.scripts.is_empty() {
-            let scripts_dir = skill_dir.join("scripts");
-            std::fs::create_dir_all(&scripts_dir)?;
-            for (filename, content) in &request.scripts {
-                std::fs::write(scripts_dir.join(filename), content)?;
-            }
-        }
-
-        // Write references to references/ subdirectory
-        if !request.references.is_empty() {
-            let refs_dir = skill_dir.join("references");
-            std::fs::create_dir_all(&refs_dir)?;
-            for (filename, content) in &request.references {
-                std::fs::write(refs_dir.join(filename), content)?;
-            }
-        }
-
-        // Write assets to assets/ subdirectory
-        if !request.assets.is_empty() {
-            let assets_dir = skill_dir.join("assets");
-            std::fs::create_dir_all(&assets_dir)?;
-            for (filename, content) in &request.assets {
-                std::fs::write(assets_dir.join(filename), content)?;
-            }
-        }
+        Self::write_files(&skill_dir, "scripts", &request.scripts)?;
+        Self::write_files(&skill_dir, "references", &request.references)?;
+        Self::write_files(&skill_dir, "assets", &request.assets)?;
 
         info!("Created skill: {} at {:?}", request.name, skill_dir);
 
         // Load and register the skill
-        let skill = match self.load_skill(&skill_dir).await {
+        let skill = match self.load_skill_directory(&skill_dir) {
             Ok(skill) => skill,
             Err(e) => {
                 // Clean up on error
@@ -826,6 +905,7 @@ impl SkillStore {
             }
         };
 
+        self.remove_registered_skill(&skill.manifest.id);
         let id = self.register_skill(&skill)?;
 
         info!("Skill {} created and registered successfully", request.name);
@@ -836,125 +916,130 @@ impl SkillStore {
     ///
     /// Updates a skill in Agent Skills format (SKILL.md with YAML frontmatter).
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
-    pub async fn update_skill(
-        &self,
-        skill_id: &str,
-        request: CreateSkillRequest,
-    ) -> Result<CallableId> {
-        // Find existing skill directory
-        let skill_dir = self.find_skill_directory(skill_id)?;
-
-        let skill_md_path = skill_dir.join("SKILL.md");
-
-        // Read existing SKILL.md or create new one
-        let existing_content = if skill_md_path.exists() {
-            std::fs::read_to_string(&skill_md_path)?
+    /// Returns an error if the skill is missing or read-only, an edit is invalid,
+    /// a rename conflicts, or filesystem or registry reconciliation fails.
+    pub fn update_skill(&self, skill_id: &str, request: UpdateSkillRequest) -> Result<CallableId> {
+        let mut skill_dir = self.find_skill_directory(skill_id)?;
+        self.require_managed(&skill_dir)?;
+        let existing_content = self.load_skill_file(skill_id, "SKILL.md")?;
+        let (mut frontmatter, mut body) = Self::document_parts(&existing_content)?;
+        if let Some(content) = request.skill_md_content {
+            let (supplied_frontmatter, supplied_body) = Self::document_parts(&content)?;
+            frontmatter.extend(supplied_frontmatter);
+            body = supplied_body;
+        }
+        if let Some(name) = &request.name {
+            Self::validate_skill_name(name)?;
+            Self::set_field(&mut frontmatter, "name", name)?;
+        }
+        if let Some(version) = &request.version {
+            Self::set_field(&mut frontmatter, "version", version)?;
+        }
+        if let Some(description) = &request.description {
+            Self::set_field(&mut frontmatter, "description", description)?;
+        }
+        if let Some(tools) = &request.uses_tools {
+            Self::set_field(&mut frontmatter, "allowed-tools", tools)?;
+        }
+        if let Some(tags) = &request.tags {
+            Self::set_field(&mut frontmatter, "tags", tags)?;
+        }
+        let skill_md_content = Self::serialize_document(&frontmatter, &body)?;
+        let (updated, _) = agent_skills::parse_frontmatter_public(&skill_md_content)?;
+        let renamed = updated.name != skill_id;
+        let destination = if renamed {
+            if skill_dir == self.root {
+                return Err(SkillStoreError::ValidationError(
+                    "Cannot rename the managed root package".to_string(),
+                ));
+            }
+            let destination = self.root.join(&updated.name);
+            if destination.exists() {
+                return Err(SkillStoreError::AlreadyExists(updated.name));
+            }
+            Some(destination)
         } else {
-            String::new()
+            None
         };
-
-        // Parse existing frontmatter if present
-        let (_existing_frontmatter, existing_body) = if existing_content.starts_with("---\n") {
-            let (frontmatter, body) = Self::parse_yaml_frontmatter(&existing_content);
-            (Some(frontmatter), body)
-        } else {
-            (None, existing_content)
-        };
-
-        // Use provided content or preserve existing body
-        let body_content = if request.skill_md_content.is_empty() {
-            existing_body
-        } else {
-            Self::normalize_skill_body(&request.skill_md_content)
-        };
-
-        // Validate all filenames before writing anything to disk
-        Self::validate_filenames(&request.scripts, "script")?;
-        Self::validate_filenames(&request.references, "reference")?;
-        Self::validate_filenames(&request.assets, "asset")?;
-
-        // Generate updated SKILL.md
-        let skill_md_content = Self::build_skill_md_content(&request, &body_content)?;
-
-        std::fs::write(&skill_md_path, skill_md_content)?;
-
-        // Update scripts/ subdirectory
-        if !request.scripts.is_empty() {
-            let scripts_dir = skill_dir.join("scripts");
-            std::fs::create_dir_all(&scripts_dir)?;
-            for (filename, content) in &request.scripts {
-                std::fs::write(scripts_dir.join(filename), content)?;
+        for (directory, files) in [
+            ("scripts", &request.scripts),
+            ("references", &request.references),
+            ("assets", &request.assets),
+        ] {
+            Self::validate_filenames(files, directory)?;
+            for (filename, _) in files {
+                writable_file(&skill_dir, &Path::new(directory).join(filename))?;
             }
         }
-
-        // Update references/ subdirectory
-        if !request.references.is_empty() {
-            let refs_dir = skill_dir.join("references");
-            std::fs::create_dir_all(&refs_dir)?;
-            for (filename, content) in &request.references {
-                std::fs::write(refs_dir.join(filename), content)?;
-            }
+        let skill_md_path = writable_file(&skill_dir, Path::new("SKILL.md"))?;
+        std::fs::write(skill_md_path, skill_md_content)?;
+        Self::write_files(&skill_dir, "scripts", &request.scripts)?;
+        Self::write_files(&skill_dir, "references", &request.references)?;
+        Self::write_files(&skill_dir, "assets", &request.assets)?;
+        if let Some(destination) = destination {
+            std::fs::rename(&skill_dir, &destination)?;
+            skill_dir = destination;
         }
-
-        // Update assets/ subdirectory
-        if !request.assets.is_empty() {
-            let assets_dir = skill_dir.join("assets");
-            std::fs::create_dir_all(&assets_dir)?;
-            for (filename, content) in &request.assets {
-                std::fs::write(assets_dir.join(filename), content)?;
-            }
-        }
+        self.reconcile_skill_names(
+            std::iter::once(skill_id.to_string()).chain(renamed.then(|| updated.name.clone())),
+        )?;
 
         info!("Updated skill: {} at {:?}", skill_id, skill_dir);
 
-        // Reload and re-register the skill
-        let skill = self.load_skill(&skill_dir).await?;
-        let id = self.register_skill(&skill)?;
+        let id = self
+            .registry
+            .get_by_fq_name(&format!("skill.{}", updated.name))
+            .ok_or_else(|| SkillStoreError::NotFound(updated.name.clone()))?
+            .id;
 
         info!("Skill {} updated and re-registered successfully", skill_id);
         Ok(id)
     }
 
-    /// Parse YAML frontmatter from content (helper for `update_skill`)
-    fn parse_yaml_frontmatter(content: &str) -> (String, String) {
-        let Some(after_first) = content.strip_prefix("---\n") else {
-            return (String::new(), content.to_string());
-        };
-        let Some((frontmatter, body)) = after_first.split_once("\n---\n") else {
-            return (String::new(), content.to_string());
-        };
-        (frontmatter.to_string(), body.trim().to_string())
+    fn require_managed(&self, path: &Path) -> Result<()> {
+        if !path.canonicalize()?.starts_with(&self.root) {
+            return Err(SkillStoreError::ValidationError(
+                "Read-only overlay skills cannot be modified".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn write_files(root: &Path, directory: &str, files: &[(String, String)]) -> Result<()> {
+        for (filename, content) in files {
+            let target = writable_file(root, &Path::new(directory).join(filename))?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, content)?;
+        }
+        Ok(())
+    }
+
+    fn remove_registered_skill(&self, skill_id: &str) {
+        for skill in self.registry.by_kind(CallableKind::Skill) {
+            if skill.name == skill_id {
+                if let Some(search_engine) = &self.search_engine {
+                    search_engine.remove_record(&skill.id);
+                }
+                self.registry.remove(&skill.id);
+            }
+        }
     }
 
     /// Delete a skill
     /// # Errors
     /// Returns an error if the operation cannot be completed.
     pub fn delete_skill(&self, skill_id: &str) -> Result<()> {
-        // Find skill directory
         let skill_dir = self.find_skill_directory(skill_id)?;
-
-        // Find and remove from registry - need to find by name since version is part of ID
-        // Search registry for skills matching this name
-        let skills = self.registry.by_kind(crate::core::CallableKind::Skill);
-        for skill in skills {
-            if let Some(name) = skill.id.skill_name() {
-                if name == skill_id {
-                    // Remove from search index first if configured
-                    if let Some(ref search_engine) = self.search_engine {
-                        search_engine.remove_record(&skill.id);
-                        debug!("Removed skill from search index: {}", skill.id.as_str());
-                    }
-
-                    self.registry.remove(&skill.id);
-                    info!("Removed skill from registry: {}", skill.id.as_str());
-                    break;
-                }
-            }
+        self.require_managed(&skill_dir)?;
+        if skill_dir == self.root {
+            return Err(SkillStoreError::ValidationError(
+                "Cannot delete the managed root package".to_string(),
+            ));
         }
-
-        // Delete directory
         std::fs::remove_dir_all(&skill_dir)?;
+        self.reconcile_skill_names([skill_id.to_string()])?;
 
         info!("Deleted skill: {} from {:?}", skill_id, skill_dir);
         Ok(())
@@ -962,25 +1047,41 @@ impl SkillStore {
 
     /// Validate skill name
     fn validate_skill_name(name: &str) -> Result<()> {
-        if name.is_empty() {
-            return Err(SkillStoreError::ValidationError(
-                "Skill name cannot be empty".to_string(),
-            ));
-        }
-
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
+        if !Self::is_valid_skill_id(name) {
             return Err(SkillStoreError::ValidationError(format!(
-                "Invalid skill name: {name}"
+                "Invalid skill name: {name}; expected 1-64 lowercase letters, digits or single hyphens"
             )));
         }
-
-        if name.len() > 100 {
-            return Err(SkillStoreError::ValidationError(
-                "Skill name too long (max 100 characters)".to_string(),
-            ));
-        }
-
         Ok(())
+    }
+
+    /// Validate every installed package, including packages that cannot be loaded.
+    pub async fn validate_all(&self) -> ValidationResult {
+        let mut result = ValidationResult::success();
+        let (paths, errors) = self.package_directories();
+        for error in errors {
+            result.add_error(error);
+        }
+        for path in paths {
+            match agent_skills::AgentSkill::from_directory(&path).await {
+                Ok(agent_skill) => {
+                    let skill = Skill {
+                        manifest: agent_skill.to_skill_manifest(),
+                        path: path.clone(),
+                        documentation: Some(agent_skill.content),
+                    };
+                    let diagnostics = self.validate_skill(&skill);
+                    for error in diagnostics.errors {
+                        result.add_error(format!("{}: {error}", path.display()));
+                    }
+                    for warning in diagnostics.warnings {
+                        result.add_warning(format!("{}: {warning}", path.display()));
+                    }
+                }
+                Err(error) => result.add_error(format!("{}: {error}", path.display())),
+            }
+        }
+        result
     }
 
     /// Validate a skill manifest and content
@@ -1005,10 +1106,10 @@ impl SkillStore {
         }
 
         // Validate description length
-        if skill.manifest.description.is_empty() {
+        if skill.manifest.description.trim().is_empty() {
             result.add_error("Description cannot be empty".to_string());
-        } else if skill.manifest.description.len() > 500 {
-            result.add_warning("Description is very long (>500 chars)".to_string());
+        } else if skill.manifest.description.chars().count() > 1024 {
+            result.add_error("Description exceeds 1024 characters".to_string());
         }
 
         // Validate input schema
@@ -1080,33 +1181,15 @@ impl SkillStore {
             }
         }
 
-        // Validate bundled scripts exist and are executable
-        let script_extensions = ["py", "sh", "js"];
-        let entries = match std::fs::read_dir(&skill.path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                result.add_error(format!(
-                    "Cannot read skill directory {}: {error}",
-                    skill.path.display()
-                ));
-                return result;
-            }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if script_extensions.contains(&ext) {
-                        // Check if script is readable
-                        if std::fs::read(&path).is_err() {
-                            result.add_error(format!(
-                                "Cannot read bundled script: {:?}",
-                                path.file_name()
-                            ));
-                        }
+        match inventory_files(&skill.path) {
+            Ok(files) => {
+                for file in files {
+                    if let Err(error) = std::fs::File::open(skill.path.join(&file)) {
+                        result.add_error(format!("Cannot read {}: {error}", file.display()));
                     }
                 }
             }
+            Err(error) => result.add_error(error.to_string()),
         }
 
         result
@@ -1153,22 +1236,14 @@ impl SkillStore {
 
     /// Check if skill ID is valid format
     fn is_valid_skill_id(id: &str) -> bool {
-        if id.is_empty() || id.len() > 100 {
-            return false;
-        }
-
-        // Must start with letter
-        if !id
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_lowercase())
-        {
-            return false;
-        }
-
-        // Only lowercase alphanumeric and hyphens
-        id.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        !id.is_empty()
+            && id.chars().count() <= 64
+            && !id.starts_with('-')
+            && !id.ends_with('-')
+            && !id.contains("--")
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     }
 
     /// Detect circular dependencies in skills
@@ -1204,13 +1279,125 @@ impl SkillStore {
         Ok(vec![]) // No cycle found
     }
 }
-fn is_script_filename(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            ["py", "sh", "js"]
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+fn canonical_directory(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name);
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn excluded_directory(name: &std::ffi::OsStr) -> bool {
+    name == ".git" || name == "node_modules"
+}
+
+fn sorted_entries(path: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
+    let mut entries = std::fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    Ok(entries)
+}
+
+fn contained_file(root: &Path, filename: &str) -> std::io::Result<PathBuf> {
+    let relative = Path::new(filename);
+    if filename.is_empty()
+        || filename.contains('\\')
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        || relative
+            .components()
+            .any(|part| excluded_directory(part.as_os_str()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Invalid resource path",
+        ));
+    }
+    let root = root.canonicalize()?;
+    let file = root.join(relative).canonicalize()?;
+    if !file.starts_with(&root) || !file.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Resource escapes skill directory or is not a file",
+        ));
+    }
+    Ok(file)
+}
+
+fn writable_file(root: &Path, relative: &Path) -> std::io::Result<PathBuf> {
+    let mut target = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Invalid write path",
+            ));
+        }
+        target.push(component);
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Cannot modify symlink resources",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(target)
+}
+
+fn inventory_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in sorted_entries(&directory)? {
+            let kind = entry.file_type()?;
+            if kind.is_symlink() || excluded_directory(&entry.file_name()) {
+                continue;
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                if let Ok(relative) = entry.path().strip_prefix(root) {
+                    files.push(relative.to_path_buf());
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn resource_paths(files: &[PathBuf], tools: &[BundledTool]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|path| {
+            let name = path.to_str()?;
+            (name != "SKILL.md" && !tools.iter().any(|tool| tool.name == name))
+                .then(|| name.to_string())
         })
+        .collect()
 }

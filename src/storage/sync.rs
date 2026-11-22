@@ -1,387 +1,1049 @@
-//! Agent Skills Synchronization
-//!
-//! Automatically syncs Agent Skills from repositories declared in config.yaml.
-//! Manages the lifecycle of skills: fetching, updating, and cleanup.
+//! Shared, ownership-aware import and synchronization of Agent Skills sources.
 
 use crate::storage::agent_skills::AgentSkill;
-use anyhow::Result;
+use anyhow::{bail, ensure, Context, Result};
+use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use tempfile::{NamedTempFile, TempDir};
 use tokio::process::Command;
-use tracing::{debug, info, warn};
 
-/// Agent Skills repository configuration (from config.yaml)
+const MAX_DEPTH: usize = 32;
+const MAX_ENTRIES: usize = 100_000;
+const METADATA_FILE: &str = ".agent-skills-sync.json";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSkillsRepoConfig {
-    /// Repository URL or GitHub shorthand (owner/repo)
+    /// Local directory, Git URL, or GitHub owner/repository shorthand.
     pub repo: String,
-
-    /// Git ref (branch, tag, or commit) - defaults to main/master
+    /// Branch, tag, or full commit. Local directories without a ref use their working tree.
     #[serde(default)]
     pub git_ref: Option<String>,
-
-    /// Specific skill names to import (if omitted, imports all)
+    /// None imports every package; an empty list imports none.
     #[serde(default)]
     pub skills: Option<Vec<String>>,
-
-    /// Alias for tracking (auto-generated from repo URL if not provided)
+    /// Display label only; ownership does not depend on this label.
     #[serde(default)]
     pub alias: Option<String>,
 }
 
-/// Metadata about synced skills for tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncMetadata {
     pub repo: String,
     pub git_ref: Option<String>,
     pub commit_sha: String,
     pub synced_skills: Vec<String>,
-    pub last_sync: chrono::DateTime<chrono::Utc>,
+    pub last_sync: jiff::Timestamp,
+    /// Absent in legacy metadata: never infer ownership of existing files.
+    #[serde(default)]
+    pub fingerprints: BTreeMap<String, String>,
+    #[serde(default)]
+    pub selection: Option<Vec<String>>,
 }
 
-/// Agent Skills synchronizer
 pub struct AgentSkillsSync {
     skills_root: PathBuf,
     metadata_path: PathBuf,
     metadata: HashMap<String, SyncMetadata>,
 }
 
+struct Source {
+    identity: String,
+    location: String,
+    local: Option<PathBuf>,
+}
+
+struct Prepared {
+    _checkout: TempDir,
+    revision: String,
+    packages: BTreeMap<String, Dir>,
+}
+
+struct Change {
+    name: String,
+    staged: Option<PathBuf>,
+}
+
+struct TrackingWrite<'a> {
+    contents: &'a [u8],
+    path: PathBuf,
+    replace: bool,
+}
+
+impl<'a> TrackingWrite<'a> {
+    fn preflight(path: &Path, contents: &'a [u8]) -> Result<Self> {
+        let replace = match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let path = if replace {
+            // Save through a config symlink rather than replacing the link itself.
+            path.canonicalize()?
+        } else {
+            let name = path
+                .file_name()
+                .context("Tracking config has no file name")?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            parent.canonicalize()?.join(name)
+        };
+        if replace {
+            Self::writable_permissions(&path)?;
+        }
+        Ok(Self {
+            contents,
+            path,
+            replace,
+        })
+    }
+
+    fn stage(&self) -> Result<NamedTempFile> {
+        let parent = self
+            .path
+            .parent()
+            .context("Tracking config has no parent")?;
+        let mut file = NamedTempFile::new_in(parent)?;
+        file.write_all(self.contents)?;
+        file.as_file().sync_all()?;
+        Ok(file)
+    }
+
+    fn writable_permissions(path: &Path) -> Result<std::fs::Permissions> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(metadata.is_file(), "Tracking config is not a regular file");
+        let permissions = metadata.permissions();
+        ensure!(!permissions.readonly(), "Tracking config is read-only");
+        // Renaming only needs directory access; also require permission to write the file.
+        std::fs::OpenOptions::new().write(true).open(path)?;
+        Ok(permissions)
+    }
+
+    fn persist(self, file: NamedTempFile) -> Result<()> {
+        let result = (|| -> Result<()> {
+            if self.replace {
+                file.as_file()
+                    .set_permissions(Self::writable_permissions(&self.path)?)?;
+                file.persist(&self.path)?;
+            } else {
+                file.persist_noclobber(&self.path)?;
+            }
+            Ok(())
+        })();
+        result.with_context(|| format!("Cannot write tracking config {}", self.path.display()))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImportMode {
+    Add { force: bool },
+    Sync,
+    Check,
+}
+
 impl AgentSkillsSync {
-    /// Create a new synchronizer
+    /// Load ownership records. Invalid metadata is an error, not permission to overwrite.
+    ///
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns filesystem, metadata, or source-normalization errors.
     pub async fn new(skills_root: impl AsRef<Path>) -> Result<Self> {
         let skills_root = skills_root.as_ref().to_path_buf();
-        let metadata_path = skills_root.join(".agent-skills-sync.json");
-
-        // Load existing metadata
-        let metadata = if metadata_path.exists() {
-            let content = tokio::fs::read_to_string(&metadata_path).await?;
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            HashMap::new()
+        let metadata_path = skills_root.join(METADATA_FILE);
+        let metadata: HashMap<String, SyncMetadata> = match tokio::fs::read(&metadata_path).await {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("Invalid sync ownership metadata")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(error.into()),
         };
-
+        let mut migrated: HashMap<String, SyncMetadata> = HashMap::new();
+        for (old_key, mut record) in metadata {
+            // Relative legacy spellings do not identify their original working directory.
+            let key = metadata_source(&record.repo).map_or(old_key, |value| value.identity);
+            record.synced_skills.retain(|name| valid_name(name));
+            record.fingerprints.retain(|name, _| valid_name(name));
+            if let Some(existing) = migrated.get_mut(&key) {
+                existing.synced_skills.extend(record.synced_skills);
+                existing.synced_skills.sort();
+                existing.synced_skills.dedup();
+                // Ambiguous old aliases are not proof of ownership.
+                existing.fingerprints.clear();
+            } else {
+                migrated.insert(key, record);
+            }
+        }
         Ok(Self {
             skills_root,
             metadata_path,
-            metadata,
+            metadata: migrated,
         })
     }
 
-    /// Sync all Agent Skills repositories from config
+    /// Import selected packages without retiring previously installed packages from the source.
+    /// Only explicit force may replace another source's package, an unowned package, or local
+    /// edits. Any package error aborts the entire add without changing installs or ownership.
+    ///
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns source-fetch, staging, transaction, or metadata errors. Package conflicts
+    /// and invalid packages are returned in the report.
+    pub async fn add(&mut self, config: &AgentSkillsRepoConfig, force: bool) -> Result<SyncReport> {
+        self.import(config, ImportMode::Add { force }, None).await
+    }
+
+    /// Import packages and atomically replace the tracking file only after the install
+    /// and ownership updates succeed. A tracking write failure rolls both back.
+    /// This does not isolate concurrent writers or guarantee recovery after a process crash.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::add`], plus errors staging or persisting tracking.
+    /// If rollback itself fails, the error identifies the retained backups.
+    pub async fn add_with_tracking(
+        &mut self,
+        config: &AgentSkillsRepoConfig,
+        force: bool,
+        tracking_path: &Path,
+        tracking_contents: &[u8],
+    ) -> Result<SyncReport> {
+        let tracking =
+            TrackingWrite::preflight(tracking_path, tracking_contents).with_context(|| {
+                format!("Cannot prepare tracking config {}", tracking_path.display())
+            })?;
+        self.import(config, ImportMode::Add { force }, Some(tracking))
+            .await
+    }
+
+    /// Fetch a source and list candidate names without validating or installing packages.
+    ///
+    /// # Errors
+    /// Returns fetching, discovery, malformed frontmatter, or invalid name errors.
+    pub async fn discover_source(config: &AgentSkillsRepoConfig) -> Result<Vec<String>> {
+        let prepared = prepare(config).await?;
+        Ok(prepared.packages.into_keys().collect())
+    }
+
+    /// Refresh upstream state and reconcile configured sources; never overwrite local edits.
+    ///
+    /// # Errors
+    /// Returns metadata transaction errors. Per-source errors appear in the report.
     pub async fn sync_all(&mut self, repos: &[AgentSkillsRepoConfig]) -> Result<SyncReport> {
+        self.reconcile(repos, false).await
+    }
+
+    /// Fetch upstream state and report proposed changes, without changing installs or metadata.
+    /// Pins are resolved exactly like sync; changing `git_ref` then checking previews an update.
+    ///
+    /// # Errors
+    /// Returns filesystem errors. Per-source errors appear in the report.
+    pub async fn check_all(&self, repos: &[AgentSkillsRepoConfig]) -> Result<SyncReport> {
+        let mut preview = Self {
+            skills_root: self.skills_root.clone(),
+            metadata_path: self.metadata_path.clone(),
+            metadata: self.metadata.clone(),
+        };
+        preview.reconcile(repos, true).await
+    }
+
+    async fn reconcile(
+        &mut self,
+        repos: &[AgentSkillsRepoConfig],
+        check: bool,
+    ) -> Result<SyncReport> {
         let mut report = SyncReport::default();
-
-        // Get current repo aliases from config
-        let config_aliases: HashSet<String> = repos.iter().map(Self::repo_alias).collect();
-
-        // Find repos that were removed from config
-        let removed_aliases: Vec<String> = self
+        let mut active = HashSet::new();
+        // A malformed config must not make a previously managed source look retired.
+        for config in repos {
+            active.insert(source(&config.repo)?.identity);
+        }
+        let removed: Vec<_> = self
             .metadata
             .keys()
-            .filter(|alias| !config_aliases.contains(*alias))
+            .filter(|key| !active.contains(*key))
             .cloned()
             .collect();
+        let mut seen = HashSet::new();
+        for config in repos {
+            let identity = source(&config.repo)?.identity;
+            if !seen.insert(identity) {
+                report
+                    .errors
+                    .push(format!("{}: source configured more than once", config.repo));
+                continue;
+            }
+            let mode = if check {
+                ImportMode::Check
+            } else {
+                ImportMode::Sync
+            };
+            match self.import(config, mode, None).await {
+                Ok(result) => report.merge(result),
+                Err(error) => report.errors.push(format!("{}: {error:#}", config.repo)),
+            }
+        }
+        for key in removed {
+            report.merge(self.retire(&key, check).await?);
+        }
+        Ok(report)
+    }
 
-        // Clean up removed repos
-        for alias in removed_aliases {
-            info!("Removing skills from deleted repo: {}", alias);
-            if let Some(meta) = self.metadata.get(&alias) {
-                for skill_name in &meta.synced_skills {
-                    let skill_path = self.skills_root.join(skill_name);
-                    if skill_path.exists() {
-                        match tokio::fs::remove_dir_all(&skill_path).await {
-                            Ok(()) => {
-                                report.removed.push(skill_name.clone());
-                                info!("Removed skill: {}", skill_name);
-                            }
-                            Err(e) => {
-                                warn!("Failed to remove skill {}: {}", skill_name, e);
-                                report.errors.push(format!("Remove {skill_name}: {e}"));
-                            }
+    async fn retire(&mut self, key: &str, check: bool) -> Result<SyncReport> {
+        let mut report = SyncReport::default();
+        let Some(record) = self.metadata.get(key).cloned() else {
+            return Ok(report);
+        };
+        if let Err(error) = metadata_source(&record.repo) {
+            report.errors.push(format!(
+                "{}: source identity is unverified; packages preserved: {error:#}",
+                record.repo
+            ));
+            return Ok(report);
+        }
+        let mut next = record.clone();
+        let mut changes = Vec::new();
+        for name in &record.synced_skills {
+            match self.removable(key, name).await {
+                Ok(exists) => {
+                    if exists {
+                        changes.push(Change {
+                            name: name.clone(),
+                            staged: None,
+                        });
+                        report.removed.push(name.clone());
+                    }
+                    next.synced_skills.retain(|value| value != name);
+                    next.fingerprints.remove(name);
+                }
+                Err(error) => report.errors.push(format!("{name}: {error:#}")),
+            }
+        }
+        let mut metadata = self.metadata.clone();
+        if next.synced_skills.is_empty() {
+            metadata.remove(key);
+        } else {
+            metadata.insert(key.to_owned(), next);
+        }
+        if check {
+            self.metadata = metadata;
+        } else {
+            self.commit(changes, metadata, None).await?;
+        }
+        Ok(report)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "source import keeps validation, ownership planning, and commit in one transaction"
+    )]
+    async fn import(
+        &mut self,
+        config: &AgentSkillsRepoConfig,
+        mode: ImportMode,
+        tracking: Option<TrackingWrite<'_>>,
+    ) -> Result<SyncReport> {
+        let force = matches!(mode, ImportMode::Add { force: true });
+        let check = matches!(mode, ImportMode::Check);
+        let additive = matches!(mode, ImportMode::Add { .. });
+        let source = source(&config.repo)?;
+        let identity = source.identity;
+        if !force {
+            if let Some(record) = self.metadata.get(&identity) {
+                metadata_source(&record.repo)
+                    .context("Stored source identity is unverified; use add --force to replace")?;
+            }
+        }
+        // Always fetch before deciding whether an upstream package changed.
+        let prepared = prepare(config).await?;
+        let staging = if check {
+            tempfile::tempdir()?
+        } else {
+            tokio::fs::create_dir_all(&self.skills_root).await?;
+            tempfile::tempdir_in(&self.skills_root)?
+        };
+        let mut report = SyncReport::default();
+        let mut next = self
+            .metadata
+            .get(&identity)
+            .cloned()
+            .unwrap_or_else(|| SyncMetadata {
+                repo: String::new(),
+                git_ref: None,
+                commit_sha: String::new(),
+                synced_skills: Vec::new(),
+                last_sync: jiff::Timestamp::now(),
+                fingerprints: BTreeMap::new(),
+                selection: Some(Vec::new()),
+            });
+        let selected: BTreeMap<_, _> = prepared
+            .packages
+            .iter()
+            .filter(|(name, _)| {
+                config
+                    .skills
+                    .as_ref()
+                    .is_none_or(|filter| filter.contains(name))
+            })
+            .collect();
+        if let Some(filter) = &config.skills {
+            for name in filter {
+                if !prepared.packages.contains_key(name) {
+                    report
+                        .errors
+                        .push(format!("{name}: requested package not found"));
+                }
+            }
+        }
+        let mut changes = Vec::new();
+        let mut successful = HashSet::new();
+        for (name, package) in selected {
+            let staged = staging.path().join(name);
+            let result: Result<(String, bool)> = async {
+                let fingerprint = stage_package(package, &staged).await?;
+                let destination = self.skills_root.join(name);
+                let exists = path_exists(&destination).await?;
+                let actual = if exists {
+                    Some(tree_hash_async(destination).await)
+                } else {
+                    None
+                };
+                if !force {
+                    if self.other_owner(&identity, name) {
+                        bail!("package is owned by another source; use add --force to replace");
+                    }
+                    if let Some(actual) = &actual {
+                        let expected = next.fingerprints.get(name).context(
+                            "existing package has no ownership baseline; use add --force",
+                        )?;
+                        if actual
+                            .as_ref()
+                            .map_err(|error| anyhow::anyhow!("{error:#}"))?
+                            != expected
+                        {
+                            bail!("local modifications preserved; use add --force to replace");
                         }
                     }
                 }
-                self.metadata.remove(&alias);
+                let unchanged = !force
+                    && actual.is_some_and(|value| value.is_ok_and(|value| value == fingerprint));
+                Ok((fingerprint, !unchanged))
+            }
+            .await;
+            match result {
+                Ok((fingerprint, needs_replacement)) => {
+                    if needs_replacement {
+                        if path_exists(&self.skills_root.join(name)).await? {
+                            report.updated.push(name.clone());
+                        } else {
+                            report.added.push(name.clone());
+                        }
+                        changes.push(Change {
+                            name: name.clone(),
+                            staged: Some(staged),
+                        });
+                    }
+                    next.fingerprints.insert(name.clone(), fingerprint);
+                    if !next.synced_skills.contains(name) {
+                        next.synced_skills.push(name.clone());
+                    }
+                    successful.insert(name.clone());
+                }
+                Err(error) => report.errors.push(format!("{name}: {error:#}")),
             }
         }
-
-        // Sync each configured repo
-        for repo_config in repos {
-            let alias = Self::repo_alias(repo_config);
-            info!(
-                "Syncing Agent Skills from: {} ({})",
-                repo_config.repo, alias
-            );
-
-            match self.sync_repo(repo_config, &alias).await {
-                Ok(repo_report) => {
-                    report.merge(repo_report);
+        let obsolete: Vec<_> = next
+            .synced_skills
+            .iter()
+            .filter(|name| {
+                !additive
+                    && (!prepared.packages.contains_key(*name)
+                        || config
+                            .skills
+                            .as_ref()
+                            .is_some_and(|filter| !filter.contains(*name)))
+            })
+            .cloned()
+            .collect();
+        for name in obsolete {
+            match self.removable(&identity, &name).await {
+                Ok(exists) => {
+                    if exists {
+                        changes.push(Change {
+                            name: name.clone(),
+                            staged: None,
+                        });
+                        report.removed.push(name.clone());
+                    }
+                    next.synced_skills.retain(|value| value != &name);
+                    next.fingerprints.remove(&name);
                 }
-                Err(e) => {
-                    warn!("Failed to sync repo {}: {}", repo_config.repo, e);
-                    report.errors.push(format!("{}: {}", repo_config.repo, e));
+                Err(error) => report.errors.push(format!("{name}: {error:#}")),
+            }
+        }
+        if additive && !report.errors.is_empty() {
+            report.added.clear();
+            report.updated.clear();
+            report.removed.clear();
+            return Ok(report);
+        }
+        next.repo = source.location;
+        next.git_ref.clone_from(&config.git_ref);
+        if additive && config.skills.is_some() {
+            if let (Some(previous), Some(selected)) = (&mut next.selection, &config.skills) {
+                previous.extend(selected.iter().cloned());
+                previous.sort_unstable();
+                previous.dedup();
+            }
+        } else {
+            next.selection.clone_from(&config.skills);
+        }
+        next.commit_sha = prepared.revision;
+        next.last_sync = jiff::Timestamp::now();
+        next.synced_skills.sort();
+        let mut metadata = self.metadata.clone();
+        if force {
+            for (key, record) in &mut metadata {
+                if key != &identity {
+                    record
+                        .synced_skills
+                        .retain(|name| !successful.contains(name));
+                    record
+                        .fingerprints
+                        .retain(|name, _| !successful.contains(name));
                 }
             }
         }
-
-        // Save metadata
-        self.save_metadata().await?;
-
+        metadata.insert(identity, next);
+        if check {
+            self.metadata = metadata;
+        } else {
+            self.commit(changes, metadata, tracking).await?;
+        }
         Ok(report)
     }
 
-    /// Sync a single repository
-    #[expect(
-        clippy::too_many_lines,
-        reason = "repository synchronization is a single transactional workflow"
-    )]
-    async fn sync_repo(
-        &mut self,
-        config: &AgentSkillsRepoConfig,
-        alias: &str,
-    ) -> Result<SyncReport> {
-        let mut report = SyncReport::default();
-
-        // Parse repo URL
-        let repo_url = if config.repo.starts_with("http://")
-            || config.repo.starts_with("https://")
-            || config.repo.starts_with("file://")
-        // Allow file:// for testing
-        {
-            config.repo.clone()
-        } else if config.repo.contains('/') && !config.repo.contains(':') {
-            format!("https://github.com/{}", config.repo)
-        } else {
-            return Err(anyhow::anyhow!(format!(
-                "Invalid repo format: {}",
-                config.repo
-            )));
-        };
-
-        // Check if already synced with same commit
-        let needs_sync = self.metadata.get(alias).is_none_or(|meta| {
-            // Check if config changed (different git_ref or skill filter)
-            meta.git_ref != config.git_ref || {
-                match (&config.skills, !meta.synced_skills.is_empty()) {
-                    (Some(config_skills), true) => {
-                        // If config specifies skills, check if they match
-                        let meta_set: HashSet<_> = meta.synced_skills.iter().collect();
-                        let config_set: HashSet<_> = config_skills.iter().collect();
-                        meta_set != config_set
-                    }
-                    _ => false,
-                }
-            }
-        });
-
-        if !needs_sync {
-            debug!("Repo {} already up-to-date", alias);
-            return Ok(report);
-        }
-
-        // Clone to temp directory
-        let temp_dir = tempfile::tempdir()?;
-        let clone_path = temp_dir.path();
-
-        debug!("Cloning {} to {:?}", repo_url, clone_path);
-
-        let mut cmd = Command::new("git");
-        cmd.arg("clone");
-        if let Some(ref git_ref) = config.git_ref {
-            cmd.arg("--branch").arg(git_ref);
-        }
-        cmd.arg("--depth").arg("1");
-        cmd.arg(&repo_url);
-        cmd.arg(clone_path);
-
-        let output = cmd.output().await?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(std::io::Error::other(format!(
-                "Git clone failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))));
-        }
-
-        // Get commit SHA
-        let commit_sha = self.get_commit_sha(clone_path).await?;
-
-        // Discover all SKILL.md files
-        let mut discovered_skills = Vec::new();
-        Self::find_skill_md(clone_path, &mut discovered_skills);
-
-        if discovered_skills.is_empty() {
-            warn!("No Agent Skills found in repository: {}", repo_url);
-            return Ok(report);
-        }
-
-        // Filter by requested skills if specified
-        let skills_to_import: Vec<PathBuf> = if let Some(ref skill_filter) = config.skills {
-            discovered_skills
-                .into_iter()
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|name| skill_filter.iter().any(|skill| skill == name))
-                })
-                .collect()
-        } else {
-            discovered_skills
-        };
-
-        if skills_to_import.is_empty() {
-            warn!("None of the requested skills found in: {}", repo_url);
-            return Ok(report);
-        }
-
-        // Remove old skills from this repo if they exist
-        if let Some(meta) = self.metadata.get(alias) {
-            for old_skill in &meta.synced_skills {
-                if !skills_to_import.iter().any(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n == old_skill)
-                }) {
-                    let skill_path = self.skills_root.join(old_skill);
-                    if skill_path.exists() {
-                        tokio::fs::remove_dir_all(&skill_path).await?;
-                        report.removed.push(old_skill.clone());
-                    }
-                }
-            }
-        }
-
-        // Import skills
-        let mut synced_skills = Vec::new();
-        for skill_path in &skills_to_import {
-            let skill_name = skill_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| anyhow::anyhow!("Invalid skill name".to_string()))?;
-
-            // Parse and validate the skill
-            match AgentSkill::from_directory(skill_path).await {
-                Ok(_agent_skill) => {
-                    // Copy skill directory
-                    let dest_path = self.skills_root.join(skill_name);
-
-                    // Remove if exists
-                    if dest_path.exists() {
-                        tokio::fs::remove_dir_all(&dest_path).await?;
-                        report.updated.push(skill_name.to_string());
-                    } else {
-                        report.added.push(skill_name.to_string());
-                    }
-
-                    Self::copy_dir_all(skill_path, &dest_path).await?;
-                    synced_skills.push(skill_name.to_string());
-                }
-                Err(e) => {
-                    warn!("Failed to parse skill {}: {}", skill_name, e);
-                    report.errors.push(format!("{skill_name}: {e}"));
-                }
-            }
-        }
-
-        // Update metadata
-        let metadata = SyncMetadata {
-            repo: config.repo.clone(),
-            git_ref: config.git_ref.clone(),
-            commit_sha,
-            synced_skills,
-            last_sync: chrono::Utc::now(),
-        };
-        self.metadata.insert(alias.to_string(), metadata);
-
-        Ok(report)
-    }
-
-    /// Generate a unique alias for a repo
-    fn repo_alias(config: &AgentSkillsRepoConfig) -> String {
-        if let Some(ref alias) = config.alias {
-            return alias.clone();
-        }
-
-        // Generate from repo URL
-        let repo = &config.repo;
-        repo.split('/').next_back().map_or_else(
-            || repo.replace(['/', ':'], "-"),
-            |last| last.trim_end_matches(".git").to_string(),
-        )
-    }
-
-    /// Get current commit SHA from a cloned repo
-    async fn get_commit_sha(&self, repo_path: &Path) -> Result<String> {
-        let output = Command::new("git")
-            .arg("rev-parse")
-            .arg("HEAD")
-            .current_dir(repo_path)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(std::io::Error::other(
-                "Failed to get commit SHA",
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    /// Find all directories containing SKILL.md
-    fn find_skill_md(dir: &Path, found: &mut Vec<PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if path.join("SKILL.md").exists() {
-                        found.push(path);
-                    } else {
-                        // Recurse into subdirectories
-                        Self::find_skill_md(&path, found);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Copy directory recursively (boxed to avoid recursion issues)
-    fn copy_dir_all<'a>(
-        src: &'a Path,
-        dst: &'a Path,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + 'a + Send>> {
-        Box::pin(async move {
-            tokio::fs::create_dir_all(dst).await?;
-            let mut entries = tokio::fs::read_dir(src).await?;
-
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                let dest_path = dst.join(entry.file_name());
-
-                if path.is_dir() {
-                    Self::copy_dir_all(&path, &dest_path).await?;
-                } else {
-                    tokio::fs::copy(&path, &dest_path).await?;
-                }
-            }
-            Ok(())
+    fn other_owner(&self, identity: &str, name: &str) -> bool {
+        self.metadata.iter().any(|(key, record)| {
+            key != identity && record.synced_skills.iter().any(|value| value == name)
         })
     }
 
-    /// Save metadata to disk
-    async fn save_metadata(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.metadata)
-            .map_err(|e| crate::SkillStoreError::Parse(e.to_string()))?;
-        tokio::fs::write(&self.metadata_path, json).await?;
+    async fn removable(&self, identity: &str, name: &str) -> Result<bool> {
+        let path = self.skills_root.join(name);
+        if !path_exists(&path).await? {
+            return Ok(false);
+        }
+        if self.other_owner(identity, name) {
+            bail!("ambiguous source ownership; package preserved");
+        }
+        let record = self
+            .metadata
+            .get(identity)
+            .context("Source ownership record is missing")?;
+        metadata_source(&record.repo).context("Unverified source identity; package preserved")?;
+        let baseline = record
+            .fingerprints
+            .get(name)
+            .context("legacy/unowned package preserved (no ownership baseline)")?;
+        if &tree_hash_async(path).await? != baseline {
+            bail!("locally modified package preserved");
+        }
+        Ok(true)
+    }
+
+    async fn commit(
+        &mut self,
+        changes: Vec<Change>,
+        metadata: HashMap<String, SyncMetadata>,
+        tracking: Option<TrackingWrite<'_>>,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(&self.skills_root).await?;
+        let tracking = if let Some(tracking) = tracking {
+            let root = self.skills_root.canonicalize()?;
+            ensure!(
+                tracking.path != root.join(METADATA_FILE)
+                    && !changes
+                        .iter()
+                        .any(|change| tracking.path.starts_with(root.join(&change.name))),
+                "Tracking config overlaps files changed by the import"
+            );
+            let file = tracking.stage().with_context(|| {
+                format!("Cannot stage tracking config {}", tracking.path.display())
+            })?;
+            Some((tracking, file))
+        } else {
+            None
+        };
+        let temporary = NamedTempFile::new_in(&self.skills_root)?;
+        tokio::fs::write(temporary.path(), serde_json::to_vec_pretty(&metadata)?).await?;
+        temporary.as_file().sync_all()?;
+        let backup = tempfile::tempdir_in(&self.skills_root)?;
+        let metadata_backup = backup.path().join(METADATA_FILE);
+        let mut backed_up_metadata = false;
+        let mut installed_metadata = false;
+        let mut applied: Vec<(String, bool, bool)> = Vec::new();
+        let result: Result<()> = async {
+            for change in changes {
+                let destination = self.skills_root.join(&change.name);
+                let existed = path_exists(&destination).await?;
+                if existed {
+                    tokio::fs::rename(&destination, backup.path().join(&change.name)).await?;
+                }
+                applied.push((change.name, existed, false));
+                if let Some(staged) = change.staged {
+                    tokio::fs::rename(staged, &destination).await?;
+                    if let Some(last) = applied.last_mut() {
+                        last.2 = true;
+                    }
+                }
+            }
+            if tracking.is_some() && path_exists(&self.metadata_path).await? {
+                tokio::fs::rename(&self.metadata_path, &metadata_backup).await?;
+                backed_up_metadata = true;
+            }
+            tokio::fs::rename(temporary.path(), &self.metadata_path).await?;
+            installed_metadata = true;
+            if let Some((tracking, file)) = tracking {
+                tracking.persist(file)?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let mut failures = Vec::new();
+            let restore_metadata = if backed_up_metadata {
+                tokio::fs::rename(metadata_backup, &self.metadata_path).await
+            } else if installed_metadata {
+                tokio::fs::remove_file(&self.metadata_path).await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = restore_metadata {
+                failures.push(format!("ownership metadata: {error}"));
+            }
+            for (name, existed, installed) in applied.into_iter().rev() {
+                let destination = self.skills_root.join(&name);
+                let result = async {
+                    if installed {
+                        tokio::fs::remove_dir_all(&destination).await?;
+                    }
+                    if existed {
+                        tokio::fs::rename(backup.path().join(&name), destination).await?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    failures.push(format!("{name}: {error}"));
+                }
+            }
+            if !failures.is_empty() {
+                let recovery = backup.keep();
+                bail!(
+                    "{error:#}; rollback failed: {}; backups retained at {}",
+                    failures.join("; "),
+                    recovery.display()
+                );
+            }
+            return Err(error);
+        }
+        self.metadata = metadata;
         Ok(())
     }
 }
 
-/// Report of sync operations
+/// Return the stable source identity used for config deduplication and ownership.
+/// Aliases, selected packages, and Git refs do not change this identity.
+///
+/// # Errors
+/// Returns an error for invalid sources or unavailable local paths.
+pub fn normalize_source(raw: &str) -> Result<String> {
+    Ok(source(raw)?.identity)
+}
+
+/// Return a persistent source spelling independent of the current working directory.
+/// File URLs remain Git sources rather than becoming working-tree directories.
+///
+/// # Errors
+/// Returns an error for invalid sources or unavailable local paths.
+pub fn canonical_source(raw: &str) -> Result<String> {
+    Ok(source(raw)?.location)
+}
+
+fn metadata_source(raw: &str) -> Result<Source> {
+    if !Path::new(raw).is_absolute() && !raw.starts_with("file://") && !is_git_source(raw) {
+        bail!("relative legacy source has no recorded base directory");
+    }
+    source(raw)
+}
+
+fn is_git_source(raw: &str) -> bool {
+    ["https://", "http://", "ssh://", "git://"]
+        .iter()
+        .any(|prefix| raw.starts_with(prefix))
+        || (raw.contains('@') && raw.contains(':') && !raw.contains("://"))
+}
+
+fn source(raw: &str) -> Result<Source> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("empty source");
+    }
+    let direct = Path::new(raw);
+    let file_path = raw
+        .strip_prefix("file://")
+        .map(|_| {
+            reqwest::Url::parse(raw)
+                .context("Invalid file URL")?
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("File URL must be local"))
+        })
+        .transpose()?;
+    let (location, local, canonical) = if let Some(path) = file_path {
+        let path = std::fs::canonicalize(path)?;
+        (
+            reqwest::Url::from_file_path(&path)
+                .map_err(|()| anyhow::anyhow!("File URL must be absolute"))?
+                .to_string(),
+            None,
+            format!("path:{}", path.display()),
+        )
+    } else if direct.exists()
+        || raw.starts_with('.')
+        || direct.is_absolute()
+        || raw.starts_with('~')
+    {
+        let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+            PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(rest)
+        } else {
+            direct.to_path_buf()
+        };
+        let path = std::fs::canonicalize(expanded).context("Local source not found")?;
+        if !path.is_dir() {
+            bail!("Local source must be a directory");
+        }
+        (
+            path.to_string_lossy().into_owned(),
+            Some(path.clone()),
+            format!("path:{}", path.display()),
+        )
+    } else if is_git_source(raw) {
+        (
+            raw.to_owned(),
+            None,
+            format!("git:{}", raw.trim_end_matches('/').trim_end_matches(".git")),
+        )
+    } else {
+        let parts: Vec<_> = raw.split('/').collect();
+        if parts.len() != 2
+            || parts.iter().any(|part| {
+                part.is_empty()
+                    || !part
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+        {
+            bail!("Expected a local path, Git URL, or owner/repository shorthand");
+        }
+        let url = format!("https://github.com/{raw}");
+        (
+            url.clone(),
+            None,
+            format!("git:{}", url.trim_end_matches(".git")),
+        )
+    };
+    Ok(Source {
+        identity: blake3::hash(canonical.as_bytes()).to_hex().to_string(),
+        location,
+        local,
+    })
+}
+
+async fn git(path: Option<&Path>, args: &[&str]) -> Result<String> {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .kill_on_drop(true);
+    if let Some(path) = path {
+        command.current_dir(path);
+    }
+    let output = command.output().await.context("Running git")?;
+    if !output.status.success() {
+        bail!(
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+async fn prepare(config: &AgentSkillsRepoConfig) -> Result<Prepared> {
+    let source = source(&config.repo)?;
+    let checkout = tempfile::tempdir()?;
+    let (root, revision) = if let Some(path) = source.local.filter(|_| config.git_ref.is_none()) {
+        (path, String::new())
+    } else {
+        let root = checkout.path().join("repository");
+        git(
+            None,
+            &[
+                "clone",
+                "--no-checkout",
+                "--",
+                &source.location,
+                &root.to_string_lossy(),
+            ],
+        )
+        .await?;
+        let revision = if let Some(reference) = &config.git_ref {
+            let branch = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+            let candidates = [
+                format!("refs/remotes/origin/{branch}^{{commit}}"),
+                format!("refs/tags/{reference}^{{commit}}"),
+                format!("{reference}^{{commit}}"),
+            ];
+            let mut resolved = None;
+            for candidate in &candidates {
+                if let Ok(value) = git(
+                    Some(&root),
+                    &["rev-parse", "--verify", "--end-of-options", candidate],
+                )
+                .await
+                {
+                    resolved = Some(value);
+                    break;
+                }
+            }
+            resolved.context("Requested branch, tag, or commit was not found")?
+        } else {
+            git(Some(&root), &["rev-parse", "HEAD"]).await?
+        };
+        git(Some(&root), &["checkout", "--detach", &revision, "--"]).await?;
+        (root, revision)
+    };
+    let discovery_root = Dir::open_ambient_dir(root, ambient_authority())?;
+    let packages = tokio::task::spawn_blocking(move || discover(discovery_root)).await??;
+    Ok(Prepared {
+        _checkout: checkout,
+        revision,
+        packages,
+    })
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn discover(root: Dir) -> Result<BTreeMap<String, Dir>> {
+    let mut pending = vec![(root, 0_usize)];
+    let mut count = 0_usize;
+    let mut packages = BTreeMap::new();
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            bail!("Source discovery exceeds depth limit {MAX_DEPTH}");
+        }
+        match directory.symlink_metadata("SKILL.md") {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    bail!("SKILL.md must be a regular file");
+                }
+                let (mut input, _) =
+                    open_regular_file(&directory, std::ffi::OsStr::new("SKILL.md"))?;
+                let mut content = String::new();
+                input.read_to_string(&mut content)?;
+                let name = AgentSkill::source_name(&content)?;
+                match packages.entry(name) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(directory);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        bail!("Duplicate package name: {}", entry.key());
+                    }
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for entry in directory.entries()? {
+            let entry = entry?;
+            count = count.saturating_add(1);
+            if count > MAX_ENTRIES {
+                bail!("Source discovery exceeds entry limit {MAX_ENTRIES}");
+            }
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("Source contains a symlink: {}", Path::new(&name).display());
+            }
+            if kind.is_dir() {
+                pending.push((directory.open_dir(name)?, depth.saturating_add(1)));
+            }
+        }
+    }
+    Ok(packages)
+}
+
+async fn stage_package(source: &Dir, destination: &Path) -> Result<String> {
+    let source = source.try_clone()?;
+    let destination_copy = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || copy_tree(source, &destination_copy)).await??;
+    AgentSkill::from_directory(destination)
+        .await
+        .with_context(|| format!("Invalid package {}", destination.display()))?;
+    tree_hash_async(destination.to_path_buf()).await
+}
+
+fn copy_tree(source: Dir, destination: &Path) -> Result<()> {
+    let mut pending = vec![(source, destination.to_path_buf(), 0_usize)];
+    let mut count = 0_usize;
+    while let Some((source, destination, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            bail!("Package exceeds depth limit {MAX_DEPTH}");
+        }
+        std::fs::create_dir(&destination)?;
+        for entry in source.entries()? {
+            let entry = entry?;
+            count = count.saturating_add(1);
+            if count > MAX_ENTRIES {
+                bail!("Package exceeds entry limit {MAX_ENTRIES}");
+            }
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("Package symlink rejected: {}", Path::new(&name).display());
+            }
+            let target = destination.join(&name);
+            if kind.is_dir() {
+                pending.push((source.open_dir(name)?, target, depth.saturating_add(1)));
+            } else if kind.is_file() {
+                let (input, metadata) = open_regular_file(&source, &name)?;
+                copy_regular_file(input, &metadata, &target)?;
+            } else {
+                bail!("Package contains a non-regular file");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_regular_file(
+    directory: &Dir,
+    name: &std::ffi::OsStr,
+) -> Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let input = directory.open_with(name, &options)?.into_std();
+    let metadata = input.metadata()?;
+    if !metadata.is_file() {
+        bail!("Package file changed to a non-regular file");
+    }
+    Ok((input, metadata))
+}
+
+fn copy_regular_file(
+    mut input: std::fs::File,
+    metadata: &std::fs::Metadata,
+    destination: &Path,
+) -> Result<()> {
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.set_permissions(metadata.permissions())?;
+    Ok(())
+}
+
+async fn tree_hash_async(path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || tree_hash(&path)).await?
+}
+
+fn tree_hash(root: &Path) -> Result<String> {
+    if !std::fs::symlink_metadata(root)?.is_dir() {
+        bail!("Package is not a regular directory");
+    }
+    let root = Dir::open_ambient_dir(root, ambient_authority())?;
+    let mut hasher = blake3::Hasher::new();
+    let mut pending = vec![(root, PathBuf::new(), 0_usize)];
+    let mut count = 0_usize;
+    let mut buffer = [0_u8; 16_384];
+    while let Some((directory, relative, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            bail!("Installed package exceeds depth limit");
+        }
+        let mut entries = Vec::new();
+        for entry in directory.entries()? {
+            count = count.saturating_add(1);
+            if count > MAX_ENTRIES {
+                bail!("Installed package exceeds entry limit");
+            }
+            entries.push(entry?);
+        }
+        entries.sort_by_key(cap_std::fs::DirEntry::file_name);
+        for entry in entries {
+            let kind = entry.file_type()?;
+            let basename = entry.file_name();
+            let path = relative.join(&basename);
+            let name = path.to_str().context("Package paths must be UTF-8")?;
+            hasher.update(&u64::try_from(name.len())?.to_le_bytes());
+            hasher.update(name.as_bytes());
+            if kind.is_dir() {
+                hasher.update(b"directory");
+                pending.push((directory.open_dir(basename)?, path, depth.saturating_add(1)));
+            } else if kind.is_file() {
+                hasher.update(b"file");
+                let (mut file, metadata) = open_regular_file(&directory, &basename)?;
+                hasher.update(&metadata.len().to_le_bytes());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    hasher.update(&metadata.permissions().mode().to_le_bytes());
+                }
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(buffer.get(..read).context("Invalid read size")?);
+                }
+            } else {
+                bail!("Package contains a symlink or non-regular file");
+            }
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+async fn path_exists(path: &Path) -> Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SyncReport {
     pub added: Vec<String>,

@@ -1,7 +1,6 @@
 //! Agent Skills Format Support
 //!
-//! Parses and converts skills in the Agent Skills format (Vercel skills.sh compatible)
-//! to the internal skills.rs format.
+//! Parses Agent Skills documents and resources into the internal skills.rs format.
 //!
 //! Agent Skills Format:
 //! - SKILL.md with YAML frontmatter
@@ -65,8 +64,7 @@ pub struct AgentSkillsFrontmatter {
     /// Skill name (required, must match directory name)
     pub name: String,
 
-    /// Description (optional for command-only skills, max 1024 chars)
-    /// Some skills intentionally omit description to prevent auto-triggering
+    /// Required discovery description (max 1024 Unicode characters).
     #[serde(default)]
     pub description: Option<String>,
 
@@ -91,6 +89,10 @@ pub struct AgentSkillsFrontmatter {
     /// (`["Bash", "Read", "Write"]`).
     #[serde(default, rename = "allowed-tools")]
     pub allowed_tools: Option<AllowedTools>,
+
+    /// Host-specific fields, retained without interpreting their values.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
 
 /// Default version for Agent Skills
@@ -112,8 +114,16 @@ pub struct AgentSkill {
 impl AgentSkill {
     /// Parse an Agent Skill from a directory
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error if the document is missing, unreadable or invalid, its name
+    /// differs from the directory, or a resource escapes the package.
     pub async fn from_directory(path: &Path) -> Result<Self> {
+        Self::from_directory_with_name_check(path, true).await
+    }
+
+    pub(crate) async fn from_directory_with_name_check(
+        path: &Path,
+        check_name: bool,
+    ) -> Result<Self> {
         let skill_md_path = path.join("SKILL.md");
 
         if !skill_md_path.exists() {
@@ -121,6 +131,7 @@ impl AgentSkill {
                 "SKILL.md not found".to_string(),
             ));
         }
+        super::contained_file(path, "SKILL.md")?;
 
         let content = tokio::fs::read_to_string(&skill_md_path).await?;
         let (frontmatter, body) = Self::parse_frontmatter(&content)?;
@@ -131,20 +142,24 @@ impl AgentSkill {
             .and_then(|n| n.to_str())
             .ok_or_else(|| AgentSkillsError::InvalidFormat("Invalid directory name".to_string()))?;
 
-        if frontmatter.name != dir_name {
+        if check_name && frontmatter.name != dir_name {
             return Err(AgentSkillsError::ValidationError(format!(
                 "Skill name '{}' does not match directory name '{}'",
                 frontmatter.name, dir_name
             )));
         }
 
-        // Validate name format
-        Self::validate_name(&frontmatter.name)?;
-
-        // Discover optional directories
-        let scripts = Self::discover_files(&path.join("scripts")).await;
-        let references = Self::discover_files(&path.join("references")).await;
-        let assets = Self::discover_files(&path.join("assets")).await;
+        let files = super::inventory_files(path)?;
+        let in_directory = |directory: &str| {
+            files
+                .iter()
+                .filter(|file| file.starts_with(directory))
+                .map(|file| path.join(file))
+                .collect()
+        };
+        let scripts = in_directory("scripts");
+        let references = in_directory("references");
+        let assets = in_directory("assets");
 
         Ok(Self {
             frontmatter,
@@ -156,24 +171,22 @@ impl AgentSkill {
         })
     }
 
-    /// Parse YAML frontmatter from SKILL.md (private)
+    pub(crate) fn source_name(content: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Name {
+            name: String,
+        }
+        let normalized = normalized_document(content);
+        let (yaml, _) = frontmatter_parts(&normalized)?;
+        let name: Name = serde_yaml::from_str(yaml)?;
+        Self::validate_name(&name.name)?;
+        Ok(name.name)
+    }
+
     fn parse_frontmatter(content: &str) -> Result<(AgentSkillsFrontmatter, String)> {
-        // Normalize line endings to \n for consistent parsing
-        let normalized = content.replace("\r\n", "\n");
-
-        // Check for frontmatter delimiters
-        let after_first = normalized.strip_prefix("---\n").ok_or_else(|| {
-            AgentSkillsError::InvalidFormat(
-                "SKILL.md must start with YAML frontmatter (---)".to_string(),
-            )
-        })?;
-        let (yaml_content, body) = after_first.split_once("\n---\n").ok_or_else(|| {
-            AgentSkillsError::InvalidFormat(
-                "SKILL.md frontmatter not properly closed with ---".to_string(),
-            )
-        })?;
+        let normalized = normalized_document(content);
+        let (yaml_content, body) = frontmatter_parts(&normalized)?;
         let body = body.trim().to_string();
-
         let frontmatter: AgentSkillsFrontmatter = serde_yaml::from_str(yaml_content)?;
 
         // Validate required fields
@@ -181,23 +194,23 @@ impl AgentSkill {
             return Err(AgentSkillsError::MissingField("name".to_string()));
         }
 
-        // Validate field constraints
-        if frontmatter.name.len() > 64 {
+        Self::validate_name(&frontmatter.name)?;
+        let description = frontmatter
+            .description
+            .as_deref()
+            .ok_or_else(|| AgentSkillsError::MissingField("description".to_string()))?;
+        if description.trim().is_empty() {
+            return Err(AgentSkillsError::MissingField("description".to_string()));
+        }
+        if description.chars().count() > 1024 {
             return Err(AgentSkillsError::ValidationError(
-                "name exceeds 64 characters".to_string(),
+                "description exceeds 1024 characters".to_string(),
             ));
         }
-        if let Some(ref desc) = frontmatter.description {
-            if desc.len() > 1024 {
-                return Err(AgentSkillsError::ValidationError(
-                    "description exceeds 1024 characters".to_string(),
-                ));
-            }
-        }
         if let Some(ref compat) = frontmatter.compatibility {
-            if compat.len() > 500 {
+            if compat.trim().is_empty() || compat.chars().count() > 500 {
                 return Err(AgentSkillsError::ValidationError(
-                    "compatibility exceeds 500 characters".to_string(),
+                    "compatibility must contain 1-500 characters".to_string(),
                 ));
             }
         }
@@ -207,7 +220,7 @@ impl AgentSkill {
 
     /// Validate skill name format per Agent Skills spec
     fn validate_name(name: &str) -> Result<()> {
-        if name.is_empty() || name.len() > 64 {
+        if name.is_empty() || name.chars().count() > 64 {
             return Err(AgentSkillsError::ValidationError(
                 "name must be 1-64 characters".to_string(),
             ));
@@ -238,25 +251,6 @@ impl AgentSkill {
         }
 
         Ok(())
-    }
-
-    /// Discover files in a directory (non-recursive)
-    async fn discover_files(dir: &Path) -> Vec<PathBuf> {
-        if !dir.exists() {
-            return Vec::new();
-        }
-
-        let mut files = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(metadata) = entry.metadata().await {
-                    if metadata.is_file() {
-                        files.push(entry.path());
-                    }
-                }
-            }
-        }
-        files
     }
 
     /// Parse allowed-tools into a Vec (supports both string and array formats)
@@ -304,31 +298,17 @@ impl AgentSkill {
     pub fn to_skill_manifest(&self) -> crate::SkillManifest {
         use crate::{EntrypointType, SkillHints, SkillManifest, ToolPolicy};
 
-        // Determine entrypoint type
-        let entrypoint = if self.has_scripts() {
-            EntrypointType::Script
-        } else {
-            EntrypointType::Prompted
-        };
+        let entrypoint = EntrypointType::Prompted;
 
         // Parse allowed tools for tool policy
         let allowed_tools = self.parse_allowed_tools();
         let tool_policy = ToolPolicy {
-            allow: if allowed_tools.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                allowed_tools
-            },
+            allow: allowed_tools,
             deny: vec![],
             required: vec![],
         };
 
-        // Get description (use empty string if not provided for command-only skills)
-        let description = self
-            .frontmatter
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("Command-only skill: {}", self.frontmatter.name));
+        let description = self.frontmatter.description.clone().unwrap_or_default();
 
         // Extract hints from description (keywords for search)
         let description_words: Vec<String> = description
@@ -340,7 +320,16 @@ impl AgentSkill {
 
         let hints = SkillHints {
             intent: description_words,
-            domain: vec![],
+            domain: self
+                .frontmatter
+                .extra
+                .get("tags")
+                .and_then(serde_yaml::Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_yaml::Value::as_str)
+                .map(str::to_string)
+                .collect(),
             outcomes: vec![],
             expected_calls: None,
         };
@@ -379,75 +368,54 @@ impl AgentSkill {
     }
 
     /// Convert Agent Skill to `SkillContent` for progressive disclosure
-    #[expect(
-        clippy::unused_async,
-        reason = "kept async for compatibility with skill-loading call sites"
-    )]
-    pub async fn to_skill_content(&self) -> crate::SkillContent {
-        use crate::core::BundledTool;
+    /// # Errors
+    /// Returns an error if package resources cannot be inventoried safely or the
+    /// frontmatter cannot be serialized to YAML.
+    pub fn to_skill_content(&self) -> Result<crate::SkillContent> {
         use crate::SkillContent;
 
-        let mut bundled_tools = Vec::new();
-        let mut additional_files = Vec::new();
-
-        // Add scripts as bundled tools
-        for script_path in &self.scripts {
-            if let Some(filename) = script_path.file_name().and_then(|n| n.to_str()) {
-                let interpreter = Self::infer_interpreter(filename);
-                let tool = BundledTool {
-                    name: filename.to_string(),
-                    description: format!("Bundled script: {filename}"),
-                    command: vec![interpreter, filename.to_string()],
-                    schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": true
-                    }),
-                };
-                bundled_tools.push(tool);
-            }
-        }
-
-        // Add references as additional files
-        for ref_path in &self.references {
-            if let Some(filename) = ref_path.file_name().and_then(|n| n.to_str()) {
-                additional_files.push(format!("references/{filename}"));
-            }
-        }
-
-        // Add assets as additional files
-        for asset_path in &self.assets {
-            if let Some(filename) = asset_path.file_name().and_then(|n| n.to_str()) {
-                additional_files.push(format!("assets/{filename}"));
-            }
-        }
-
-        SkillContent {
+        let files = super::inventory_files(&self.path)?;
+        let bundled_tools = super::SkillStore::discover_bundled_tools(&self.path, &files);
+        let additional_files = super::resource_paths(&files, &bundled_tools);
+        Ok(SkillContent {
+            name: self.frontmatter.name.clone(),
+            version: self.version(),
+            description: self.frontmatter.description.clone().unwrap_or_default(),
+            directory: self.path.clone(),
+            frontmatter: serde_yaml::to_value(&self.frontmatter)?,
             skill_md: self.content.clone(),
             additional_files,
             bundled_tools,
             uses_tools: self.parse_allowed_tools(),
-        }
+        })
     }
+}
 
-    /// Infer interpreter from file extension
-    fn infer_interpreter(filename: &str) -> String {
-        let extension = Path::new(filename).extension().and_then(|ext| ext.to_str());
-        if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("py")) {
-            "python3".to_string()
-        } else if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("sh")) {
-            "bash".to_string()
-        } else if extension.is_some_and(|ext| ext.eq_ignore_ascii_case("js")) {
-            "node".to_string()
-        } else {
-            "bash".to_string() // default
-        }
+fn normalized_document(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.contains("\r\n") {
+        std::borrow::Cow::Owned(content.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(content)
     }
+}
+
+fn frontmatter_parts(normalized: &str) -> Result<(&str, &str)> {
+    let after_first = normalized.strip_prefix("---\n").ok_or_else(|| {
+        AgentSkillsError::InvalidFormat(
+            "SKILL.md must start with YAML frontmatter (---)".to_string(),
+        )
+    })?;
+    after_first.split_once("\n---\n").ok_or_else(|| {
+        AgentSkillsError::InvalidFormat(
+            "SKILL.md frontmatter not properly closed with ---".to_string(),
+        )
+    })
 }
 
 /// Public wrapper to parse frontmatter for backward compatibility with old-format skills
 /// # Errors
-/// Returns an error if the operation cannot be completed.
+/// Returns an error for missing or malformed YAML frontmatter, required fields,
+/// or values that violate the Agent Skills field constraints.
 pub fn parse_frontmatter_public(content: &str) -> Result<(AgentSkillsFrontmatter, String)> {
     AgentSkill::parse_frontmatter(content)
 }

@@ -3,17 +3,19 @@
 //! Provides multiple sandboxing backends:
 //! - None: No sandboxing (development only)
 //! - Timeout: Basic timeout enforcement
-//! - Restricted: Limited filesystem/network access
+//! - Restricted: Environment/resource hardening, not filesystem/network containment
 //! - Bubblewrap: Linux container-based sandboxing
 //! - Docker: Docker container-based sandboxing
 //! - WASM: WebAssembly-based sandboxing (wasmtime runtime)
 
 use crate::execution::wasm::WasmSandbox;
 use bollard::container::LogOutput;
-use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
+use bollard::models::{
+    ContainerCreateBody, HostConfig, HostConfigLogConfig, Mount, MountType, ResourcesUlimits,
+};
 use bollard::query_parameters::{
-    CreateContainerOptions, KillContainerOptions, LogsOptions, StartContainerOptions,
-    WaitContainerOptions,
+    AttachContainerOptions, CreateContainerOptions, KillContainerOptions, RemoveContainerOptions,
+    StartContainerOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use futures::stream::StreamExt;
@@ -23,8 +25,110 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+fn decode_output(output: Vec<u8>) -> String {
+    String::from_utf8(output)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
+fn append_output(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    remaining: &mut u64,
+    limit: u64,
+) -> Result<()> {
+    let count = u64::try_from(bytes.len()).map_err(std::io::Error::other)?;
+    if count > *remaining {
+        return Err(SandboxError::OutputLimitExceeded(limit));
+    }
+    let required = output
+        .len()
+        .checked_add(bytes.len())
+        .ok_or(SandboxError::OutputLimitExceeded(limit))?;
+    if required > output.capacity() {
+        let capacity = output
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .min(usize::try_from(limit).unwrap_or(usize::MAX));
+        output
+            .try_reserve_exact(
+                capacity
+                    .checked_sub(output.len())
+                    .ok_or(SandboxError::OutputLimitExceeded(limit))?,
+            )
+            .map_err(std::io::Error::other)?;
+    }
+    output.extend_from_slice(bytes);
+    *remaining = remaining
+        .checked_sub(count)
+        .ok_or(SandboxError::OutputLimitExceeded(limit))?;
+    Ok(())
+}
+
+async fn capture_native_output(
+    stdout: &mut (impl AsyncRead + Unpin),
+    stderr: &mut (impl AsyncRead + Unpin),
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    limit: u64,
+) -> Result<()> {
+    let mut remaining = limit;
+    let mut stdout_buffer = [0_u8; 4096];
+    let mut stderr_buffer = [0_u8; 4096];
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    while stdout_open || stderr_open {
+        tokio::select! {
+            result = stdout.read(&mut stdout_buffer), if stdout_open => {
+                let count = result?;
+                stdout_open = count != 0;
+                let bytes = stdout_buffer.get(..count).ok_or_else(|| {
+                    std::io::Error::other("stdout read exceeded its buffer")
+                })?;
+                append_output(out, bytes, &mut remaining, limit)?;
+            }
+            result = stderr.read(&mut stderr_buffer), if stderr_open => {
+                let count = result?;
+                stderr_open = count != 0;
+                let bytes = stderr_buffer.get(..count).ok_or_else(|| {
+                    std::io::Error::other("stderr read exceeded its buffer")
+                })?;
+                append_output(err, bytes, &mut remaining, limit)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_container(docker: &Docker, id: &str) -> Result<Option<i32>> {
+    let mut stream = docker.wait_container(
+        id,
+        Some(WaitContainerOptions {
+            condition: "not-running".to_string(),
+        }),
+    );
+    let status = match stream.next().await {
+        Some(Ok(response)) => response.status_code,
+        Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+        Some(Err(error)) => {
+            return Err(SandboxError::ExecutionFailed(format!(
+                "Docker wait failed: {error}"
+            )));
+        }
+        None => {
+            return Err(SandboxError::ExecutionFailed(
+                "Docker wait stream closed without exit status".to_string(),
+            ));
+        }
+    };
+    Ok(i32::try_from(status).ok())
+}
 
 fn elapsed_millis(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -156,7 +260,7 @@ impl SandboxPreset {
 ///       timeout_ms: 5000
 ///       max_memory_bytes: 134217728
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SandboxConfigOverride {
     /// Preset configuration to use as base
     ///
@@ -176,6 +280,8 @@ pub struct SandboxConfigOverride {
     pub max_memory_bytes: Option<u64>,
     /// Max CPU time in seconds (overrides preset/global default)
     pub max_cpu_seconds: Option<u64>,
+    /// Maximum combined captured stdout/stderr bytes (zero permits no output)
+    pub max_output_bytes: Option<u64>,
     /// Additional allowed read paths (merged with preset/global)
     #[serde(default)]
     pub allow_read: Vec<PathBuf>,
@@ -221,6 +327,9 @@ impl SandboxConfigOverride {
         if let Some(max_cpu_seconds) = self.max_cpu_seconds {
             config.max_cpu_seconds = max_cpu_seconds;
         }
+        if let Some(max_output_bytes) = self.max_output_bytes {
+            config.max_output_bytes = max_output_bytes;
+        }
         config.allow_read.extend(self.allow_read.clone());
         config.allow_write.extend(self.allow_write.clone());
 
@@ -235,6 +344,9 @@ pub enum SandboxError {
 
     #[error("Timeout exceeded: {0}ms")]
     Timeout(u64),
+
+    #[error("Captured output exceeded the {0}-byte limit")]
+    OutputLimitExceeded(u64),
 
     #[error("Sandbox not available: {0}")]
     NotAvailable(String),
@@ -254,17 +366,17 @@ pub type Result<T> = std::result::Result<T, SandboxError>;
 pub enum SandboxBackend {
     /// No sandboxing (development only)
     None,
-    /// Basic timeout enforcement only
-    #[default]
+    /// Trusted-code hardening only; detached descendants can escape process-group cleanup.
     Timeout,
-    /// Restricted environment (limited FS/network)
+    /// Trusted-code hardening only; no hostile-code or detached-descendant containment.
     Restricted,
-    /// Bubblewrap (Linux container)
+    /// Bubblewrap (Linux container); fails closed when unavailable.
+    #[cfg_attr(target_os = "linux", default)]
     Bubblewrap,
     /// Docker container-based sandboxing
+    #[cfg_attr(not(target_os = "linux"), default)]
     Docker,
-    /// WASM runtime (future)
-    #[allow(dead_code)]
+    /// WebAssembly with capability-scoped WASI and enforced guest resource limits.
     Wasm,
 }
 
@@ -283,7 +395,8 @@ impl SandboxBackend {
 }
 
 /// Docker container configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DockerConfig {
     /// Docker image to use
     pub image: String,
@@ -317,7 +430,7 @@ fn default_network_mode() -> String {
 }
 
 /// Docker mount configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerMount {
     /// Source path on host
     pub source: PathBuf,
@@ -345,7 +458,8 @@ impl Default for DockerConfig {
 }
 
 /// Sandbox configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SandboxConfig {
     /// Sandboxing backend
     pub backend: SandboxBackend,
@@ -361,6 +475,9 @@ pub struct SandboxConfig {
     pub max_memory_bytes: u64,
     /// Maximum CPU time (seconds, 0 = unlimited)
     pub max_cpu_seconds: u64,
+    /// Maximum combined raw stdout/stderr bytes, including WASM output.
+    /// Defaults to 8 MiB; zero permits no output, not unlimited output.
+    pub max_output_bytes: u64,
     /// Docker-specific configuration (only used when backend is Docker)
     #[serde(default)]
     pub docker: DockerConfig,
@@ -376,6 +493,7 @@ impl Default for SandboxConfig {
             allow_network: false,
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
             max_cpu_seconds: 30,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: DockerConfig::default(),
         }
     }
@@ -390,12 +508,13 @@ impl SandboxConfig {
     pub fn development() -> Self {
         Self {
             backend: SandboxBackend::Timeout,
-            timeout_ms: 60000,                    // 60 seconds
-            allow_read: vec![],                   // No restrictions via sandbox
-            allow_write: vec![],                  // No restrictions via sandbox
-            allow_network: true,                  // Network allowed
+            timeout_ms: 60000,
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_network: true,
             max_memory_bytes: 1024 * 1024 * 1024, // 1 GB
             max_cpu_seconds: 60,                  // 60 seconds
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: DockerConfig {
                 network_mode: "bridge".to_string(),
                 memory_limit: 1024 * 1024 * 1024, // 1 GB
@@ -404,10 +523,8 @@ impl SandboxConfig {
         }
     }
 
-    /// Standard configuration - balanced security (recommended default)
-    ///
-    /// Uses timeout + restricted backend with safe defaults.
-    /// Suitable for: Production use with bundled tools and skills.
+    /// Standard configuration: enforced filesystem/network containment.
+    /// Requires Bubblewrap on Linux or Docker on other platforms; never falls back.
     #[must_use]
     pub fn standard() -> Self {
         Self::default()
@@ -429,6 +546,7 @@ impl SandboxConfig {
             allow_network: false,                // No network
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_seconds: 10,                 // 10 seconds
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: docker_config,
         }
     }
@@ -449,6 +567,7 @@ impl SandboxConfig {
             allow_network: false,                // No network
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_seconds: 10,                 // 10 seconds
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: DockerConfig {
                 image: "alpine:latest".to_string(),
                 memory_limit: 256 * 1024 * 1024,  // 256 MB
@@ -467,13 +586,14 @@ impl SandboxConfig {
     #[must_use]
     pub fn network() -> Self {
         Self {
-            backend: SandboxBackend::Restricted,
+            backend: Self::default().backend,
             timeout_ms: 30000,                   // 30 seconds
             allow_read: vec![],                  // Minimal read access
             allow_write: vec![],                 // No write access
             allow_network: true,                 // Network enabled
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
             max_cpu_seconds: 30,                 // 30 seconds
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: DockerConfig {
                 network_mode: "bridge".to_string(),
                 ..Default::default()
@@ -490,13 +610,14 @@ impl SandboxConfig {
         let docker_config = DockerConfig::default();
 
         Self {
-            backend: SandboxBackend::Restricted,
+            backend: Self::default().backend,
             timeout_ms: 30000,                   // 30 seconds
             allow_read: read_paths,              // Specified read paths
             allow_write: write_paths,            // Specified write paths
             allow_network: false,                // No network
             max_memory_bytes: 512 * 1024 * 1024, // 512 MB
             max_cpu_seconds: 30,                 // 30 seconds
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: docker_config,
         }
     }
@@ -517,6 +638,7 @@ impl SandboxConfig {
             allow_network: false,                // No WASI network
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_seconds: 30,                 // 30 seconds
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             docker: docker_config,
         }
     }
@@ -564,7 +686,7 @@ impl SandboxConfig {
 }
 
 /// Execution result from sandbox
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SandboxResult {
     pub stdout: String,
     pub stderr: String,
@@ -576,6 +698,97 @@ pub struct SandboxResult {
 /// Sandboxed executor
 pub struct Sandbox {
     config: SandboxConfig,
+}
+
+/// Retain this value for the lifetime of the process so its private home/tmp survives.
+pub struct PreparedCommand {
+    command: Command,
+    _directory: Option<tempfile::TempDir>,
+}
+
+impl PreparedCommand {
+    pub const fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+
+    /// # Errors
+    /// Returns spawn errors, including failure to apply configured resource limits.
+    pub fn spawn(&mut self) -> Result<(tokio::process::Child, ProcessGroup)> {
+        let child = self.command.spawn()?;
+        let group = ProcessGroup { id: child.id() };
+        Ok((child, group))
+    }
+}
+
+/// Kills descendants still in the original Unix process group on exit or cancellation.
+///
+/// Native trusted-code modes cannot stop descendants that create a new session/group.
+/// Bubblewrap additionally confines descendants to its private PID namespace.
+pub struct ProcessGroup {
+    id: Option<u32>,
+}
+
+impl ProcessGroup {
+    /// # Errors
+    /// Returns OS errors when the process group cannot be terminated.
+    pub fn terminate(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(id) = self.id {
+            let id = i32::try_from(id).map_err(std::io::Error::other)?;
+            let group = id
+                .checked_neg()
+                .filter(|group| *group < 0)
+                .ok_or_else(|| std::io::Error::other("Process group ID must be positive"))?;
+            // Each prepared process starts a fresh process group before exec.
+            if unsafe { libc::kill(group, libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate() {
+            error!("Failed to terminate subprocess group: {error}");
+        }
+    }
+}
+
+struct ContainerCleanup {
+    docker: Docker,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for ContainerCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let docker = self.docker.clone();
+        let id = self.id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    error!("Failed to remove sandbox container {id}: {error}");
+                }
+            });
+        }
+    }
 }
 
 impl Sandbox {
@@ -596,20 +809,11 @@ impl Sandbox {
         env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
         match self.config.backend {
-            SandboxBackend::None => {
-                self.execute_unsandboxed(program, args, working_dir, env_vars)
-                    .await
-            }
-            SandboxBackend::Timeout => {
-                self.execute_with_timeout(program, args, working_dir, env_vars)
-                    .await
-            }
-            SandboxBackend::Restricted => {
-                self.execute_restricted(program, args, working_dir, env_vars)
-                    .await
-            }
-            SandboxBackend::Bubblewrap => {
-                self.execute_bubblewrap(program, args, working_dir, env_vars)
+            SandboxBackend::None
+            | SandboxBackend::Timeout
+            | SandboxBackend::Restricted
+            | SandboxBackend::Bubblewrap => {
+                self.execute_native(program, args, working_dir, env_vars)
                     .await
             }
             SandboxBackend::Docker => {
@@ -623,373 +827,231 @@ impl Sandbox {
         }
     }
 
-    /// Execute without sandboxing (development only)
-    async fn execute_unsandboxed(
-        &self,
-        program: &str,
-        args: &[String],
-        working_dir: &Path,
-        env_vars: &[(String, String)],
-    ) -> Result<SandboxResult> {
-        warn!("Executing without sandbox: {}", program);
-        self.execute_with_timeout(program, args, working_dir, env_vars)
-            .await
-    }
-
-    /// Execute with timeout enforcement
-    async fn execute_with_timeout(
-        &self,
-        program: &str,
-        args: &[String],
-        working_dir: &Path,
-        env_vars: &[(String, String)],
-    ) -> Result<SandboxResult> {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(working_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        for (key, value) in env_vars {
-            cmd.env(key, value);
-        }
-
-        let start = std::time::Instant::now();
-        if self.config.timeout_ms == 0 {
-            let output = cmd.output().await.map_err(SandboxError::Io)?;
-            return Ok(SandboxResult {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code(),
-                duration_ms: elapsed_millis(start),
-                timed_out: false,
-            });
-        }
-        let timeout = Duration::from_millis(self.config.timeout_ms);
-
-        let output = match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(SandboxError::Io(e)),
-            Err(_) => {
-                return Ok(SandboxResult {
-                    stdout: String::new(),
-                    stderr: "Execution timed out".to_string(),
-                    exit_code: None,
-                    duration_ms: self.config.timeout_ms,
-                    timed_out: true,
-                });
-            }
-        };
-
-        let duration_ms = elapsed_millis(start);
-
-        Ok(SandboxResult {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code(),
-            duration_ms,
-            timed_out: false,
-        })
-    }
-
-    /// Execute with restricted environment
-    ///
-    /// Creates a sandboxed environment with:
-    /// - Resource limits (CPU, memory, file descriptors)
-    /// - Clean environment (no inherited env vars except PATH)
-    /// - Working directory isolation (temp directory)
-    /// - Network access control (via env vars, full blocking requires bubblewrap)
+    /// Prepare the same enforced command boundary used for bundled scripts and MCP stdio.
+    /// # Errors
+    /// Rejects unenforceable policies and unsupported backends before spawning.
     #[expect(
         clippy::too_many_lines,
-        reason = "restricted process setup must remain ordered around the pre-exec boundary"
+        reason = "command preparation defines one ordered capability boundary"
     )]
-    async fn execute_restricted(
+    pub fn prepare_command(
         &self,
         program: &str,
         args: &[String],
-        _working_dir: &Path,
+        working_dir: &Path,
         env_vars: &[(String, String)],
-    ) -> Result<SandboxResult> {
-        // Create temp sandbox directory
-        let sandbox_dir = tempfile::tempdir()
-            .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create sandbox: {e}")))?;
-
-        // Copy allowed read files into sandbox
-        for allowed_path in &self.config.allow_read {
-            if allowed_path.exists() {
-                let file_name = allowed_path.file_name().ok_or_else(|| {
-                    SandboxError::InvalidConfig(format!("Invalid path: {}", allowed_path.display()))
-                })?;
-                let dest = sandbox_dir.path().join(file_name);
-
-                if allowed_path.is_file() {
-                    if let Err(e) = std::fs::copy(allowed_path, &dest) {
-                        warn!(
-                            "Failed to copy {} to sandbox: {}",
-                            allowed_path.display(),
-                            e
-                        );
-                    }
-                } else if allowed_path.is_dir() {
-                    if let Err(e) = Self::copy_dir_recursive(allowed_path, &dest) {
-                        warn!(
-                            "Failed to copy dir {} to sandbox: {}",
-                            allowed_path.display(),
-                            e
-                        );
-                    }
+    ) -> Result<PreparedCommand> {
+        if matches!(
+            self.config.backend,
+            SandboxBackend::Docker | SandboxBackend::Wasm
+        ) {
+            return Err(SandboxError::NotAvailable(
+                "This backend cannot expose a native stdio command".to_string(),
+            ));
+        }
+        if matches!(
+            self.config.backend,
+            SandboxBackend::None | SandboxBackend::Timeout | SandboxBackend::Restricted
+        ) && (!self.config.allow_network
+            || !self.config.allow_read.is_empty()
+            || !self.config.allow_write.is_empty())
+        {
+            return Err(SandboxError::InvalidConfig(
+                "Native none/timeout/restricted modes cannot enforce filesystem/network restrictions; use bubblewrap, Docker, or WASM".to_string(),
+            ));
+        }
+        if self.config.backend == SandboxBackend::None
+            && (self.config.max_memory_bytes > 0 || self.config.max_cpu_seconds > 0)
+        {
+            return Err(SandboxError::InvalidConfig("The none backend does not enforce resource limits; use timeout or an isolated backend".to_string()));
+        }
+        #[cfg(not(unix))]
+        if self.config.backend != SandboxBackend::None || self.config.timeout_ms > 0 {
+            return Err(SandboxError::NotAvailable(
+                "Native process-group/resource hardening requires Unix; use Docker".to_string(),
+            ));
+        }
+        let directory = if self.config.backend == SandboxBackend::None {
+            None
+        } else {
+            Some(tempfile::tempdir()?)
+        };
+        let private_path = directory.as_ref().map(tempfile::TempDir::path);
+        let working_dir = working_dir.canonicalize()?;
+        let mut command = if self.config.backend == SandboxBackend::Bubblewrap {
+            if !cfg!(target_os = "linux") {
+                return Err(SandboxError::NotAvailable(
+                    "Bubblewrap requires Linux".to_string(),
+                ));
+            }
+            let mut command = Command::new("bwrap");
+            command
+                .arg("--unshare-all")
+                .arg("--die-with-parent")
+                .arg("--new-session");
+            if self.config.allow_network {
+                command.arg("--share-net");
+            }
+            for path in ["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
+                if Path::new(path).exists() {
+                    command.arg("--ro-bind").arg(path).arg(path);
                 }
             }
+            command
+                .arg("--proc")
+                .arg("/proc")
+                .arg("--dev")
+                .arg("/dev")
+                .arg("--tmpfs")
+                .arg("/tmp")
+                .arg("--ro-bind")
+                .arg(&working_dir)
+                .arg(&working_dir);
+            for path in &self.config.allow_read {
+                let path = path.canonicalize()?;
+                command.arg("--ro-bind").arg(&path).arg(&path);
+            }
+            for path in &self.config.allow_write {
+                let path = path.canonicalize()?;
+                command.arg("--bind").arg(&path).arg(&path);
+            }
+            let private_path = private_path.ok_or_else(|| {
+                SandboxError::InvalidConfig(
+                    "Bubblewrap requires a private invocation directory".to_string(),
+                )
+            })?;
+            command
+                .arg("--bind")
+                .arg(private_path)
+                .arg(private_path)
+                .arg("--chdir")
+                .arg(&working_dir)
+                .arg("--")
+                .arg(program)
+                .args(args);
+            command
+        } else {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        };
+        command
+            .current_dir(&working_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(private_path) = private_path {
+            command
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("LANG", "C.UTF-8")
+                .env("HOME", private_path)
+                .env("TMPDIR", private_path)
+                .env("TMP", private_path)
+                .env("TEMP", private_path);
         }
-
-        // On Unix, we can use ulimit-style restrictions
+        for (key, value) in env_vars {
+            command.env(key, value);
+        }
         #[cfg(unix)]
         {
-            let mut cmd = Command::new(program);
-            cmd.args(args)
-                .current_dir(sandbox_dir.path())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            // Add user-specified env vars
-            for (key, value) in env_vars {
-                cmd.env(key, value);
-            }
-
-            // Clear all environment except allowed vars
-            cmd.env_clear();
-
-            // Restore minimal safe environment
-            if let Ok(path) = std::env::var("PATH") {
-                cmd.env("PATH", path);
-            }
-
-            // Re-add user-specified env vars
-            for (key, value) in env_vars {
-                cmd.env(key, value);
-            }
-
-            // Block network if not allowed (basic approach via env)
-            if !self.config.allow_network {
-                cmd.env("HTTP_PROXY", "http://127.0.0.1:0");
-                cmd.env("HTTPS_PROXY", "http://127.0.0.1:0");
-                cmd.env("ALL_PROXY", "http://127.0.0.1:0");
-            }
-
-            // Capture config values for the closure
-            let max_cpu_seconds = self.config.max_cpu_seconds;
-            let max_memory_bytes = self.config.max_memory_bytes;
-
-            // Set resource limits using pre_exec
-            unsafe {
-                cmd.pre_exec(move || {
-                    use libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
-
-                    // Limit CPU time
-                    if max_cpu_seconds > 0 {
-                        let cpu_limit = rlimit {
-                            rlim_cur: max_cpu_seconds,
-                            rlim_max: max_cpu_seconds,
-                        };
-                        setrlimit(RLIMIT_CPU, &raw const cpu_limit);
-                    }
-
-                    // Limit memory
-                    if max_memory_bytes > 0 {
-                        let mem_limit = rlimit {
-                            rlim_cur: max_memory_bytes,
-                            rlim_max: max_memory_bytes,
-                        };
-                        setrlimit(RLIMIT_AS, &raw const mem_limit);
-                    }
-
-                    // Limit open files
-                    let file_limit = rlimit {
-                        rlim_cur: 64,
-                        rlim_max: 64,
-                    };
-                    setrlimit(RLIMIT_NOFILE, &raw const file_limit);
-
-                    Ok(())
-                });
-            }
-
-            let start = std::time::Instant::now();
-            let timeout = Duration::from_millis(self.config.timeout_ms);
-
-            let output = match tokio::time::timeout(timeout, cmd.output()).await {
-                Ok(Ok(output)) => output,
-                Ok(Err(e)) => return Err(SandboxError::Io(e)),
-                Err(_) => {
-                    return Ok(SandboxResult {
-                        stdout: String::new(),
-                        stderr: "Execution timed out".to_string(),
-                        exit_code: None,
-                        duration_ms: self.config.timeout_ms,
-                        timed_out: true,
+            command.process_group(0);
+            if self.config.backend != SandboxBackend::None {
+                let cpu = libc::rlim_t::try_from(self.config.max_cpu_seconds)
+                    .map_err(std::io::Error::other)?;
+                let memory = libc::rlim_t::try_from(self.config.max_memory_bytes)
+                    .map_err(std::io::Error::other)?;
+                // Only async-signal-safe syscalls may run in this post-fork closure.
+                unsafe {
+                    command.pre_exec(move || {
+                        for (resource, limit) in [
+                            (libc::RLIMIT_CPU, cpu),
+                            (libc::RLIMIT_AS, memory),
+                            (libc::RLIMIT_NOFILE, 256),
+                        ] {
+                            if limit > 0 {
+                                let limits = libc::rlimit {
+                                    rlim_cur: limit,
+                                    rlim_max: limit,
+                                };
+                                if libc::setrlimit(resource, &raw const limits) != 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                            }
+                        }
+                        Ok(())
                     });
                 }
-            };
-
-            let duration_ms = elapsed_millis(start);
-
-            Ok(SandboxResult {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code(),
-                duration_ms,
-                timed_out: false,
-            })
-        }
-
-        #[cfg(not(unix))]
-        {
-            warn!("Restricted mode has limited functionality on this platform, using timeout-only");
-            self.execute_with_timeout(program, args, sandbox_dir.path(), env_vars)
-                .await
-        }
-    }
-
-    /// Recursively copy directory
-    fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let path = entry.path();
-            let dest_path = dst.join(entry.file_name());
-
-            if path.is_dir() {
-                Self::copy_dir_recursive(&path, &dest_path)?;
-            } else {
-                std::fs::copy(&path, &dest_path)?;
             }
         }
-        Ok(())
+        Ok(PreparedCommand {
+            command,
+            _directory: directory,
+        })
     }
 
-    /// Execute using Bubblewrap (Linux only)
-    async fn execute_bubblewrap(
+    async fn execute_native(
         &self,
         program: &str,
         args: &[String],
         working_dir: &Path,
         env_vars: &[(String, String)],
     ) -> Result<SandboxResult> {
-        // Check if bwrap is available
-        if !Self::is_bubblewrap_available() {
-            return Err(SandboxError::NotAvailable(
-                "bubblewrap not found. Install with: sudo apt-get install bubblewrap".to_string(),
-            ));
-        }
-
-        let mut cmd = Command::new("bwrap");
-
-        // Basic isolation
-        cmd.arg("--unshare-all")
-            .arg("--share-net") // Share network namespace (if allowed)
-            .arg("--die-with-parent");
-
-        // Mount essential directories read-only
-        cmd.arg("--ro-bind")
-            .arg("/usr")
-            .arg("/usr")
-            .arg("--ro-bind")
-            .arg("/lib")
-            .arg("/lib")
-            .arg("--ro-bind")
-            .arg("/lib64")
-            .arg("/lib64")
-            .arg("--ro-bind")
-            .arg("/bin")
-            .arg("/bin")
-            .arg("--ro-bind")
-            .arg("/sbin")
-            .arg("/sbin");
-
-        // Tmpfs for /tmp and /var/tmp
-        cmd.arg("--tmpfs").arg("/tmp").arg("--tmpfs").arg("/var");
-
-        // Proc filesystem
-        cmd.arg("--proc").arg("/proc").arg("--dev").arg("/dev");
-
-        // Working directory (bind as read-write)
-        cmd.arg("--bind").arg(working_dir).arg(working_dir);
-
-        // Additional read paths
-        for path in &self.config.allow_read {
-            if path.exists() {
-                cmd.arg("--ro-bind").arg(path).arg(path);
-            }
-        }
-
-        // Additional write paths
-        for path in &self.config.allow_write {
-            if path.exists() {
-                cmd.arg("--bind").arg(path).arg(path);
-            }
-        }
-
-        // Block network if not allowed
-        if !self.config.allow_network {
-            cmd.arg("--unshare-net");
-        }
-
-        // Set working directory
-        cmd.arg("--chdir").arg(working_dir);
-
-        // Environment variables
-        for (key, value) in env_vars {
-            cmd.arg("--setenv").arg(key).arg(value);
-        }
-
-        // The actual command to run
-        cmd.arg(program);
-        cmd.args(args);
-
-        // Capture output
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        debug!("Executing with bubblewrap: {:?}", cmd);
-
+        let mut prepared = self.prepare_command(program, args, working_dir, env_vars)?;
         let start = std::time::Instant::now();
-        let timeout = Duration::from_millis(self.config.timeout_ms);
-
-        let output = match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                return Err(SandboxError::ExecutionFailed(format!(
-                    "Bubblewrap failed: {e}"
-                )))
-            }
-            Err(_) => {
-                return Ok(SandboxResult {
-                    stdout: String::new(),
-                    stderr: "Execution timed out".to_string(),
-                    exit_code: None,
-                    duration_ms: self.config.timeout_ms,
-                    timed_out: true,
-                });
-            }
+        let (mut child, group) = prepared.spawn()?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| SandboxError::ExecutionFailed("Missing captured stdout".to_string()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| SandboxError::ExecutionFailed("Missing captured stderr".to_string()))?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let wait = async {
+            tokio::try_join!(
+                async { child.wait().await.map_err(SandboxError::from) },
+                capture_native_output(
+                    &mut stdout,
+                    &mut stderr,
+                    &mut out,
+                    &mut err,
+                    self.config.max_output_bytes,
+                ),
+            )
         };
-
-        let duration_ms = elapsed_millis(start);
-
+        let result = if self.config.timeout_ms == 0 {
+            Some(wait.await)
+        } else {
+            tokio::time::timeout(Duration::from_millis(self.config.timeout_ms), wait)
+                .await
+                .ok()
+        };
+        group.terminate()?;
+        if !matches!(&result, Some(Ok(_))) {
+            child.kill().await.ok();
+            child.wait().await?;
+        }
+        let Some(result) = result else {
+            return Ok(SandboxResult {
+                stdout: decode_output(out),
+                stderr: "Execution timed out".to_string(),
+                exit_code: None,
+                duration_ms: elapsed_millis(start),
+                timed_out: true,
+            });
+        };
+        let (status, ()) = result?;
         Ok(SandboxResult {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code(),
-            duration_ms,
+            stdout: decode_output(out),
+            stderr: decode_output(err),
+            exit_code: status.code(),
+            duration_ms: elapsed_millis(start),
             timed_out: false,
         })
-    }
-
-    /// Check if bubblewrap is available
-    fn is_bubblewrap_available() -> bool {
-        std::process::Command::new("which")
-            .arg("bwrap")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
     }
 
     /// Execute a WASM module using wasmtime
@@ -1032,28 +1094,10 @@ impl Sandbox {
             })
             .unwrap_or_else(|| "{}".to_string());
 
-        // Create WASM sandbox and execute
-        let wasm_sandbox = WasmSandbox::new(self.config.clone());
-
-        // Execute with timeout
-        let timeout_duration = Duration::from_millis(self.config.timeout_ms);
-        let result = tokio::time::timeout(
-            timeout_duration,
-            wasm_sandbox.execute(wasm_path, &input_json),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(sandbox_result)) => Ok(sandbox_result),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(SandboxResult {
-                stdout: String::new(),
-                stderr: "WASM execution timed out".to_string(),
-                exit_code: None,
-                duration_ms: self.config.timeout_ms,
-                timed_out: true,
-            }),
-        }
+        // WasmSandbox owns interruption and waits for blocking work to stop.
+        WasmSandbox::new(self.config.clone())
+            .execute(wasm_path, &input_json)
+            .await
     }
 
     /// Execute using Docker container
@@ -1085,20 +1129,20 @@ impl Sandbox {
         // Build the command to execute
         let mut cmd_parts = vec![program.to_string()];
         cmd_parts.extend(args.iter().cloned());
-        let cmd_json = serde_json::to_string(&cmd_parts).map_err(|e| {
-            SandboxError::InvalidConfig(format!("Failed to serialize command: {e}"))
-        })?;
 
         // Prepare environment variables for the container
         let mut container_env = self.config.docker.env_vars.clone();
+        container_env
+            .entry("HOME".to_string())
+            .or_insert_with(|| "/tmp".to_string());
+        container_env
+            .entry("TMPDIR".to_string())
+            .or_insert_with(|| "/tmp".to_string());
 
         // Add user-provided env vars
         for (key, value) in env_vars {
             container_env.insert(key.clone(), value.clone());
         }
-
-        // Serialize container arguments as env var for the wrapper script
-        container_env.insert("SKILL_CMD_JSON".to_string(), cmd_json);
 
         // Convert env vars to Docker format: "KEY=VALUE"
         let env_list: Vec<String> = container_env
@@ -1108,55 +1152,55 @@ impl Sandbox {
 
         // Build volume mounts from allow_read and allow_write
         let mut mounts = Vec::new();
+        let host_working_dir = working_dir.canonicalize()?;
+        if host_working_dir != Path::new(&self.config.docker.working_dir) {
+            mounts.push(Mount {
+                target: Some(host_working_dir.to_string_lossy().into_owned()),
+                source: Some(host_working_dir.to_string_lossy().into_owned()),
+                typ: Some(MountType::BIND),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
 
         // Add working directory as a mount
         mounts.push(Mount {
             target: Some(self.config.docker.working_dir.clone()),
-            source: Some(working_dir.to_string_lossy().to_string()),
+            source: Some(working_dir.canonicalize()?.to_string_lossy().into_owned()),
             typ: Some(MountType::BIND),
-            read_only: Some(false),
+            read_only: Some(true),
             ..Default::default()
         });
 
         // Add configured read paths
         for path in &self.config.allow_read {
-            if path.exists() {
-                mounts.push(Mount {
-                    target: Some(format!(
-                        "{}/{}",
-                        self.config.docker.working_dir,
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    )),
-                    source: Some(path.to_string_lossy().to_string()),
-                    typ: Some(MountType::BIND),
-                    read_only: Some(true),
-                    ..Default::default()
-                });
-            }
+            let path = path.canonicalize()?;
+            mounts.push(Mount {
+                target: Some(path.to_string_lossy().into_owned()),
+                source: Some(path.to_string_lossy().into_owned()),
+                typ: Some(MountType::BIND),
+                read_only: Some(true),
+                ..Default::default()
+            });
         }
 
         // Add configured write paths
         for path in &self.config.allow_write {
-            if path.exists() {
-                mounts.push(Mount {
-                    target: Some(format!(
-                        "{}/{}",
-                        self.config.docker.working_dir,
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    )),
-                    source: Some(path.to_string_lossy().to_string()),
-                    typ: Some(MountType::BIND),
-                    read_only: Some(false),
-                    ..Default::default()
-                });
-            }
+            let path = path.canonicalize()?;
+            mounts.push(Mount {
+                target: Some(path.to_string_lossy().into_owned()),
+                source: Some(path.to_string_lossy().into_owned()),
+                typ: Some(MountType::BIND),
+                read_only: Some(false),
+                ..Default::default()
+            });
         }
 
         // Add custom mounts from docker config
         for mount in &self.config.docker.mounts {
             mounts.push(Mount {
                 target: Some(mount.target.clone()),
-                source: Some(mount.source.to_string_lossy().to_string()),
+                source: Some(mount.source.canonicalize()?.to_string_lossy().into_owned()),
                 typ: Some(MountType::BIND),
                 read_only: Some(mount.read_only),
                 ..Default::default()
@@ -1173,12 +1217,29 @@ impl Sandbox {
         // Convert timeout to nanoseconds for Docker
         let nano_cpus = cpu_quota_to_nano_cpus(self.config.docker.cpu_quota)?;
 
-        let memory = if self.config.docker.memory_limit > 0 {
-            Some(self.config.docker.memory_limit)
-        } else {
-            None
-        };
+        let memory = match (
+            (self.config.max_memory_bytes > 0).then_some(self.config.max_memory_bytes),
+            u64::try_from(self.config.docker.memory_limit)
+                .ok()
+                .filter(|limit| *limit > 0),
+        ) {
+            (Some(global), Some(container)) => Some(global.min(container)),
+            (global, container) => global.or(container),
+        }
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|error| SandboxError::InvalidConfig(error.to_string()))?;
 
+        let cpu_limit = (self.config.max_cpu_seconds > 0)
+            .then(|| i64::try_from(self.config.max_cpu_seconds))
+            .transpose()
+            .map_err(|error| SandboxError::InvalidConfig(error.to_string()))?;
+        mounts.sort_unstable_by(|left, right| {
+            left.target
+                .cmp(&right.target)
+                .then_with(|| left.read_only.cmp(&right.read_only))
+        });
+        mounts.dedup_by(|left, right| left.target == right.target);
         // Create host config
         let host_config = HostConfig {
             mounts: if mounts.is_empty() {
@@ -1189,18 +1250,36 @@ impl Sandbox {
             network_mode: Some(network_mode),
             nano_cpus,
             memory,
-            auto_remove: Some(self.config.docker.auto_remove),
+            auto_remove: Some(false),
+            // Attach before start instead of accumulating daemon-side container logs.
+            log_config: Some(HostConfigLogConfig {
+                typ: Some("none".to_string()),
+                ..Default::default()
+            }),
+            ulimits: cpu_limit.map(|limit| {
+                vec![ResourcesUlimits {
+                    name: Some("cpu".to_string()),
+                    soft: Some(limit),
+                    hard: Some(limit),
+                }]
+            }),
+            readonly_rootfs: Some(true),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            tmpfs: Some(HashMap::from([(
+                "/tmp".to_string(),
+                "rw,nosuid,nodev,size=64m".to_string(),
+            )])),
             ..Default::default()
         };
 
         // Create container configuration using the current Docker API model.
         let config = ContainerCreateBody {
             image: Some(self.config.docker.image.clone()),
-            cmd: Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                program.to_string(),
-            ]),
+            cmd: Some(cmd_parts),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
             working_dir: Some(self.config.docker.working_dir.clone()),
             env: if env_list.is_empty() {
                 None
@@ -1226,7 +1305,27 @@ impl Sandbox {
             })?;
 
         let container_id = container.id;
+        let mut cleanup = ContainerCleanup {
+            docker: docker.clone(),
+            id: container_id.clone(),
+            armed: true,
+        };
         info!("Created Docker container: {}", container_id);
+
+        let mut attached = docker
+            .attach_container(
+                &container_id,
+                Some(AttachContainerOptions {
+                    stdout: true,
+                    stderr: true,
+                    stream: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| {
+                SandboxError::ExecutionFailed(format!("Cannot attach sandbox output: {error}"))
+            })?;
 
         // Start the container
         docker
@@ -1237,97 +1336,125 @@ impl Sandbox {
             })?;
 
         let start = std::time::Instant::now();
-        let timeout_duration = Duration::from_millis(self.config.timeout_ms);
-
-        // Wait for container with timeout - wait_container returns a stream, collect it
-        let wait_result = tokio::time::timeout(timeout_duration, async {
-            let mut stream = docker.wait_container(
-                &container_id,
-                Some(WaitContainerOptions {
-                    condition: "not-running".to_string(),
-                }),
-            );
-            stream.next().await
-        })
-        .await;
-
+        let limit_ms = match (
+            self.config.timeout_ms,
+            self.config.max_cpu_seconds.saturating_mul(1000),
+        ) {
+            (0, cpu) => cpu,
+            (timeout, 0) => timeout,
+            (timeout, cpu) => timeout.min(cpu),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let capture = async {
+            let mut remaining = self.config.max_output_bytes;
+            while let Some(output) = attached.output.next().await {
+                let output = output.map_err(|error| {
+                    SandboxError::ExecutionFailed(format!("Cannot read sandbox output: {error}"))
+                })?;
+                match output {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        append_output(
+                            &mut out,
+                            &message,
+                            &mut remaining,
+                            self.config.max_output_bytes,
+                        )?;
+                    }
+                    LogOutput::StdErr { message } => {
+                        append_output(
+                            &mut err,
+                            &message,
+                            &mut remaining,
+                            self.config.max_output_bytes,
+                        )?;
+                    }
+                    LogOutput::StdIn { .. } => {}
+                }
+            }
+            Ok::<(), SandboxError>(())
+        };
+        let wait = async { tokio::try_join!(wait_for_container(&docker, &container_id), capture) };
+        let wait_result = if limit_ms == 0 {
+            Some(wait.await)
+        } else {
+            tokio::time::timeout(Duration::from_millis(limit_ms), wait)
+                .await
+                .ok()
+        };
         let duration_ms = elapsed_millis(start);
-
-        // Check if timed out
-        let timed_out = wait_result.is_err();
+        let timed_out = wait_result.is_none();
+        let exit_code = match wait_result {
+            Some(Ok((exit_code, ()))) => exit_code,
+            Some(Err(error)) => {
+                docker
+                    .remove_container(
+                        &container_id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .map_err(|cleanup_error| {
+                        SandboxError::ExecutionFailed(format!(
+                            "{error}; cannot remove sandbox container: {cleanup_error}"
+                        ))
+                    })?;
+                cleanup.armed = false;
+                return Err(error);
+            }
+            None => None,
+        };
 
         if timed_out {
             // Kill the container if timed out
-            let _ = docker
+            docker
                 .kill_container(
                     &container_id,
                     Some(KillContainerOptions {
                         signal: "SIGKILL".to_string(),
                     }),
                 )
-                .await;
+                .await
+                .map_err(|error| {
+                    SandboxError::ExecutionFailed(format!(
+                        "Cannot kill timed-out container: {error}"
+                    ))
+                })?;
+            wait_for_container(&docker, &container_id).await?;
             warn!(
                 "Docker container {} timed out after {}ms",
                 container_id, duration_ms
             );
         }
 
-        // Fetch logs
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-
-        let logs_options = LogsOptions {
-            stdout: true,
-            stderr: true,
-            timestamps: false,
-            follow: false,
-            ..Default::default()
-        };
-
-        let mut logs_stream = docker.logs(&container_id, Some(logs_options));
-
-        while let Some(log_result) = logs_stream.next().await {
-            match log_result {
-                Ok(log_output) => match log_output {
-                    LogOutput::StdOut { message, .. } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    LogOutput::StdErr { message, .. } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    error!("Error fetching logs: {}", e);
-                }
-            }
-        }
-
-        // Get container exit code
-        let exit_code = if timed_out {
-            None
-        } else {
-            // Inspect container to get exit code
-            match docker.inspect_container(&container_id, None).await {
-                Ok(inspect) => inspect
-                    .state
-                    .and_then(|s| s.exit_code)
-                    .and_then(|code| i32::try_from(code).ok()),
-                Err(e) => {
-                    error!("Failed to inspect container: {}", e);
-                    None
-                }
-            }
-        };
-
         info!(
             "Docker container {} finished in {}ms with exit code: {:?}",
             container_id, duration_ms, exit_code
         );
+        if self.config.docker.auto_remove {
+            docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    SandboxError::ExecutionFailed(format!(
+                        "Cannot remove sandbox container: {error}"
+                    ))
+                })?;
+        }
+        // A caller opting to retain stopped containers still gets cancellation cleanup.
+        cleanup.armed = false;
 
         Ok(SandboxResult {
-            stdout,
-            stderr,
+            stdout: decode_output(out),
+            stderr: decode_output(err),
             exit_code,
             duration_ms,
             timed_out,

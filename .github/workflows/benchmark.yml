@@ -2,121 +2,93 @@ name: Benchmark
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   benchmark:
-    name: Run Benchmarks
-    runs-on: ubuntu-latest
+    name: Measure local skill operations
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: dtolnay/rust-toolchain@master
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
+          toolchain: '1.97.0'
+      - uses: actions/cache@v4
         with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install criterion
-        run: cargo install cargo-criterion || true
-
-      - name: Run benchmarks
-        run: cargo bench --workspace --all-features -- --output-format bencher | tee output.txt
-        continue-on-error: true
-
-      - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
-        if: github.ref == 'refs/heads/main'
-        with:
-          tool: 'cargo'
-          output-file-path: output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
-          alert-threshold: '150%'
-          comment-on-alert: true
-          fail-on-alert: false
-
-      - name: Comment on PR with benchmark results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let output = '';
-            try {
-              output = fs.readFileSync('output.txt', 'utf8');
-            } catch (e) {
-              output = 'No benchmark results available';
-            }
-
-            const body = `## Benchmark Results\n\n\`\`\`\n${output}\n\`\`\``;
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });
-        continue-on-error: true
-
-  performance-test:
-    name: Performance Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release
-        run: cargo build --release --workspace --all-features
-
-      - name: Run performance tests
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-benchmark-${{ hashFiles('Cargo.lock') }}
+      - name: Build locked release
+        run: cargo build --locked --release -p skillsrs --bin skills
+      - name: Generate deterministic fixtures and measure operations
         run: |
-          # Test startup time
-          echo "Testing startup time..."
-          time target/release/skills --version
-
-          # Test basic operations
-          echo "Testing basic operations..."
-          target/release/skills server --help
-        continue-on-error: true
+          python3 - <<'PY'
+          import json, os, pathlib, platform, statistics, subprocess, tempfile, time
+          binary = pathlib.Path('target/release/skills').resolve()
+          fixture_count, samples, warmups = 100, 20, 3
+          with tempfile.TemporaryDirectory(prefix='skills-benchmark-') as temp:
+              root = pathlib.Path(temp)
+              for index in range(fixture_count):
+                  name = f'fixture-{index:04d}'
+                  skill = root / 'skills' / name
+                  (skill / 'references').mkdir(parents=True)
+                  (skill / 'assets').mkdir()
+                  (skill / 'SKILL.md').write_text(
+                      f'---\nname: {name}\ndescription: Local benchmark fixture number {index}\n---\n\n'
+                      + '# Local fixture\n\nRead the supplied reference; do not execute code.\n' * 64)
+                  (skill / 'references' / 'details.txt').write_text('Deterministic local reference.\n' * 1024)
+                  (skill / 'assets' / 'blob.bin').write_bytes(bytes(range(256)) * 256)
+              config = root / 'config.yaml'
+              config.write_text('upstreams: []\nagent_skills_repos: []\n')
+              prefix = [str(binary), '--config', str(config), '--path', str(root)]
+              environment = {k: v for k, v in os.environ.items() if not k.startswith(('SKILLS_', 'MESURII_'))}
+              operations = {
+                  'registry_search': ['search', 'fixture', '--kind', 'skills'],
+                  'instruction_read': ['skill', 'show', 'fixture-0050'],
+                  'reference_read': ['skill', 'show', 'fixture-0050', '--file', 'references/details.txt'],
+                  'binary_read': ['skill', 'show', 'fixture-0050', '--file', 'assets/blob.bin'],
+                  'validate_store': ['validate'],
+              }
+              results = {}
+              for name, arguments in operations.items():
+                  durations = []
+                  for iteration in range(warmups + samples):
+                      started = time.perf_counter_ns()
+                      subprocess.run(prefix + arguments, cwd=root, env=environment,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+                      elapsed = (time.perf_counter_ns() - started) / 1_000_000
+                      if iteration >= warmups:
+                          durations.append(elapsed)
+                  ordered = sorted(durations)
+                  results[name] = {'samples_ms': durations, 'median_ms': statistics.median(durations),
+                                   'mean_ms': statistics.mean(durations), 'p95_ms': ordered[18]}
+              report = {
+                  'commit': os.environ['GITHUB_SHA'], 'platform': platform.platform(),
+                  'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+                  'fixture_count': fixture_count, 'samples': samples, 'warmups': warmups,
+                  'measurement': 'Wall time per CLI process, including startup and store loading; no network or script execution.',
+                  'operations': results,
+              }
+              pathlib.Path(os.environ['GITHUB_WORKSPACE'], 'benchmark-results.json').write_text(json.dumps(report, indent=2))
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('## Local CLI operation timings\n\nIncludes process startup and store loading. Not a cross-product comparison.\n\n')
+                  summary.write('| Operation | Median (ms) | p95 (ms) |\n|---|---:|---:|\n')
+                  for name, result in results.items():
+                      summary.write(f"| {name} | {result['median_ms']:.3f} | {result['p95_ms']:.3f} |\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-operation-benchmark
+          path: benchmark-results.json
+          if-no-files-found: error

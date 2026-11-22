@@ -1,6 +1,6 @@
 //! skills.rs - Infinite Skills. Finite Context.
 //!
-//! Unified MCP server aggregating tools and skills with 99% token reduction.
+//! Unified MCP server for discovering tools and loading portable skill packages.
 //! Exposes exactly 3 tools to the host LLM: search, exec, manage.
 
 pub mod core;
@@ -24,7 +24,7 @@ pub use execution::{
         DockerConfig, DockerMount, Sandbox, SandboxBackend, SandboxConfig, SandboxConfigOverride,
         SandboxError, SandboxPreset, SandboxResult,
     },
-    ExecContext, ExecutionTrace, Runtime, RuntimeError, TraceStep, WorkflowEngine,
+    ExecContext, ExecutionTrace, Runtime, RuntimeError, TraceStep,
 };
 
 pub use mcp::SkillsServer;
@@ -34,7 +34,7 @@ pub use storage::search::{
 };
 pub use storage::{
     agent_skills, sync, CreateSkillRequest, EntrypointType, Skill, SkillContent, SkillHints,
-    SkillManifest, SkillStore, SkillStoreError, ToolPolicy, ValidationResult,
+    SkillManifest, SkillStore, SkillStoreError, ToolPolicy, UpdateSkillRequest, ValidationResult,
 };
 
 // Re-export common dependencies that users might need

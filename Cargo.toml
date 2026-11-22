@@ -5,11 +5,11 @@ edition = "2021"
 authors = ["skills.rs team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/labiium/skills"
-description = "Infinite Skills. Finite Context. - Unified MCP server aggregating tools and skills with 99% token reduction"
+description = "Unified MCP server for tools and skills"
 readme = "README.md"
 keywords = ["mcp", "skills", "tools", "ai", "llm"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.94"
+rust-version = "1.97"
 
 [lib]
 name = "skillsrs"
@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP SDK
-rmcp = { version = "3.1.2", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.11.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -30,7 +30,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
+serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 schemars = { version = "1.2", features = ["derive"] }
 
 # HTTP
@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "1.0", default-features = false, features = ["std", "serde"] }
 
 # Hashing
 blake3 = "1.5"
@@ -62,6 +62,8 @@ glob = "0.3"
 futures = "0.3"
 async-trait = "0.1"
 bytes = "1.8"
+base64 = "0.22"
+cap-std = "4"
 
 # Filesystem watching
 notify = "8.2"
@@ -77,7 +79,7 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "sqlite"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 
 # Semver parsing
 semver = "1.0"
@@ -86,12 +88,12 @@ semver = "1.0"
 tempfile = "3.24"
 
 # WASM runtime
-wasmtime = { version = "47.0.3", features = ["cranelift"] }
+wasmtime = { version = "50.0.3", features = ["cranelift"] }
 
 # Docker sandboxing
 bollard = { version = "0.21", features = ["ssl"] }
 http = "1.0"
-wasmtime-wasi = { version = "47.0.3", features = ["p1"] }
+wasmtime-wasi = { version = "50.0.3", default-features = false, features = ["p1"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

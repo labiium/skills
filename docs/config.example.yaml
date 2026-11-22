@@ -1,176 +1,78 @@
-# skills.rs Configuration Example
-#
-# This file demonstrates all available configuration options for the
-# skills.rs unified MCP server (Infinite Skills. Finite Context.).
-
-# Server configuration
+# Safe starting point; paths default to platform directories unless overridden.
+# Docker uses this file with --path /data and a non-loopback HTTP bind.
+# For HTTP, set SKILLS_HTTP_TOKEN securely before starting the process.
 server:
-  # Bind address for HTTP mode
-  bind: "127.0.0.1:8000"
+  auth_token_env: "SKILLS_HTTP_TOKEN"
 
-  # Transport mode: stdio or http
-  transport: "stdio"
-
-  # Log level: trace, debug, info, warn, error
-  log_level: "info"
-
-# Sandbox configuration (applies to bundled tool execution)
-# To disable sandboxing entirely, set:
-#   backend: none
-sandbox:
-  # Backend: none, timeout, restricted, bubblewrap
-  backend: "timeout"
-
-  # Maximum execution time (milliseconds)
-  timeout_ms: 30000
-
-  # Allowed read/write paths (implementation-dependent; empty = default policy)
-  allow_read: []
-  allow_write: []
-
-  # Allow network access for sandboxed executions
-  allow_network: false
-
-  # Resource limits
-  max_memory_bytes: 536870912 # 512MB
-  max_cpu_seconds: 30
-
-# Paths configuration (optional - uses system defaults if not specified)
-# All paths support environment variable overrides (e.g., SKILLS_ROOT)
-paths:
-  # Data directory (parent for database and skills)
-  # Default:
-  #   Linux: ~/.local/share/skills
-  #   macOS: ~/Library/Application Support/skills
-  #   Windows: %APPDATA%\labiium\skills
-  # data_dir: "/custom/data/dir"
-
-  # Configuration directory
-  # Default:
-  #   Linux: ~/.config/skills
-  #   macOS: ~/Library/Preferences/skills
-  #   Windows: %APPDATA%\labiium\skills\config
-  # config_dir: "/custom/config/dir"
-
-  # Cache directory
-  # Default:
-  #   Linux: ~/.cache/skills
-  #   macOS: ~/Library/Caches/skills
-  #   Windows: %LOCALAPPDATA%\labiium\skills\cache
-  # cache_dir: "/custom/cache/dir"
-
-  # Database file path
-  # Default: <data_dir>/skills.db
-  # database_path: "/custom/path/skills.db"
-
-  # Skills root directory
-  # Default: <data_dir>/skills
-  # skills_root: "./skills"
-
-  # Logs directory
-  # Default: <data_dir>/logs
-  # logs_dir: "/custom/logs/dir"
-
-# Index configuration
-index:
-  # Engine type: memory or tantivy
-  engine: "memory"
-
-  # Maximum search results
-  max_results: 50
-
-# Policy configuration
 policy:
-  # Default risk tier for unknown callables
-  # Options: read_only, writes, destructive, admin, unknown
-  default_risk: "unknown"
-
-  # Risk tiers that require consent
-  require_consent_for:
-    - "writes"
-    - "destructive"
-    - "admin"
-
-  # Trusted server aliases (empty = trust none, ["*"] = trust all)
-  trusted_servers:
-    - "local-fs"
-    - "local-tools"
-
-  # Denied tags (callables with these tags are blocked)
-  deny_tags:
-    - "payments"
-    - "destructive-ops"
-
-  # Maximum calls per skill execution
-  max_calls_per_skill: 30
-
-  # Maximum execution time in milliseconds
+  mode: standard
+  management_enabled: false
+  enforce_server_trust: true
+  default_risk: unknown
+  require_consent_for: [writes, destructive, admin, unknown]
+  trusted_servers: []
+  allow_patterns: ["*"]
+  deny_patterns: []
+  deny_tags: []
   max_exec_ms: 120000
 
-  # Allow patterns (glob-style, empty = allow none, ["*"] = allow all)
-  allow_patterns:
-    - "*"
+# Enforced native isolation: Bubblewrap on Linux (requires bwrap + namespaces),
+# Docker elsewhere (requires a reachable daemon). Omit backend for that default.
+# Missing isolation is an error. Reading skill instructions does not run code.
+sandbox:
+  timeout_ms: 30000
+  allow_read: []
+  allow_write: []
+  allow_network: false
+  max_memory_bytes: 536870912
+  max_cpu_seconds: 30
+  max_output_bytes: 8388608
 
-  # Deny patterns (glob-style)
-  deny_patterns: []
+# Optional explicit paths. Prefer absolute paths in service configurations.
+# --path /data or SKILLS_PATH=/data selects an isolated managed storage root.
+# paths:
+#   data_dir: "/var/lib/skills"
+#   database_path: "/var/lib/skills/skills.db"
+#   cache_dir: "/var/cache/skills"
+#   logs_dir: "/var/log/skills"
 
-# Upstream MCP servers
-upstreams:
-  # Example: stdio server
-  - alias: "filesystem"
-    transport: "stdio"
-    command:
-      - "npx"
-      - "-y"
-      - "@modelcontextprotocol/server-filesystem"
-      - "/tmp"
-    tags:
-      - "filesystem"
-      - "local"
+use_global:
+  enabled: false
 
-  # Example: HTTP server
-  - alias: "github"
-    transport: "http"
-    url: "https://api.example.com/mcp"
-    auth:
-      type: "bearer"
-      env: "GITHUB_TOKEN"
-    tags:
-      - "github"
-      - "remote"
+# Configure only reviewed upstream programs/endpoints. Discovery is not trust.
+upstreams: []
+# Example HTTP upstream (replace the endpoint; add alias to trusted_servers
+# only when you intend to authorize execution):
+# upstreams:
+#   - alias: internal
+#     transport: http
+#     url: "https://mcp.example.com/mcp"
+#     required: true
+#     tags: [internal]
+#     auth:
+#       type: bearer
+#       env: INTERNAL_MCP_TOKEN
+#
+# Example native stdio upstream, requiring a reviewed installed executable:
+#   - alias: local
+#     transport: stdio
+#     command: ["/usr/local/bin/reviewed-mcp-server"]
+#     tags: [local]
+#     sandbox_config:
+#       backend: bubblewrap
+#       allow_read: ["/workspace/reference"]
+#
+# timeout/restricted are NOT filesystem/network isolation. Trusted native
+# processes may explicitly use backend: timeout with allow_network: true and
+# no allow_read/allow_write lists. Never describe this as a secure sandbox.
 
-  # Example: local tool server
-  - alias: "keysight"
-    transport: "stdio"
-    command:
-      - "/usr/local/bin/keysight-mcp"
-      - "--mode"
-      - "lab"
-    tags:
-      - "instruments"
-      - "vna"
-      - "trusted"
-
-# Agent Skills repositories (Vercel skills.sh compatible)
-# Auto-syncs skills from GitHub repositories in Agent Skills format
-agent_skills_repos:
-  # Example: Import specific skills from Vercel's repository
-  - repo: "vercel-labs/agent-skills"
-    skills:
-      - "web-design-guidelines"
-      - "vercel-react-best-practices"
-    # Optional: specify git ref (branch, tag, or commit)
-    # git_ref: "main"
-
-  # Example: Import all skills from a repository
-  - repo: "wshobson/agents"
-    # If 'skills' is omitted, imports all Agent Skills found
-
-  # Example: Full GitHub URL with specific skill
-  - repo: "https://github.com/owner/repo"
-    skills:
-      - "monorepo-management"
-    git_ref: "v1.0.0"
-
-# Note: Skills are auto-synced on server startup and can be manually synced with:
-#   skills sync
+# Pin git_ref to a reviewed full commit for reproducibility. Moving refs are
+# checked against real upstream commits by `skills check` and `skills sync`.
+agent_skills_repos: []
+# agent_skills_repos:
+#   - repo: "owner/repo"
+#     skills: ["review-notes"]
+#     git_ref: "<reviewed-40-hex-commit>"
+#
+# `skills add` extends repository selections. `skills check` previews changes;
+# `skills sync` applies them. Server startup does not sync configured sources.

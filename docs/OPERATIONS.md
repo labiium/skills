@@ -1,1068 +1,212 @@
-# Operations Guide
+# Operations guide
 
-Complete guide for deploying, configuring, and operating skills.rs in production and development environments.
+This guide covers installation, configuration, service deployment, execution boundaries, and recovery. Use [MCP integration](MCP_GUIDE.md) for upstream schemas and [skills](SKILLS.md) for source ownership and resources.
 
-## Table of Contents
+## Installation and release assets
 
-1. [Installation](#installation)
-2. [Directory Structure](#directory-structure)
-3. [Configuration](#configuration)
-4. [Running Skills.rs](#running-skillsrs)
-5. [Sandboxing and Security](#sandboxing-and-security)
-6. [CLI Usage (mcp-cli Replacement)](#cli-usage-mcp-cli-replacement)
-7. [Docker Deployment](#docker-deployment)
-8. [Monitoring and Maintenance](#monitoring-and-maintenance)
-9. [Troubleshooting](#troubleshooting)
-
----
-
-## Installation
-
-### From Source (Recommended)
+Rust builds require Rust 1.97 or newer. On Debian/Ubuntu, install a C toolchain, pkg-config, and CA certificates before building.
 
 ```bash
-cargo install --git https://github.com/labiium/skills
+cargo install --locked skillsrs
+# Or build reviewed repository source:
+cargo build --locked --release -p skillsrs --bin skills
 ```
 
-This installs the `skills` binary to `~/.cargo/bin/` which should be in your PATH.
-
-### Pre-built Binaries
-
-Download from [GitHub Releases](https://github.com/labiium/skills/releases):
+Release assets are archives, not bare binaries. Download the archive matching your platform from [Releases](https://github.com/labiium/skills/releases) together with `SHA256SUMS`; verify its checksum before extracting/installing. Linux assets are `skills-linux-x86_64.tar.gz` and `skills-linux-aarch64.tar.gz`; macOS assets use `skills-macos-x86_64.tar.gz` and `skills-macos-aarch64.tar.gz`; Windows uses `skills-windows-x86_64.zip`. GNU Linux builds require compatible system libraries; use a source build or the container if your system cannot load them. Verify that release checksums came from the release you intended to trust; a checksum is not a separate signature.
 
 ```bash
-# Linux x86_64
-curl -L https://github.com/labiium/skills/releases/latest/download/skills-linux-x86_64 -o skills
-chmod +x skills
-sudo mv skills /usr/local/bin/
-
-# macOS (Intel)
-curl -L https://github.com/labiium/skills/releases/latest/download/skills-macos-x86_64 -o skills
-chmod +x skills
-sudo mv skills /usr/local/bin/
-
-# macOS (Apple Silicon)
-curl -L https://github.com/labiium/skills/releases/latest/download/skills-macos-aarch64 -o skills
-chmod +x skills
-sudo mv skills /usr/local/bin/
+sha256sum --check --ignore-missing SHA256SUMS
+# macOS: shasum -a 256 skills-macos-aarch64.tar.gz
+# Compare with the matching SHA256SUMS entry, then extract the selected archive.
+tar -xzf skills-linux-x86_64.tar.gz
+./skills --version
 ```
 
-### Docker
-
-```bash
-docker pull ghcr.io/labiium/skills:latest
-```
-
----
-
-## Directory Structure
-
-Skills.rs follows platform-specific conventions for storing data, configuration, and cache files.
-
-### Default Locations
-
-**Linux (XDG Base Directory):**
-```
-~/.local/share/skills/          # Data directory
-├── skills/                     # Skills storage
-├── skills.db                   # SQLite database
-└── logs/                       # Log files
-
-~/.config/skills/               # Configuration directory
-└── config.yaml                 # Main config file
-
-~/.cache/skills/                # Cache directory
-```
-
-**macOS:**
-```
-~/Library/Application Support/skills/    # Data directory
-├── skills/                              # Skills storage
-├── skills.db                            # SQLite database
-└── logs/                                # Log files
-
-~/Library/Preferences/skills/            # Configuration directory
-└── config.yaml                          # Main config file
-
-~/Library/Caches/skills/                 # Cache directory
-```
-
-**Windows:**
-```
-%APPDATA%\labiium\skills\        # Data directory
-├── skills\                      # Skills storage
-├── skills.db                    # SQLite database
-└── logs\                        # Log files
-
-%APPDATA%\labiium\skills\config\ # Configuration directory
-└── config.yaml                  # Main config file
-
-%LOCALAPPDATA%\labiium\skills\cache\  # Cache directory
-```
-
-### View Current Paths
+## Paths and configuration
 
 ```bash
 skills paths
+skills init
+skills --global paths
+skills --config /etc/skills/config.yaml --path /var/lib/skills paths
 ```
 
-Output shows all active directories and their locations.
+`skills paths` is the authority for the current installation. Platform defaults are generally:
 
-### Custom Paths
+| Platform | Data | Configuration |
+|---|---|---|
+| Linux | `~/.local/share/skills` | `~/.config/skills` |
+| macOS | `~/Library/Application Support/skills` | `~/Library/Preferences/skills` |
+| Windows | the platform application-data directory for `labiium/skills` | inspect `skills paths` |
 
-Override default locations using command-line arguments, environment variables, or configuration:
+Managed data contains `skills/`, `skills.db`, cache/log directories, and source-sync metadata. Merely creating a logs directory does not configure file logging.
 
-**Command-line:**
-```bash
-skills --data-dir /custom/data server
-skills --skills-root /custom/skills list
-skills --database /custom/db/skills.db server
-```
+Configuration selection uses explicit `--config`, then nearest project `.skills/config.yaml`, then the system/global file. `--global` skips project discovery. `use_global.enabled: true` combines global configuration/upstreams with project configuration; review collisions before enabling it. Use absolute `paths` values in long-running service configurations so their meaning does not depend on a working directory.
 
-**Environment variable:**
-```bash
-export SKILLS_PATH=/var/lib/skills
-```
+Root `--path` overrides the managed data root; `SKILLS_PATH` is its environment counterpart. This derives the skill root, database, cache, and logs under that root and disables automatic read-only overlays. There are no `--data-dir`, `--database`, or `SKILLS_ROOT` overrides. Use `--skill-root` for explicit read-only roots. Project `.agents/skills` and `.claude/skills` discovery requires `--trust-project-skills`; never enable it just because an unreviewed repository requested it.
 
-All paths are derived from `SKILLS_PATH`:
-- Config: `{SKILLS_PATH}/config.yaml`
-- Skills: `{SKILLS_PATH}/skills/`
-- Database: `{SKILLS_PATH}/skills.db`
-- Cache: `{SKILLS_PATH}/cache/`
-- Logs: `{SKILLS_PATH}/logs/`
+The [example configuration](config.example.yaml) starts with no upstreams, Standard policy, management disabled, and a bearer-token environment selector for HTTP. Start with this small configuration rather than copying unknown fields from a different MCP client. Unsupported fields do not become enforced policy merely because they appear in YAML.
 
-**Configuration file (`config.yaml`):**
-```yaml
-paths:
-  data_dir: "/var/lib/skills"
+## HTTP authentication and readiness
 
-sandbox:
-  backend: timeout
-  timeout_ms: 30000
-```
-
-### Configuration Priority
-
-Paths are resolved in this order (highest to lowest):
-1. Command-line arguments
-2. Environment variables
-3. Configuration file
-4. System defaults
-
----
-
-## Configuration
-
-### Configuration File Location
-
-Skills.rs configuration is discovered in this order:
-1. Path specified with `--config` flag
-2. Nearest `.skills/config.yaml` found by walking up from the current directory (project-local)
-3. System config directory `config.yaml` (global)
-
-To force using global config only (ignore project `.skills/config.yaml`), use `--global`.
-
-### Basic Configuration
-
-Create a project-local config at `.skills/config.yaml` (recommended), or use the global config in the system config directory (varies by platform).
-
-```yaml
-# Upstream MCP servers
-upstreams:
-  - alias: filesystem
-    transport: stdio
-    command:
-      - npx
-      - "-y"
-      - "@modelcontextprotocol/server-filesystem"
-      - "."
-    tags:
-      - filesystem
-      - local
-
-  - alias: github
-    transport: http
-    url: "https://api.github.com/mcp"
-    auth:
-      type: bearer
-      env: GITHUB_TOKEN
-    tags:
-      - github
-      - remote
-
-# Sandbox configuration (optional)
-sandbox:
-  backend: restricted  # none, timeout, restricted, bubblewrap
-  timeout_ms: 30000
-  max_memory_bytes: 536870912
-
-# Policy configuration (optional)
-policy:
-  default_risk: read_only
-  require_consent_for:
-    - writes
-    - destructive
-  trusted_servers:
-    - filesystem
-```
-
-### MCP Server Configuration (Quick Reference)
-
-In Skills.rs, **upstreams** are MCP servers that provide tools to your application.
-
-#### Common MCP Server Patterns
-
-| Server Type | Transport | Example |
-|-------------|-----------|---------|
-| npm-based | stdio | filesystem, brave-search |
-| Local binary | stdio | custom tools |
-| Remote API | http | GitHub, custom APIs |
-
-#### Configuration Examples
-
-**npm-based MCP server (stdio):**
-```yaml
-upstreams:
-  - alias: filesystem
-    transport: stdio
-    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
-```
-
-**Local binary (stdio):**
-```yaml
-upstreams:
-  - alias: custom-tool
-    transport: stdio
-    command: ["/usr/local/bin/my-mcp-server"]
-```
-
-**HTTP with bearer token authentication:**
-```yaml
-upstreams:
-  - alias: github
-    transport: http
-    url: "https://api.github.com/mcp"
-    auth:
-      type: bearer
-      env: GITHUB_TOKEN
-```
-
-**HTTP with header authentication:**
-```yaml
-upstreams:
-  - alias: api-service
-    transport: http
-    url: "https://api.example.com/mcp"
-    auth:
-      type: header
-      header_name: X-API-Key
-      env: API_KEY
-```
-
-#### Security Note
-
-Configure per-server sandboxing for untrusted servers. See [Sandboxing and Security](#sandboxing-and-security) for details on:
-- Timeout limits
-- Memory restrictions
-- Network access control
-- Filesystem isolation
-
-#### Complete Reference
-
-For detailed configuration options, authentication methods, and advanced settings, see [MCP_GUIDE.md](MCP_GUIDE.md).
-
-### Full Configuration Reference
-
-See [config.example.yaml](config.example.yaml) for all available options.
-
----
-
-## Running Skills.rs
-
-Skills.rs operates in two modes:
-
-### 1. CLI Mode (Direct Tool Access)
-
-Use skills.rs as a command-line interface for direct tool execution:
+Stdio belongs under an MCP client that keeps its input/output streams open:
 
 ```bash
-# List all servers and tools
-skills list
-skills list -d  # with descriptions
-skills list filesystem  # specific server
-
-# Get tool schema
-skills tool filesystem/read_file
-
-# Execute a tool
-skills tool filesystem/read_file '{"path": "./README.md"}'
-skills exec filesystem/read_file '{"path": "./README.md"}'  # alias
-
-# Search for tools
-skills grep "*file*"
-
-# Show current paths
-skills paths
+skills --config /etc/skills/config.yaml server stdio
 ```
 
-**Default behavior:** CLI mode runs **without sandboxing** by default for convenience.
-
-### 2. Server Mode (MCP Server)
-
-Run as an MCP server to expose skills and tools to AI agents:
+Use HTTP for a background network service:
 
 ```bash
-# stdio transport (recommended)
-skills server stdio
-
-# HTTP transport
-skills server http --bind 0.0.0.0:8000
+# Set SKILLS_HTTP_TOKEN securely in the service environment first.
+skills --config /etc/skills/config.yaml --path /var/lib/skills server http --bind 127.0.0.1:8000
+curl --fail --header "Authorization: Bearer $SKILLS_HTTP_TOKEN" http://127.0.0.1:8000/health
 ```
 
-**Default behavior:** Server mode runs **with sandboxing** by default for security.
+Configure the variable name through:
 
-### Running as a Service
+```yaml
+server:
+  auth_token_env: SKILLS_HTTP_TOKEN
+```
 
-**Linux (systemd):**
+When configured, an unset or empty token is a startup error. Both `/mcp` and `/health` require a matching bearer header. Non-loopback binds require authentication, including container binds to `0.0.0.0`. An unauthenticated loopback bind is allowed only for the read-safe default policy; management or execution-enabling changes require authentication. Loopback is not a multi-user authorization boundary against other local processes.
 
-Create `/etc/systemd/system/skills.service`:
+`/health` returns HTTP 200 when the component profile is ready and 503 otherwise. Generic Standard readiness checks configured required upstreams without imposing Mesurii aliases. Open additionally requires `codiium` and `dociium`, its unrestricted backend, and an asserted source revision. A healthy process does not prove a particular user workflow succeeded.
+
+Use a trusted TLS reverse proxy for network traffic, restrict inbound access, and keep tokens out of URLs, logs, committed files, and shell history. A bearer token authenticates a client connection; policy still controls what it may do. Rotate the service environment secret and restart the service to rotate credentials.
+
+## Linux service
+
+Provision a dedicated unprivileged `skills` account, `/var/lib/skills` owned by it, and a readable `/etc/skills/config.yaml`. Put `SKILLS_HTTP_TOKEN=...` in a root-owned service environment file with restrictive permissions, using your secret-management process.
 
 ```ini
 [Unit]
-Description=Skills.rs - Infinite Skills. Finite Context.
-After=network.target
+Description=Skills MCP gateway
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=skills
-Environment=SKILLS_PATH=/var/lib/skills
-ExecStart=/usr/local/bin/skills server stdio
+Group=skills
+WorkingDirectory=/var/lib/skills
+EnvironmentFile=/etc/skills/server.env
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/skills --config /etc/skills/config.yaml --path /var/lib/skills server http --bind 127.0.0.1:8000
 Restart=on-failure
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable and start:
 ```bash
-sudo systemctl enable skills
-sudo systemctl start skills
+sudo systemctl daemon-reload
+sudo systemctl enable --now skills
 sudo systemctl status skills
+sudo journalctl -u skills
 ```
 
-**macOS (launchd):**
+Do not run stdio as a detached system service without an MCP client: its input stream can close. On macOS, an equivalent launchd `ProgramArguments` array must include the executable, root config/path options, `server`, `http`, `--bind`, and the address as separate entries. Set a working directory and supply the token through a protected deployment mechanism rather than committing secrets in a plist. On Windows, use a service manager that preserves those same arguments and an unprivileged account.
 
-Create `~/Library/LaunchAgents/com.labiium.skills.plist`:
+The HTTP server handles Ctrl+C and Unix `SIGTERM` for graceful shutdown. Give the service manager a grace period longer than the configured execution deadlines.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.labiium.skills</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/skills</string>
-        <string>server</string>
-        <string>stdio</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-</dict>
-</plist>
-```
-
-Load:
-```bash
-launchctl load ~/Library/LaunchAgents/com.labiium.skills.plist
-```
-
----
-
-## Sandboxing and Security
-
-### Understanding Sandboxing
-
-Skills.rs provides multiple sandboxing backends to isolate tool execution:
-
-- **none** - No sandboxing (full system access)
-- **timeout** - Timeout enforcement only
-- **restricted** - Limited filesystem/network access (default for server mode)
-- **bubblewrap** - Linux container isolation (requires bubblewrap)
-
-### Default Behavior
-
-| Mode | Default Sandbox |
-|------|----------------|
-| CLI (`skills tool`, `skills list`) | **None** |
-| Server (`skills server stdio`) | **Restricted** |
-
-**Rationale:**
-- CLI mode is for trusted direct interaction
-- Server mode aggregates potentially untrusted upstreams
-
-### Disabling Sandboxing
-
-⚠️ **Security Warning:** Only disable sandboxing in trusted environments!
-
-**CLI flag:**
-```bash
-skills server stdio --no-sandbox
-```
-
-**Environment variable:**
-```bash
-export SKILLS_NO_SANDBOX=1
-skills server stdio
-```
-
-**Configuration file:**
-```yaml
-sandbox:
-  backend: none
-```
-
-**Current directory mode:**
-```bash
-# Uses current directory AND disables sandbox
-skills --current-dir tool filesystem/read_file '{"path": "./README.md"}'
-```
-
-### Per-Server Sandboxing
-
-Configure different sandbox levels for different upstreams:
-
-```yaml
-upstreams:
-  # Trusted local server - minimal sandboxing
-  - alias: local-fs
-    transport: stdio
-    command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
-    sandbox:
-      backend: timeout
-      timeout_ms: 30000
-
-  # Untrusted remote server - full sandboxing
-  - alias: remote-api
-    transport: http
-    url: "https://untrusted-api.com/mcp"
-    sandbox:
-      backend: restricted
-      timeout_ms: 10000
-      allow_read: []
-      allow_write: []
-      allow_network: false
-```
-
-### Security Best Practices
-
-1. **Default to Sandboxing** - Only disable when necessary
-2. **Trust Boundaries** - Use per-server sandbox configuration
-3. **Least Privilege** - Allow minimum required access
-4. **Audit Logs** - Monitor execution history for suspicious activity
-5. **Resource Limits** - Set timeouts even without full sandboxing
-6. **Network Isolation** - Disable network for tools that don't need it
-
-### Policy Engine
-
-Configure execution policies based on risk tiers:
-
-```yaml
-policy:
-  default_risk: read_only
-  require_consent_for:
-    - writes
-    - destructive
-  trusted_servers:
-    - filesystem
-    - local-tool
-  
-  risk_overrides:
-    "github/delete_repository": destructive
-    "filesystem/write_file": limited_write
-```
-
-Risk tiers:
-- **read_only** - No modifications allowed
-- **limited_write** - Limited write operations
-- **full_access** - Unrestricted access
-- **destructive** - Dangerous operations (requires explicit consent)
-
----
-
-## CLI Usage (mcp-cli Replacement)
-
-Skills.rs is a **drop-in replacement** for mcp-cli with additional features.
-
-### Command Comparison
-
-| Task | mcp-cli | skills.rs |
-|------|---------|-----------|
-| List all | `mcp-cli` | `skills list` |
-| List with descriptions | `mcp-cli -d` | `skills list -d` |
-| List server | `mcp-cli filesystem` | `skills list filesystem` |
-| Get schema | `mcp-cli filesystem/read_file` | `skills tool filesystem/read_file` |
-| Execute | `mcp-cli filesystem/read_file '{"path":"..."}' ` | `skills tool filesystem/read_file '{"path":"..."}'` |
-| Search | `mcp-cli grep "*file*"` | `skills grep "*file*"` |
-
-### Migration from mcp-cli
-
-1. **Install skills.rs:**
-   ```bash
-   cargo install --git https://github.com/labiium/skills
-   ```
-
-2. **Convert config** from `mcp_servers.json` to `config.yaml`:
-
-   **Before (mcp_servers.json):**
-   ```json
-   {
-     "mcpServers": {
-       "filesystem": {
-         "command": "npx",
-         "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-       }
-     }
-   }
-   ```
-
-   **After (config.yaml):**
-   ```yaml
-   upstreams:
-     - alias: filesystem
-       transport: stdio
-       command:
-         - npx
-         - "-y"
-         - "@modelcontextprotocol/server-filesystem"
-         - "."
-   ```
-
-3. **Update commands:**
-   - Replace `mcp-cli` with `skills` in all scripts
-   - Change `mcp-cli <server>/<tool>` to `skills tool <server>/<tool>`
-
-### Additional Features vs mcp-cli
-
-Skills.rs provides these features not available in mcp-cli:
-
-1. **Persistent Storage** - Tool metadata cached across invocations
-2. **Execution History** - Full audit trail of all executions
-3. **Skills (Compositions)** - Create reusable tool workflows
-4. **Sandboxing** - Resource limits and isolation
-5. **Policy Engine** - Risk-based access control
-6. **Server Mode** - Act as an MCP server itself
-7. **Better Performance** - Native binary, less memory usage
-
-### AI Agent System Prompt
-
-Replace mcp-cli references:
-
-```markdown
-## MCP Tool Access
-
-You have access to MCP servers via the `skills` CLI.
-
-### Available Commands
-
-- `skills list` - List all servers and tools
-- `skills list <server>` - Show server's tools
-- `skills list -d` - Include descriptions
-- `skills tool <server>/<tool>` - Get tool schema
-- `skills tool <server>/<tool> '<json>'` - Execute tool
-- `skills grep "<pattern>"` - Search by glob pattern
-
-### Workflow
-
-1. **Discover**: Run `skills list` or `skills grep "<pattern>"`
-2. **Inspect**: Run `skills tool <server>/<tool>` to see schema
-3. **Execute**: Run `skills tool <server>/<tool> '<json>'`
-
-### Examples
+## Docker
 
 ```bash
-# List all tools
-skills list
-
-# Search for file-related tools
-skills grep "*file*"
-
-# Get schema
-skills tool filesystem/read_file
-
-# Execute
-skills tool filesystem/read_file '{"path": "./README.md"}'
-
-# JSON output for parsing
-skills tool filesystem/read_file '{"path": "./README.md"}' --json
-
-# Raw text output
-skills tool filesystem/read_file '{"path": "./README.md"}' --raw
-```
-```
-
----
-
-## Docker Deployment
-
-### Using Pre-built Images
-
-```bash
-# Pull latest image
-docker pull ghcr.io/labiium/skills:latest
-
-# Run with stdio
-docker run -it \
+docker build --build-arg RUST_VERSION=1.97 -t skills:local .
+# Supply SKILLS_HTTP_TOKEN securely in your environment.
+docker run -d --name skills \
+  -p 127.0.0.1:8000:8000 \
+  -e SKILLS_HTTP_TOKEN \
   -v skills-data:/data \
-  -v skills-config:/etc/skills \
-  ghcr.io/labiium/skills:latest
-
-# Run HTTP server
-docker run -d \
-  -p 8000:8000 \
-  -v skills-data:/data \
-  -v skills-config:/etc/skills \
-  ghcr.io/labiium/skills:latest \
-  server http --bind 0.0.0.0:8000
+  skills:local
 ```
 
-### Docker Compose
+The image runs as user `skills` (UID 10001), loads `/etc/skills/config.yaml`, and isolates managed data under `/data`. The default command is `server http --bind 0.0.0.0:8000`; the example config selects `SKILLS_HTTP_TOKEN`. The healthcheck probes the authenticated `/health` endpoint instead of running `--version`.
 
-Create `docker-compose.yml`:
+Mount a custom config read-only at `/etc/skills/config.yaml`. Named volumes preserve managed data. For bind mounts, give UID 10001 access to the data directory without making it world-writable. Python, Node, Bash, git, curl, and Bubblewrap are installed; upstream-specific packages are not. Install reviewed pinned dependencies in a derived image if required. Do not put secrets into the image build arguments.
 
 ```yaml
-version: '3.8'
-
 services:
   skills:
-    image: ghcr.io/labiium/skills:latest
-    container_name: skills
+    image: skills:local
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    environment:
+      SKILLS_HTTP_TOKEN: ${SKILLS_HTTP_TOKEN:?Supply a bearer token}
+      RUST_LOG: info
     volumes:
       - skills-data:/data
-      - skills-config:/etc/skills
-      - ./skills:/data/skills:ro
-    environment:
-      - SKILLS_PATH=/data
-      - RUST_LOG=info
-    command: server http --bind 0.0.0.0:8000
-
+      - ./config.yaml:/etc/skills/config.yaml:ro
 volumes:
   skills-data:
-  skills-config:
 ```
 
-Start:
-```bash
-docker-compose up -d
-```
+Run with `docker compose up -d`. To update a pulled image, use `docker compose pull` followed by `docker compose up -d`; merely restarting a container does not replace its image.
 
-### Building Custom Images
+For stdio under a client, override the default command with `server stdio`, use `docker run --rm -i`, and do not allocate a TTY. The image's HTTP healthcheck does not apply to stdio; disable it for that transport with `--no-healthcheck`.
 
-```bash
-# Clone repository
-git clone https://github.com/labiium/skills
-cd skills
+Neither privileged mode nor a host Docker socket is needed for read-only skill serving or remote HTTP upstreams. Bubblewrap execution inside a container still needs usable user namespaces; many container hosts deny them. Do not add privileges or mount the host Docker socket as a generic fix for untrusted helpers. Use a host configured for isolation, or leave code execution disabled. The service should remain useful for instruction/resource reads even where nested isolation is unavailable.
 
-# Build
-docker build -t skills:custom .
+## Execution boundaries
 
-# Run
-docker run -it skills:custom
-```
+Standard mode enforces policy in CLI and MCP paths; CLI mode is not an automatic unrestricted alternative. Management mutations default off. Trusted upstream aliases, allowed callable patterns, denied tags, and unknown-risk consent gates remain independent checks. MCP caller-provided consent is advisory, not proof of user approval. Use `policy.management_enabled: true` only for a client that should be able to create/update executable skill content and change upstream configuration.
 
----
+| Backend | Boundary and prerequisites |
+|---|---|
+| `bubblewrap` | Linux namespace/filesystem/network isolation; requires `bwrap` and kernel namespace permission. Default on Linux. |
+| `docker` | Container boundary and configured limits; requires reachable Docker daemon. Default outside Linux; native stdio MCP processes are not supported by this backend. |
+| `wasm` | WASI guest capabilities plus a killable Unix worker for compilation/execution, bounded compiler memory/CPU, guest memory/fuel, and deadlines. Requires the installed `skills` executable; unsupported worker platforms fail closed. |
+| `timeout`, `restricted` | Unix process environment/resource/deadline hardening only; unsupported platforms fail closed. No filesystem or network containment. Explicit configurations must allow network and omit path restriction lists. |
+| `none` | Unrestricted host process access, subject only to the surrounding deployment boundary. |
 
-## Monitoring and Maintenance
+Enforced backends fail closed when unavailable; they do not silently fall back to `timeout` or `none`. Bubblewrap gives a read-only skill working directory and private writable temporary/home locations by default. Add only the filesystem access a reviewed helper actually needs. Memory/CPU/network controls are backend-specific; do not infer that a configured number guarantees equivalent enforcement across platforms. Remote HTTP effects happen on the upstream host and cannot be restricted by local namespaces.
 
-### Logging
+Native `timeout`/`restricted` cancellation kills the original process group, not hostile descendants that deliberately detach into another session. Use these modes only for trusted native programs; Bubblewrap PID namespaces or Docker are the boundary for hostile subprocesses. A timeout cannot undo filesystem writes or remote effects.
 
-**Enable structured logging:**
-```bash
-export RUST_LOG=info
-skills server stdio
-```
+`sandbox.max_output_bytes` bounds combined raw stdout/stderr capture (default 8 MiB). Crossing the limit is an error and terminates the helper/container instead of returning truncated success. Docker sandbox logging is disabled; output is attached before startup and captured through the bounded stream. Capture bounds also protect trusted/Open sessions.
 
-Log levels: `error`, `warn`, `info`, `debug`, `trace`
+WASM compilation never runs inside the serving process. A hidden worker invocation compiles and executes the module under process limits and is terminated on timeout/cancellation. Guest stdio stays private. Library consumers outside the `skills` executable must set `SKILLS_WASM_WORKER` to an absolute trusted `skills` executable. Zero CPU/fuel configuration does not remove the worker's 60-second safety ceiling; compilation has a separate bounded memory allowance.
 
-**File logging** (configure in `config.yaml`):
-```yaml
-logging:
-  level: info
-  file: /var/log/skills/skills.log
-  format: json  # or "text"
-```
 
-### Execution History
+`--no-sandbox`, `SKILLS_NO_SANDBOX`, and `--current-dir` intentionally remove process containment. Open policy (`SKILLS_POLICY=open` or `policy.mode: open`) also deliberately removes runtime gates and enables management. Use it only inside an externally managed, trusted workspace. Open requires `MESURII_SKILLS_SOURCE_REVISION` with an exact 40-hex revision asserted by the operator. That assertion is not checkout attestation or a signature, and does not establish that a binary was built from that revision.
 
-View execution history (stored in database):
+Do not execute imported instructions while assessing or installing skills. Metadata such as `allowed-tools` is descriptive and does not constrain an agent that has other host tools. Review scripts, dependencies, source ownership, and the actual security boundary before granting execution.
+
+## Monitoring, backup, and recovery
+
+Use `RUST_LOG` or root `--log-level` for diagnostics. Capture stderr through the service manager/container logs. There is no documented `logging.file` YAML setting; redirect through your supervisor for file logging and rotation. Logs and execution history can contain arguments/results, so restrict access and retention.
+
+Before backing up, stop writers or use SQLite's online backup facility rather than copying a live database without its WAL. Back up the managed skill directory, database, configuration, and `.agent-skills-sync.json` provenance together. Keep a separate inventory/backup of read-only overlay sources. Store secrets separately under the appropriate secret-management policy.
 
 ```bash
-# Query the database
-sqlite3 ~/.local/share/skills/skills.db
-```
-
-```sql
--- Recent executions
-SELECT * FROM executions ORDER BY started_at DESC LIMIT 10;
-
--- Failed executions
-SELECT * FROM executions WHERE success = 0 ORDER BY started_at DESC;
-
--- Execution statistics
-SELECT
-  callable_id,
-  COUNT(*) as total,
-  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful,
-  AVG(duration_ms) as avg_duration_ms
-FROM executions
-GROUP BY callable_id
-ORDER BY total DESC;
-```
-
-### Health Checks
-
-**HTTP endpoint:**
-```bash
-curl http://localhost:8000/health
-```
-
-**Database check:**
-```bash
-skills list > /dev/null && echo "OK" || echo "FAIL"
-```
-
-### Backup and Restore
-
-**Backup essentials:**
-```bash
-# Database
-cp ~/.local/share/skills/skills.db ~/backup/
-
-# Skills directory
-tar czf ~/backup/skills.tar.gz ~/.local/share/skills/skills/
-
-# Configuration
-cp ~/.config/skills/config.yaml ~/backup/
-```
-
-**Restore:**
-```bash
-# Stop service if running
 sudo systemctl stop skills
-
-# Restore files
-cp ~/backup/skills.db ~/.local/share/skills/
-tar xzf ~/backup/skills.tar.gz -C ~/
-cp ~/backup/config.yaml ~/.config/skills/
-
-# Start service
+# Example for the explicit /var/lib/skills service layout above:
+sudo tar -C /var/lib -czf /secure-backups/skills-data.tar.gz skills
+sudo cp /etc/skills/config.yaml /secure-backups/skills-config.yaml
 sudo systemctl start skills
 ```
 
-### Updates
+Restore into the same configured layout while the service is stopped, restore ownership for the dedicated service account, restore secrets separately, then validate and start the service. Do not restore unreviewed archived code directly into an execution-enabled deployment. Verify readiness and a representative read after recovery.
 
-**From source:**
-```bash
-cargo install --git https://github.com/labiium/skills --force
-```
-
-**Pre-built binaries:**
-```bash
-# Download latest release
-curl -L https://github.com/labiium/skills/releases/latest/download/skills-linux-x86_64 -o /usr/local/bin/skills
-chmod +x /usr/local/bin/skills
-```
-
-**Docker:**
-```bash
-docker pull ghcr.io/labiium/skills:latest
-docker-compose restart
-```
-
----
+Run `skills sync`/`skills update` explicitly to populate or refresh a store from configured sources. Server startup does not do this. Use `skills check` to preview first: `0` means up to date, `1` means changes are available, and `2` means the check failed. Save local modifications before intentional `add --force` replacement. Upgrade the program independently through a reviewed release archive, locked source build, or replacement image.
 
 ## Troubleshooting
 
-### Permission Denied
-
-**Symptom:**
-```
-Error: Failed to create directory: /var/lib/skills
-```
-
-**Solution:**
-```bash
-# Use user-owned directory
-export SKILLS_PATH=$HOME/.local/share/skills
-skills server
-
-# Or fix permissions (system-wide)
-sudo mkdir -p /var/lib/skills
-sudo chown $USER:$USER /var/lib/skills
-```
-
-### Database Locked
-
-**Symptom:**
-```
-Error: database is locked
-```
-
-**Solution:**
-```bash
-# Check for running processes
-ps aux | grep skills
-kill <pid>  # if needed
-
-# Ensure only one instance
-pkill -f skills
-skills server
-```
-
-### Skills Not Found
-
-**Symptom:**
-```
-Error: No skills found in directory
-```
-
-**Solution:**
-```bash
-# Check skills directory
-skills paths
-
-# Verify directory exists
-ls -la $(skills paths | grep "Skills root" | awk '{print $3}')
-
-# Create if missing
-mkdir -p ~/.local/share/skills/skills
-```
-
-### Upstream Connection Failed
-
-**Symptom:**
-```
-Error: Failed to connect to upstream: filesystem
-```
-
-**Solution:**
-```bash
-# Test upstream command manually
-npx -y @modelcontextprotocol/server-filesystem .
-
-# Check configuration
-cat ~/.config/skills/config.yaml
-
-# Enable debug logging
-RUST_LOG=debug skills server stdio
-```
-
-### Tool Timeout
-
-**Symptom:**
-```
-Error: Tool execution timed out after 30000ms
-```
-
-**Solution:**
-```bash
-# Increase timeout in config.yaml
-sandbox:
-  timeout_ms: 120000  # 2 minutes
-
-# Or disable timeout
-sandbox:
-  backend: none
-
-# Or use CLI mode (no sandbox by default)
-skills tool filesystem/read_file '{"path": "./large-file.txt"}'
-```
-
-### Network Access Blocked
-
-**Symptom:**
-```
-Error: Network access denied by sandbox
-```
-
-**Solution:**
-```yaml
-# Enable network in config.yaml
-sandbox:
-  backend: restricted
-  allow_network: true
-
-# Or disable sandbox for specific server
-upstreams:
-  - alias: api-server
-    sandbox:
-      backend: none
-```
-
-### Out of Memory
-
-**Symptom:**
-```
-Error: Memory limit exceeded
-```
-
-**Solution:**
-```yaml
-# Increase memory limit
-sandbox:
-  max_memory_mb: 2048
-
-# Or disable limit
-sandbox:
-  backend: timeout  # Only timeout, no memory limit
-```
-
-### Slow Performance
-
-**Issues:**
-- First run is slow (index building)
-- Subsequent runs are fast (cached)
-
-**Solution:**
-```bash
-# Warm up the registry
-skills list > /dev/null
-
-# Or rebuild index manually
-rm ~/.cache/skills/*
-skills list
-```
-
-### Docker Issues
-
-**Can't connect to stdio:**
-```bash
-# Use interactive mode
-docker run -it ghcr.io/labiium/skills:latest
-```
-
-**Volume permissions:**
-```bash
-# Use named volumes (recommended)
-docker run -v skills-data:/data ghcr.io/labiium/skills:latest
-
-# Or fix host directory permissions
-sudo chown -R 1000:1000 ./skills-data
-```
-
----
-
-## Production Deployment Checklist
-
-- [ ] Choose appropriate directory structure (system paths vs custom)
-- [ ] Configure upstreams in `config.yaml`
-- [ ] Set up sandboxing policies
-- [ ] Configure resource limits
-- [ ] Enable structured logging
-- [ ] Set up log rotation
-- [ ] Configure systemd service (or equivalent)
-- [ ] Set up monitoring and alerting
-- [ ] Configure backup automation
-- [ ] Document custom paths and configuration
-- [ ] Test disaster recovery procedures
-- [ ] Set up CI/CD for skills deployment
-- [ ] Review security policies
-- [ ] Configure network access controls
-- [ ] Set up authentication (if HTTP mode)
-- [ ] Test with production workload
-
----
-
-## Quick Reference
-
-### Environment Variables
-
-- `SKILLS_PATH` - Set root path for all skills data (default: platform-specific)
-
-- `SKILLS_NO_SANDBOX` - Disable sandboxing (`1` or `true`)
-- `RUST_LOG` - Set log level (`error`, `warn`, `info`, `debug`, `trace`)
-
-### Command-Line Options
-
-```bash
-# Global options
---config <path>         # Config file path
---data-dir <path>       # Data directory
---skills-root <path>    # Skills directory
---database <path>       # Database file
---current-dir           # Use current directory (+ disable sandbox)
---no-sandbox            # Disable sandboxing
---log-level <level>     # Log level
-
-# Server mode
-skills server stdio [--no-sandbox]
-skills server http --bind <addr:port> [--no-sandbox]
-
-# CLI mode
-skills list [server] [-d] [--json]
-skills tool <server>/<tool> [args] [--json|--raw]
-skills exec <server>/<tool> [args]  # alias for tool
-skills grep "<pattern>"
-skills paths
-```
-
-### Key Files
-
-- `config.yaml` - Main configuration
-- `skills.db` - SQLite database (registry + history)
-- `skills/` - Skills directory
-- `logs/` - Application logs
-
-### Useful Commands
-
-```bash
-# Show configuration
-skills paths
-
-# List everything
-skills list -d
-
-# Search tools
-skills grep "*file*"
-
-# Get tool schema
-skills tool filesystem/read_file
-
-# Execute tool
-skills exec filesystem/read_file '{"path":"./README.md"}'
-
-# Server mode
-skills server stdio
-
-# Debug mode
-RUST_LOG=debug skills server stdio
-
-# Use custom config
-skills --config /etc/skills/config.yaml server stdio
-```
-
----
-
-## Additional Resources
-
-- [README.md](README.md) - Project overview
-- [QUICKSTART.md](QUICKSTART.md) - Getting started guide
-- [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) - Production readiness
-- [config.example.yaml](config.example.yaml) - Full configuration reference
-- [GitHub Issues](https://github.com/labiium/skills/issues) - Bug reports and questions
-
----
-
-## Support
-
-For issues, questions, or contributions:
-- **Repository**: https://github.com/labiium/skills
-- **Issues**: https://github.com/labiium/skills/issues
-- **License**: MIT OR Apache-2.0
+| Symptom | Check before changing security policy |
+|---|---|
+| Missing skill | `skills paths`, managed directory, valid `SKILL.md`, collision precedence, project trust flag, and `--path` isolation. |
+| Permission denied | Data/config ownership for the actual service UID and read-only overlay/mount status. Do not use root as a workaround. |
+| Database locked | Find competing writers and use a coordinated shutdown/backup. Do not kill unrelated processes or delete the database. |
+| Upstream disconnected | Reviewed executable/dependencies, endpoint, credential presence, startup stderr, and sandbox prerequisites. |
+| Policy denied | Operator-configured management/trust/risk/allow rules. A self-reported consent token cannot fix authorization. |
+| Timeout | Whether the operation had side effects before failure; adjust a bounded timeout only after reviewing the cause. Never blindly replay writes. |
+| Namespace failure | Host support for Bubblewrap/user namespaces; do not silently switch to unrestricted execution. |
+| Docker unhealthy | Token presence, configured variable name, service logs, `/health` profile gates, and required upstream status. |
+| Resource looks corrupted | Use CLI `--file` bytes or decode the MCP base64 envelope exactly once. |
+| Sync refuses replacement | Local edits, changed source ownership, or legacy provenance lacking fingerprints. Back up before explicit replacement. |
+
+Before exposing a deployment, confirm authentication, TLS/network boundary, required upstreams, unprivileged ownership, executable isolation prerequisites, logs/retention, backups, and a recovery procedure appropriate to that environment. A passing health probe alone is not a production security assessment.

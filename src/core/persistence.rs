@@ -9,7 +9,7 @@
 use crate::core::{
     CallableId, CallableKind, CallableRecord, CoreError, CostHints, RiskTier, SchemaDigest,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -34,6 +34,18 @@ pub enum PersistenceError {
 }
 
 pub type Result<T> = std::result::Result<T, PersistenceError>;
+
+fn epoch_seconds(timestamp: Timestamp) -> i64 {
+    // SQLite stores whole Unix seconds, rounded down before the epoch.
+    timestamp
+        .as_second()
+        .saturating_sub(i64::from(timestamp.subsec_nanosecond() < 0))
+}
+
+fn timestamp_from_seconds(seconds: i64) -> Result<Timestamp> {
+    Timestamp::from_second(seconds)
+        .map_err(|_| PersistenceError::InvalidData("Invalid timestamp".to_string()))
+}
 
 /// Persistence layer for skills.rs
 pub struct PersistenceLayer {
@@ -175,7 +187,7 @@ impl PersistenceLayer {
     /// # Errors
     /// Returns an error if the operation cannot be completed.
     pub async fn save_callable(&self, record: &CallableRecord) -> Result<()> {
-        let now = Utc::now().timestamp();
+        let now = epoch_seconds(Timestamp::now());
 
         let tags_json = serde_json::to_string(&record.tags)?;
         let input_schema_json = serde_json::to_string(&record.input_schema)?;
@@ -229,7 +241,7 @@ impl PersistenceLayer {
         .bind(additional_files_json)
         .bind(cost_hints_json)
         .bind(record.risk_tier.to_string())
-        .bind(record.last_seen.timestamp())
+        .bind(epoch_seconds(record.last_seen))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -363,8 +375,7 @@ impl PersistenceLayer {
             additional_files,
             cost_hints,
             risk_tier,
-            last_seen: DateTime::from_timestamp(last_seen_ts, 0)
-                .ok_or_else(|| PersistenceError::InvalidData("Invalid timestamp".to_string()))?,
+            last_seen: timestamp_from_seconds(last_seen_ts)?,
             sandbox_config: None,
         })
     }
@@ -381,8 +392,8 @@ impl PersistenceLayer {
         result: Option<&serde_json::Value>,
         is_error: bool,
         duration_ms: Option<u64>,
-        started_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
+        started_at: Timestamp,
+        completed_at: Option<Timestamp>,
         trace: Option<&serde_json::Value>,
     ) -> Result<()> {
         let arguments_json = serde_json::to_string(arguments)?;
@@ -407,8 +418,8 @@ impl PersistenceLayer {
         .bind(result_json)
         .bind(i32::from(is_error))
         .bind(duration_ms)
-        .bind(started_at.timestamp())
-        .bind(completed_at.map(|t| t.timestamp()))
+        .bind(epoch_seconds(started_at))
+        .bind(completed_at.map(epoch_seconds))
         .bind(trace_json)
         .execute(&self.pool)
         .await?;
@@ -462,10 +473,9 @@ impl PersistenceLayer {
                                 "Stored duration cannot be negative".to_string(),
                             )
                         })?,
-                    started_at: DateTime::from_timestamp(started_at_ts, 0).ok_or_else(|| {
-                        PersistenceError::InvalidData("Invalid timestamp".to_string())
-                    })?,
-                    completed_at: completed_at_ts.and_then(|ts| DateTime::from_timestamp(ts, 0)),
+                    started_at: timestamp_from_seconds(started_at_ts)?,
+                    completed_at: completed_at_ts
+                        .and_then(|seconds| Timestamp::from_second(seconds).ok()),
                     trace: row
                         .get::<Option<String>, _>("trace")
                         .map(|s| serde_json::from_str(&s))
@@ -480,7 +490,7 @@ impl PersistenceLayer {
     /// Returns an error if the operation cannot be completed.
     pub async fn save_state(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let value_json = serde_json::to_string(value)?;
-        let now = Utc::now().timestamp();
+        let now = epoch_seconds(Timestamp::now());
 
         sqlx::query(
             r"
@@ -522,8 +532,7 @@ impl PersistenceLayer {
         let retention_seconds = older_than_days.checked_mul(86_400).ok_or_else(|| {
             PersistenceError::InvalidData("Retention period overflow".to_string())
         })?;
-        let cutoff = Utc::now()
-            .timestamp()
+        let cutoff = epoch_seconds(Timestamp::now())
             .checked_sub(retention_seconds)
             .ok_or_else(|| {
                 PersistenceError::InvalidData("Retention cutoff overflow".to_string())
@@ -645,8 +654,8 @@ pub struct ExecutionRecord {
     pub result: Option<serde_json::Value>,
     pub is_error: bool,
     pub duration_ms: Option<u64>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
     pub trace: Option<serde_json::Value>,
 }
 

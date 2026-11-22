@@ -1,9 +1,11 @@
 //! Tests for core module: types, registry, policy, and persistence
 
+use jiff::Timestamp;
 use skillsrs::core::persistence::PersistenceLayer;
 use skillsrs::core::policy::{ConsentLevel, PolicyConfig, PolicyEngine};
 use skillsrs::core::registry::{Registry, ServerHealth, ServerInfo};
 use skillsrs::core::{CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest};
+use skillsrs::execution::ExecutionTrace;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -36,7 +38,7 @@ fn test_risk_tier_requires_consent() {
     assert!(RiskTier::Writes.requires_consent());
     assert!(RiskTier::Destructive.requires_consent());
     assert!(RiskTier::Admin.requires_consent());
-    assert!(!RiskTier::Unknown.requires_consent());
+    assert!(RiskTier::Unknown.requires_consent());
 }
 
 #[test]
@@ -144,7 +146,7 @@ fn test_registry_server_management() {
         alias: "test-server".to_string(),
         health: ServerHealth::Connected,
         tool_count: 5,
-        last_refresh: chrono::Utc::now(),
+        last_refresh: Timestamp::now(),
         tags: vec!["test".to_string()],
     };
 
@@ -157,30 +159,32 @@ fn test_registry_server_management() {
     assert_eq!(stats.servers.len(), 1);
 }
 
-#[tokio::test]
+#[test]
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-async fn test_policy_engine_allow_readonly() {
-    let config = PolicyConfig::default();
+fn test_policy_engine_allow_readonly() {
+    let config = PolicyConfig {
+        trusted_servers: vec!["server1".to_string()],
+        ..Default::default()
+    };
     let engine = PolicyEngine::new(config).unwrap();
 
     let record = create_test_tool_record("readonly-tool", "server1");
     let result = engine
         .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
-        .await
         .unwrap();
 
     assert!(result.allowed);
 }
 
-#[tokio::test]
+#[test]
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-async fn test_policy_engine_deny_by_tag() {
+fn test_policy_engine_deny_by_tag() {
     let config = PolicyConfig {
         deny_tags: vec!["dangerous".to_string()],
         ..Default::default()
@@ -192,20 +196,22 @@ async fn test_policy_engine_deny_by_tag() {
 
     let result = engine
         .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
-        .await
         .unwrap();
 
     assert!(!result.allowed);
     assert!(result.reason.contains("denied tag"));
 }
 
-#[tokio::test]
+#[test]
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-async fn test_policy_engine_require_consent_for_writes() {
-    let config = PolicyConfig::default();
+fn test_policy_engine_require_consent_for_writes() {
+    let config = PolicyConfig {
+        trusted_servers: vec!["server1".to_string()],
+        ..Default::default()
+    };
     let engine = PolicyEngine::new(config).unwrap();
 
     let mut record = create_test_tool_record("write-tool", "server1");
@@ -214,7 +220,6 @@ async fn test_policy_engine_require_consent_for_writes() {
     // Without consent, should be denied
     let result = engine
         .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
-        .await
         .unwrap();
     assert!(!result.allowed);
     assert!(result.required_consent.is_some());
@@ -222,17 +227,16 @@ async fn test_policy_engine_require_consent_for_writes() {
     // With user consent, should be allowed
     let result = engine
         .authorize(&record, &serde_json::json!({}), ConsentLevel::UserConfirmed)
-        .await
         .unwrap();
     assert!(result.allowed);
 }
 
-#[tokio::test]
+#[test]
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-async fn test_open_policy_is_machine_readable_and_unconditionally_invokes_off_panel_tools() {
+fn test_open_policy_is_machine_readable_and_unconditionally_invokes_off_panel_tools() {
     let engine = PolicyEngine::new(PolicyConfig::open()).unwrap();
     let mut record = create_test_tool_record("off-panel-write", "untrusted-provider");
     record.risk_tier = RiskTier::Admin;
@@ -241,14 +245,13 @@ async fn test_open_policy_is_machine_readable_and_unconditionally_invokes_off_pa
 
     let result = engine
         .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
-        .await
         .unwrap();
     assert!(result.allowed);
 
     let state = engine.state();
     assert_eq!(state.mode, "open");
     assert!(state.unconditional);
-    assert_eq!(state.max_calls_per_skill, None);
+    assert!(state.management_enabled);
 }
 
 #[test]
@@ -257,7 +260,82 @@ fn test_skills_policy_open_selector_overlays_standard_config() {
     assert_eq!(config.mode.to_string(), "open");
     assert!(config.require_consent_for.is_empty());
     assert!(config.deny_tags.is_empty());
-    assert_eq!(config.max_calls_per_skill, usize::MAX);
+    assert!(config.management_enabled);
+}
+
+#[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+fn partial_policy_configuration_keeps_security_defaults() {
+    let config: PolicyConfig =
+        serde_json::from_value(serde_json::json!({"max_exec_ms": 500})).unwrap();
+    assert!(!config.management_enabled);
+    assert!(config.enforce_server_trust);
+    assert!(config.require_consent_for.contains(&"unknown".to_string()));
+    let engine = PolicyEngine::new(config).unwrap();
+    assert!(engine.authorize_management().is_err());
+    assert_eq!(engine.check_timeout(None).unwrap(), 500);
+    assert_eq!(engine.check_timeout(Some(900)).unwrap(), 500);
+    assert_eq!(engine.check_timeout(Some(100)).unwrap(), 100);
+    assert!(engine.check_timeout(Some(0)).is_err());
+    assert!(
+        serde_json::from_value::<PolicyConfig>(serde_json::json!({"max_calls_per_skill": 2}))
+            .is_err()
+    );
+}
+
+#[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+fn unknown_execution_requires_trusted_consent_but_metadata_does_not() {
+    let engine = PolicyEngine::new(PolicyConfig {
+        trusted_servers: vec!["server1".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut record = create_test_tool_record("unknown-tool", "server1");
+    record.risk_tier = RiskTier::Unknown;
+    assert!(engine.authorize_read(&record).allowed);
+    assert!(
+        !engine
+            .authorize(&record, &serde_json::json!({}), ConsentLevel::None)
+            .unwrap()
+            .allowed
+    );
+    assert!(
+        engine
+            .authorize(&record, &serde_json::json!({}), ConsentLevel::UserConfirmed)
+            .unwrap()
+            .allowed
+    );
+}
+
+#[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+fn trust_and_deny_policies_apply_to_metadata_reads() {
+    let record = create_test_tool_record("readonly-tool", "server1");
+    let engine = PolicyEngine::new(PolicyConfig::default()).unwrap();
+    assert!(!engine.authorize_read(&record).allowed);
+    let engine = PolicyEngine::new(PolicyConfig {
+        trusted_servers: vec!["server1".to_string()],
+        deny_patterns: vec!["*readonly*".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(!engine.authorize_read(&record).allowed);
+    let engine = PolicyEngine::new(PolicyConfig {
+        enforce_server_trust: false,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(engine.authorize_read(&record).allowed);
 }
 
 #[tokio::test]
@@ -292,7 +370,7 @@ async fn test_persistence_lifecycle() {
         additional_files: vec![],
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
+        last_seen: Timestamp::new(0, -750_000_000).unwrap(),
         sandbox_config: None,
     };
 
@@ -303,6 +381,40 @@ async fn test_persistence_lifecycle() {
     let loaded = persistence.load_callable(&record.id).await.unwrap();
     assert_eq!(loaded.name, record.name);
     assert_eq!(loaded.kind, record.kind);
+    assert_eq!(loaded.last_seen, Timestamp::from_second(-1).unwrap());
+
+    let legacy_trace = serde_json::json!({
+        "execution_id": "legacy",
+        "started_at": "1969-12-31T23:59:59.250Z",
+        "completed_at": "1970-01-01T00:00:00Z",
+        "total_duration_ms": 750,
+        "steps": [],
+    });
+    persistence
+        .record_execution(
+            "legacy",
+            &record.id,
+            &serde_json::Value::Null,
+            None,
+            false,
+            Some(750),
+            record.last_seen,
+            Some(Timestamp::UNIX_EPOCH),
+            Some(&legacy_trace),
+        )
+        .await
+        .unwrap();
+    let history = persistence
+        .get_execution_history(&record.id, 1)
+        .await
+        .unwrap();
+    let execution = history.into_iter().next().unwrap();
+    assert_eq!(execution.started_at, loaded.last_seen);
+    assert_eq!(execution.completed_at, Some(Timestamp::UNIX_EPOCH));
+    assert_eq!(execution.trace.as_ref(), Some(&legacy_trace));
+    let trace: ExecutionTrace = serde_json::from_value(execution.trace.unwrap()).unwrap();
+    assert_eq!(trace.started_at, record.last_seen);
+    assert_eq!(trace.completed_at, Some(Timestamp::UNIX_EPOCH));
 
     // Delete it
     persistence.delete_callable(&record.id).await.unwrap();
@@ -344,7 +456,7 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
         additional_files: vec![],
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
+        last_seen: Timestamp::now(),
         sandbox_config: None,
     }
 }
@@ -378,7 +490,7 @@ fn create_test_skill_record(name: &str) -> CallableRecord {
         additional_files: vec![],
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
+        last_seen: Timestamp::now(),
         sandbox_config: None,
     }
 }

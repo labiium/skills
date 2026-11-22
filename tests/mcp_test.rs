@@ -1,17 +1,18 @@
 //! Tests for MCP module: `SkillsServer`
 
+use jiff::Timestamp;
 use rmcp::ServerHandler;
 use skillsrs::core::policy::PolicyConfig;
 use skillsrs::core::registry::Registry;
 use skillsrs::execution::upstream::UpstreamManager;
 use skillsrs::execution::Runtime;
-use skillsrs::mcp::{ExecInput, ExecResponse, SkillsServer};
+use skillsrs::mcp::{ExecInput, ExecResponse, ManageInput, SkillsServer};
 use skillsrs::storage::search::SearchEngine;
 use skillsrs::storage::SkillStore;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
+fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>, TempDir) {
     create_empty_server_with_policy(PolicyConfig::default())
 }
 
@@ -21,7 +22,7 @@ fn create_empty_server() -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
 )]
 fn create_empty_server_with_policy(
     policy: PolicyConfig,
-) -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>) {
+) -> (SkillsServer, Arc<Registry>, Arc<SearchEngine>, TempDir) {
     let registry = Arc::new(Registry::new());
     let search_engine = Arc::new(SearchEngine::new(registry.clone()));
     let open = policy.mode == skillsrs::core::policy::PolicyMode::Open;
@@ -54,20 +55,36 @@ fn create_empty_server_with_policy(
         ),
         registry,
         search_engine,
+        temp_dir,
     )
 }
 
 fn create_server_with_test_tool() -> (SkillsServer, String) {
-    create_server_with_test_tool_policy(PolicyConfig::default())
+    create_server_with_test_tool_policy(PolicyConfig {
+        trusted_servers: vec!["test".to_string()],
+        ..Default::default()
+    })
+}
+
+fn create_server_with_test_tool_policy(policy: PolicyConfig) -> (SkillsServer, String) {
+    let open = policy.mode == skillsrs::core::policy::PolicyMode::Open;
+    let risk = if open {
+        skillsrs::core::RiskTier::Admin
+    } else {
+        skillsrs::core::RiskTier::ReadOnly
+    };
+    create_server_with_test_tool_risk(policy, risk)
 }
 
 #[expect(
     clippy::unwrap_used,
-    reason = "test assertions intentionally fail fast with source-local context"
+    reason = "test assertions intentionally fail fast"
 )]
-fn create_server_with_test_tool_policy(policy: PolicyConfig) -> (SkillsServer, String) {
-    let open = policy.mode == skillsrs::core::policy::PolicyMode::Open;
-    let (server, registry, search_engine) = create_empty_server_with_policy(policy);
+fn create_server_with_test_tool_risk(
+    policy: PolicyConfig,
+    risk_tier: skillsrs::core::RiskTier,
+) -> (SkillsServer, String) {
+    let (server, registry, search_engine, _root) = create_empty_server_with_policy(policy);
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -99,12 +116,8 @@ fn create_server_with_test_tool_policy(policy: PolicyConfig) -> (SkillsServer, S
             bundled_tools: vec![],
             additional_files: vec![],
             cost_hints: skillsrs::core::CostHints::default(),
-            risk_tier: if open {
-                skillsrs::core::RiskTier::Admin
-            } else {
-                skillsrs::core::RiskTier::ReadOnly
-            },
-            last_seen: chrono::Utc::now(),
+            risk_tier,
+            last_seen: Timestamp::now(),
             sandbox_config: None,
         })
         .unwrap();
@@ -125,6 +138,9 @@ fn exec_input(id: String, arguments: serde_json::Value) -> ExecInput {
         json_pointer: None,
         dry_run: false,
         timeout_ms: None,
+        script: None,
+        input_responses: None,
+        request_state: None,
         consent: None,
         trace: None,
     }
@@ -154,7 +170,7 @@ fn test_server_creation() {
 
 #[tokio::test]
 async fn test_open_register_component_profile_is_versioned_and_gate_free() {
-    let (server, _, _) = create_empty_server_with_policy(PolicyConfig::open());
+    let (server, _, _, _root) = create_empty_server_with_policy(PolicyConfig::open());
     let profile = server.component_profile().await;
     assert_eq!(profile.schema, "mesurii.component-profile.v1");
     assert_eq!(profile.component, "register");
@@ -346,4 +362,342 @@ fn test_exec_response_schema_matches_optional_payload_shape() {
     assert!(!exec_output_required.contains(&serde_json::json!("structured_content")));
     assert!(!exec_output_required.contains(&serde_json::json!("timing")));
     assert!(!exec_output_required.contains(&serde_json::json!("steps")));
+}
+
+#[tokio::test]
+async fn standard_readiness_is_generic_and_does_not_advertise_a_call_quota() {
+    let (server, _, _, _root) = create_empty_server();
+    let profile = server.component_profile().await;
+    assert!(profile.ready);
+    assert_eq!(profile.component, "skills");
+    assert_eq!(profile.schema, "skills.component-profile.v1");
+    assert!(profile.gates.contains(&"management".to_string()));
+    assert!(!profile.gates.contains(&"call".to_string()));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn standard_management_denies_every_mutation_before_side_effects() {
+    let (server, _, _, root) = create_empty_server();
+    let skill_dir = root.path().join("protected");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let original = "---\nname: protected\ndescription: Keep this skill\n---\nKeep this body.";
+    std::fs::write(skill_dir.join("SKILL.md"), original).unwrap();
+    for operation in [
+        "create",
+        "update",
+        "delete",
+        "add_upstream",
+        "remove_upstream",
+        "update_upstream",
+    ] {
+        let request: ManageInput = serde_json::from_value(serde_json::json!({
+            "operation": operation,
+            "skill_id": "protected",
+            "name": "created",
+            "description": "Do not create",
+            "skill_md": "Do not create",
+            "upstream_alias": "untrusted",
+            "transport": "stdio",
+            "command": ["/bin/sh", "-c", "exit 0"],
+            "consent": {"level": "admin_confirmed"}
+        }))
+        .unwrap();
+        let error = server.manage_request(request).await.err().unwrap();
+        assert!(
+            error.contains("management is disabled"),
+            "{operation}: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
+            original
+        );
+        assert!(!root.path().join("created").exists());
+    }
+    let profile = server
+        .manage_request(serde_json::from_value(serde_json::json!({"operation":"profile"})).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(profile.0.operation, "profile");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn explicit_management_opt_in_and_open_allow_real_crud() {
+    for policy in [
+        PolicyConfig {
+            management_enabled: true,
+            ..Default::default()
+        },
+        PolicyConfig::open(),
+    ] {
+        let (server, _, _, root) = create_empty_server_with_policy(policy);
+        let create: ManageInput = serde_json::from_value(serde_json::json!({
+            "operation": "create", "name": "managed", "description": "Managed instructions",
+            "skill_md": "# Managed\nOriginal instructions.", "tags": ["keep"],
+            "references": [["guide.txt", "Read me"]]
+        }))
+        .unwrap();
+        server.manage_request(create).await.unwrap();
+        server.manage_request(serde_json::from_value(serde_json::json!({
+            "operation": "update", "skill_id": "managed", "description": "Updated description"
+        })).unwrap()).await.unwrap();
+        let get = server
+            .manage_request(
+                serde_json::from_value(serde_json::json!({
+                    "operation": "get", "skill_id": "managed", "filename": "references/guide.txt"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(get.message, "Read me");
+        assert!(get.data.is_none());
+        let instructions = server
+            .manage_request(
+                serde_json::from_value(serde_json::json!({
+                    "operation": "get", "skill_id": "managed"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(instructions.message.contains("Original instructions."));
+        std::fs::create_dir_all(root.path().join("managed/assets")).unwrap();
+        std::fs::write(root.path().join("managed/assets/data.bin"), [0xff, 0, 1]).unwrap();
+        let binary = server
+            .manage_request(
+                serde_json::from_value(serde_json::json!({
+                    "operation": "get", "skill_id": "managed", "filename": "assets/data.bin"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+            .unwrap();
+        assert_eq!(
+            binary.get("encoding").and_then(serde_json::Value::as_str),
+            Some("base64")
+        );
+        assert_eq!(
+            binary.get("content").and_then(serde_json::Value::as_str),
+            Some("/wAB")
+        );
+        server
+            .manage_request(
+                serde_json::from_value(serde_json::json!({
+                    "operation": "delete", "skill_id": "managed"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!root.path().join("managed").exists());
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn request_consent_cannot_authorize_unknown_code() {
+    let (server, id) = create_server_with_test_tool_risk(
+        PolicyConfig {
+            trusted_servers: vec!["test".to_string()],
+            ..Default::default()
+        },
+        skillsrs::core::RiskTier::Unknown,
+    );
+    let input: ExecInput = serde_json::from_value(serde_json::json!({
+        "id": id,
+        "arguments": {"path": "/tmp/test"},
+        "consent": {"level": "admin_confirmed", "token": "self-issued"},
+        "dry_run": true
+    }))
+    .unwrap();
+    assert!(server
+        .exec_callable(input.clone())
+        .await
+        .unwrap_err()
+        .contains("trusted consent"));
+    let trusted = server.with_trusted_consent(skillsrs::core::policy::ConsentLevel::UserConfirmed);
+    assert_eq!(trusted.exec_callable(input).await.unwrap().mode, "dry_run");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn skill_reads_and_activation_never_execute_bundled_code() {
+    let (server, _, _, root) = create_empty_server_with_policy(PolicyConfig {
+        management_enabled: true,
+        ..Default::default()
+    });
+    let marker = root.path().join("executed");
+    let script = format!(
+        "from pathlib import Path\nPath({:?}).write_text('executed')\n",
+        marker.to_str().unwrap()
+    );
+    let created = server.manage_request(serde_json::from_value(serde_json::json!({
+        "operation": "create", "name": "instruction-only", "description": "Read instructions",
+        "skill_md": "Use the instructions without running bundled code.",
+        "scripts": [["write.py", script]]
+    })).unwrap()).await.unwrap().0;
+    let id = created.skill_id.unwrap();
+    server
+        .manage_request(
+            serde_json::from_value(serde_json::json!({
+                "operation": "get", "skill_id": id
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let activated = server
+        .exec_callable(exec_input(id.clone(), serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(activated.execution.unwrap().status, "completed");
+    assert!(!marker.exists());
+    let requested: ExecInput = serde_json::from_value(serde_json::json!({
+        "id": id, "script": "scripts/write.py", "consent": {"level": "admin_confirmed"}
+    }))
+    .unwrap();
+    assert!(server
+        .exec_callable(requested)
+        .await
+        .unwrap_err()
+        .contains("trusted consent"));
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn discovery_and_description_enforce_read_trust_and_denies() {
+    for policy in [
+        PolicyConfig::default(),
+        PolicyConfig {
+            trusted_servers: vec!["test".to_string()],
+            deny_patterns: vec!["*".to_string()],
+            ..Default::default()
+        },
+    ] {
+        let (server, id) = create_server_with_test_tool_policy(policy);
+        let input = serde_json::from_value(serde_json::json!({"q": "*"})).unwrap();
+        let results = server
+            .search(rmcp::handler::server::wrapper::Parameters(input))
+            .await
+            .unwrap()
+            .0;
+        assert!(results.matches.is_empty());
+        assert_eq!(results.stats.total_callables, 0);
+        assert!(server
+            .exec_callable(ExecInput {
+                describe: true,
+                ..exec_input(id, serde_json::json!({}))
+            })
+            .await
+            .unwrap_err()
+            .contains("Read denied"));
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn management_disabled_still_allows_existing_instruction_reads() {
+    let (writer, registry, search, root) = create_empty_server_with_policy(PolicyConfig {
+        management_enabled: true,
+        ..Default::default()
+    });
+    writer
+        .manage_request(
+            serde_json::from_value(serde_json::json!({
+                "operation": "create", "name": "readable", "description": "Read-only management",
+                "skill_md": "Existing instructions remain readable."
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let upstreams = Arc::new(UpstreamManager::new(registry.clone()));
+    let store = Arc::new(
+        SkillStore::with_search_engine(root.path(), registry.clone(), search.clone()).unwrap(),
+    );
+    let reader = SkillsServer::new(
+        registry.clone(),
+        search,
+        Arc::new(skillsrs::core::policy::PolicyEngine::new(PolicyConfig::default()).unwrap()),
+        Arc::new(Runtime::new(registry, upstreams)),
+        store,
+    );
+    let response = reader
+        .manage_request(
+            serde_json::from_value(serde_json::json!({
+                "operation": "get", "skill_id": "readable"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert!(response
+        .message
+        .contains("Existing instructions remain readable."));
+    assert!(!reader
+        .component_profile()
+        .await
+        .gates
+        .contains(&"call".to_string()));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test assertions intentionally fail fast"
+)]
+async fn script_dry_run_validates_selection_without_running_code() {
+    let (server, _, _, root) = create_empty_server_with_policy(PolicyConfig {
+        management_enabled: true,
+        require_consent_for: vec![],
+        ..Default::default()
+    });
+    let marker = root.path().join("executed");
+    let created = server.manage_request(serde_json::from_value(serde_json::json!({
+        "operation": "create", "name": "script-check", "description": "Explicit script",
+        "skill_md": "Instructions do not require helper execution.",
+        "scripts": [["helper.sh", format!("printf executed > {:?}\n", marker.to_str().unwrap())]]
+    })).unwrap()).await.unwrap().0;
+    let id = created.skill_id.unwrap();
+    let valid: ExecInput = serde_json::from_value(serde_json::json!({
+        "id": id, "script": "scripts/helper.sh", "dry_run": true
+    }))
+    .unwrap();
+    assert_eq!(
+        server.exec_callable(valid.clone()).await.unwrap().mode,
+        "dry_run"
+    );
+    let invalid = ExecInput {
+        script: Some("scripts/missing.sh".to_string()),
+        ..valid
+    };
+    assert!(server.exec_callable(invalid).await.is_err());
+    assert!(!marker.exists());
 }

@@ -1,440 +1,144 @@
-# Infinite Skills, Finite Context: Introducing skills.rs
+# Skills: format, storage, and execution
 
-**The missing piece in your AI agent toolkit has arrived.**
+A skill is an instruction document with optional supporting files. Activating one returns instructions for an agent to follow. It is not an automatic program runner or a promise that the agent completed the workflow.
 
-If you've ever built an AI agent, you know the struggle: your agent needs access to dozens of tools, but every tool description you add eats into your precious context window. You're forced to choose between giving your agent breadth (many tools) or depth (detailed instructions). 
+## Portable baseline
 
-**What if you didn't have to choose?**
-
-Enter **skills.rs** — a unified MCP server that solves the context window crisis while unlocking unlimited tool discovery for your AI agents.
-
----
-
-## The Problem: Context Window Bankruptcy
-
-Modern AI agents operate through the Model Context Protocol (MCP), connecting to various servers that provide tools like web search, file operations, database queries, and more. The standard workflow looks like this:
-
-1. Load all available tools into context
-2. Agent reviews hundreds of lines of tool descriptions
-3. Agent finally selects the right tool
-4. Context window is now 90% full with tool metadata
-
-This doesn't scale. As you add more capabilities, you quickly hit context limits. The agent spends more tokens *looking at tools* than actually solving problems.
-
-**The metrics are startling:**
-- Typical MCP setup: 10-20 tools = 2,000-5,000 tokens just for tool descriptions
-- With 50+ tools: Your context is consumed before the agent even starts working
-- Result: Agents become slower, less capable, and more expensive
-
----
-
-## The Solution: Progressive Disclosure
-
-skills.rs introduces a radical approach: **expose 3 focused meta-tools instead of hundreds of individual tools.**
-
-Instead of loading every tool description into context, agents can:
-
-1. **Search** for tools on-demand (`search`)
-2. **Inspect** only the tools they need (`exec` with `describe`)
-3. **Execute** with validation and sandboxing (`exec`)
-
-This achieves a **99% token reduction** in tool metadata while enabling *unlimited* tool discovery.
-
-### How It Works
-
-```
-Traditional Approach:
-┌────────────────────────────────────────┐
-│ Agent Context (8K tokens)              │
-│ ┌────────────────────────────────────┐ │
-│ │ Tool 1: read_file (80 tokens)      │ │
-│ │ Tool 2: write_file (90 tokens)     │ │
-│ │ Tool 3: brave_search (120 tokens)  │ │
-│ │ Tool 4: sql_query (150 tokens)     │ │
-│ │ ... 50 more tools ...              │ │
-│ │ (5,000+ tokens consumed)           │ │
-│ └────────────────────────────────────┘ │
-│ Task: "Search for latest AI news"     │
-│ (Only 3K tokens remaining!)            │
-└────────────────────────────────────────┘
-
-skills.rs Approach:
-┌────────────────────────────────────────┐
-│ Agent Context (8K tokens)              │
-│ ┌────────────────────────────────────┐ │
-│ │ 3 Meta-tools                       │ │
-│ │   - search                  │ │
-│ │   - exec                    │ │
-│ │   - manage                  │ │
-│ └────────────────────────────────────┘ │
-│ Task: "Search for latest AI news"     │
-│ (7,650+ tokens available!)             │
-└────────────────────────────────────────┘
+```text
+review-notes/
+  SKILL.md
+  scripts/             # optional helpers
+  references/          # optional text or other reference files
+  assets/              # optional binary or text assets
 ```
 
----
+A baseline `SKILL.md` requires `name` and `description`:
 
-## Two Modes of Operation
-
-skills.rs is designed for flexibility, supporting both traditional MCP server mode and a powerful CLI mode.
-
-### Mode 1: MCP Server (Progressive Disclosure)
-
-Run skills.rs as an MCP server that aggregates multiple upstream servers and exposes 3 focused meta-tools:
-
-```bash
-skills stdio
-```
-
-Your AI agent connects via MCP protocol and uses progressive disclosure:
-
-```javascript
-// Step 1: Search for tools (lightweight)
-{
-  "tool": "search",
-  "args": { "q": "search web", "kind": "tool", "limit": 5 }
-}
-// Returns: 5 matching tools with minimal metadata
-
-// Step 2: Describe the right tool
-{
-  "tool": "exec",
-  "args": { "id": "tool://brave_search@1.0", "describe": true, "format": "both" }
-}
-// Returns: Full JSON schema only for this tool
-
-// Step 3: Execute
-{
-  "tool": "exec",
-  "args": {
-    "id": "tool://brave_search@1.0",
-    "arguments": {"query": "latest AI news"}
-  }
-}
-```
-
-### Mode 2: CLI Agent Interface (Drop-in mcp-cli Replacement)
-
-skills.rs includes a powerful CLI that works as a drop-in replacement for `mcp-cli`, but with production-grade features:
-
-```bash
-# List all servers and tools
-skills list
-
-# Search for specific tools
-skills grep "*file*"
-
-# Get tool schema
-skills tool filesystem/read_file
-
-# Execute a tool
-skills tool filesystem/read_file '{"path": "./README.md"}'
-```
-
-**Why use skills.rs CLI instead of mcp-cli?**
-
-| Feature | mcp-cli | skills.rs |
-|---------|---------|-----------|
-| Token reduction | ✓ | ✓ |
-| CLI interface | ✓ | ✓ |
-| Execution persistence | ✗ | ✓ |
-| Sandboxed execution | ✗ | ✓ |
-| Skills system | ✗ | ✓ |
-| Can also run as MCP server | ✗ | ✓ |
-| Audit logging | ✗ | ✓ |
-
----
-
-## The Skills System: Teaching Agents New Tricks
-
-Beyond tool aggregation, skills.rs introduces a **skills system** — reusable packages of instructions and tools that agents can learn on-demand.
-
-### What is a Skill?
-
-A skill is a directory containing:
-
-- **SKILL.md** - Instructions with YAML frontmatter (required)
-- **scripts/** - Bundled executables (optional)
-- **references/** - Reference documentation (optional)
-- **assets/** - Binary assets (optional)
-
-### Example: Web Researcher Skill
-
-```
-.skills/skills/web-researcher/
-├── SKILL.md               # Instructions with YAML frontmatter
-├── scripts/               # Bundled scripts
-│   └── search.py
-└── references/            # Reference docs
-```
-
-**SKILL.md:**
 ```markdown
 ---
-name: web-researcher
-description: Research topics using web search
-version: 1.0.0
-allowed-tools: ["brave_search"]
+name: review-notes
+description: Review release notes against a supplied checklist.
 ---
 
-# Web Researcher
+# Review notes
 
-## Purpose
-Research topics comprehensively using web search.
-
-## Instructions
-1. Use `brave_search` to find relevant articles
-2. Read top 3 results
-3. Synthesize findings into summary
-4. Save summary to markdown file
-
-## Expected Output
-A markdown file with researched topic summary.
+Read the supplied release notes and references/checklist.txt. Report missing
+items with file locations. Ask before modifying the release notes.
 ```
 
-### Progressive Skill Loading
+This host accepts names of 1–64 ASCII lowercase letters, digits, and single hyphens, without leading/trailing hyphens. Installed directory names must match. Unicode/NFKC naming remains [unresolved upstream](https://github.com/agentskills/agentskills/discussions/487); it is not supported here. Description must contain 1–1024 characters. An optional `compatibility` value must contain 1–500 characters.
 
-Skills use the same progressive disclosure pattern:
+`license`, `compatibility`, `metadata`, and `allowed-tools` are optional metadata. This host also recognizes extensions such as `version`, tags, tool usage hints, and executable bundle metadata. They are not portable baseline requirements. Unknown frontmatter fields, including nested mappings, are retained during import and updates. Body-only edits preserve the existing mapping; omitted update fields preserve existing values, while explicit empty tool/tag lists clear them.
 
-**Level 1:** Metadata only (name, description, tags)  
-**Level 2:** Full instructions (`SKILL.md`) loaded on-demand  
-**Level 3:** Bundled scripts loaded when needed  
-**Level 4:** Execution with validation and sandboxing
+Tool hints and `allowed-tools` describe intent. They are not an independent security boundary: the agent follows instructions, and runtime policy authorizes each real call. Host-specific plugins, hooks, and native executable extensions are not executed from frontmatter.
 
-This means an agent can have access to **hundreds of skills** while consuming minimal context tokens until it actually needs the details.
+## Managed storage and read-only overlays
 
----
+`skills init` creates a managed project store at `.skills/skills`. Otherwise the host uses the platform data directory; inspect it with `skills paths`.
 
-## Production-Grade Security
-
-Unlike toy MCP servers, skills.rs is built for production with comprehensive security features:
-
-### Multi-Backend Sandboxing
-
-| Backend | Security | Platform | Use Case |
-|---------|----------|----------|----------|
-| `timeout` | Basic | All | Development |
-| `restricted` | Medium | Unix | Resource limits |
-| `bubblewrap` | High | Linux | Container isolation |
-| `wasm` | High | All | Future WASM runtime |
-
-### Security Features
-
-✅ **Resource Limits** - Configurable CPU, memory, file descriptors  
-✅ **Timeout Enforcement** - Prevents runaway scripts  
-✅ **Path Traversal Protection** - Validates all file paths  
-✅ **Network Isolation** - Optional network blocking  
-✅ **Environment Sanitization** - Removes dangerous variables  
-✅ **Execution Auditing** - Complete audit trail in SQLite  
-✅ **Input Validation** - JSON Schema validation on all inputs  
-
-### Example: Production Configuration
-
-```yaml
-sandbox:
-  backend: bubblewrap
-  timeout_ms: 30000
-  max_memory_bytes: 536870912  # 512MB
-  max_cpu_seconds: 30
-  allow_network: false
-
-persistence:
-  enabled: true
-  database: "./data/skills.db"
-  prune_after_days: 30
-```
-
----
-
-## Built with Rust, Built for Speed
-
-skills.rs is written in pure Rust with performance as a first-class concern:
-
-| Operation | Time | Scale |
-|-----------|------|-------|
-| Skill search | <10ms | Tantivy full-text index |
-| Registry lookup | <1ms | Optimized HashMap |
-| Content loading | ~1ms | Single file read |
-| Bundled tool execution | 50-200ms | Interpreter startup |
-| Persistence save | ~2ms | SQLite insert |
-
-**Tested at scale:**
-- ✓ 100 skills: No degradation
-- ✓ 1,000 callables: <1ms lookup
-- ✓ 10,000 execution records: <10ms query
-
----
-
-## Getting Started in 5 Minutes
-
-### Install
+The managed store wins when a skill name also exists in an overlay. Automatic read-only roots include user `~/.agents/skills` and `~/.claude/skills`. Project `.agents/skills` and `.claude/skills` roots require `--trust-project-skills`. Trust only after reviewing repository content, including scripts and instructions.
 
 ```bash
-# Install from crates.io
-cargo install skillsrs
-
-# Or install from GitHub
-cargo install --git https://github.com/labiium/skills
-
-# Or build from source
-git clone https://github.com/labiium/skills
-cd skills
-cargo build --release
+skills --trust-project-skills list
+skills --global list
+skills --skill-root /srv/reviewed-skills list
+skills --path /srv/isolated-skills paths
 ```
 
-### Configure
+`--skill-root` is repeatable and adds explicitly selected read-only roots. `--global` excludes project roots. `--path` and `SKILLS_PATH` disable automatic overlays so a selected data store does not silently inherit unrelated skills. An explicit root is a deliberate addition. Managed-store create/update/delete and repository sync do not write into read-only overlays.
 
-Create `~/.config/skills/config.yaml`:
+Precedence is managed store, then explicit `--skill-root` order, then trusted project roots from the nearest ancestor outward to the Git root, then user roots. Existing configured roots are watched for file changes. Deleting a managed override exposes its remaining overlay in the live registry. Restart after adding a previously nonexistent root.
 
-```yaml
-server:
-  transport: stdio
-  log_level: info
+## Import, pin, check, update
 
-sandbox:
-  backend: timeout
-  timeout_ms: 30000
-
-upstreams:
-  - alias: brave
-    transport: stdio
-    command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
-```
-
-### Run
+Review a repository before importing its instructions. Listing/importing does not execute downloaded `SKILL.md` instructions or its helpers.
 
 ```bash
-# As MCP server
-skills stdio
-
-# Or as CLI
-skills list
-skills grep "search"
-skills tool brave_search/search '{"query": "rust MCP"}'
+skills add owner/repo --list
+skills add owner/repo --skill review-notes --git-ref "$REVISION"
+skills check
+skills sync
+skills update
 ```
 
----
+Set `REVISION` to the reviewed full commit ID. A branch or tag is a moving source selector; a full commit pins the source. Repository selections are recorded in `agent_skills_repos` with `repo`, optional `skills`, and optional `git_ref`.
 
-## Real-World Use Cases
+`add --skill` extends the source's tracked selection without removing other packages. For a tracked source, both `add` and `add --list` use the configured source form: a `file://` Git source stays a Git source even if you refer to it by its local path. Omitting `--git-ref` keeps the configured ref. To narrow the selection or stop tracking a source, edit `agent_skills_repos`, run `check`, then run `sync`.
 
-### 1. Multi-Tool AI Agents
+`check` previews changes without modifying installed packages or their provenance: exit `0` means up to date, `1` means changes are available, and `2` means the check failed. `sync` fetches and applies source changes, restores missing packages, and reconciles removals. `update` is an alias for `sync`. Server startup reads the installed store without fetching or applying source updates.
 
-**Problem:** Your agent needs access to 50+ tools across multiple MCP servers.
+Imports retain source ownership and the resolved upstream commit. Sync protects locally edited content and conflicts with another source or an unmanaged skill of the same name rather than silently taking ownership. Removed upstream files and source-owned removals must not erase local work. A pinned source does not advance merely because its branch moves.
 
-**Solution:** skills.rs aggregates all upstream servers into one unified interface with progressive tool discovery.
+Provenance is stored in `.agent-skills-sync.json` under the managed root. Source identities are normalized independently of aliases, selected refs, and skill filters; records retain the source/ref, resolved commit, selected skills, and content/path/mode fingerprints. Legacy metadata without fingerprints does not authorize overwriting or deleting a destination; deliberate `add --force` replacement establishes current ownership.
 
-```yaml
-upstreams:
-  - alias: filesystem
-    command: ["mcp-server-filesystem"]
-  - alias: brave
-    command: ["mcp-server-brave-search"]
-  - alias: database
-    command: ["mcp-server-postgres"]
-  - alias: git
-    command: ["mcp-server-git"]
-```
+GitHub shorthand, HTTPS/SSH Git URLs, file URLs, and local directories are supported sources. A local directory without a ref tracks its live working tree; a local source with `--git-ref` is resolved through Git. Git uses existing configured credentials; skills.rs does not provide a registry login or separate registry backend.
 
-Agent now has access to 50+ tools while consuming only 350 tokens.
+Source folders are installed under the declared skill name, so repository layout does not need to match the final directory name. `--list` enumerates candidate names without validating or copying every package. Installation validates the selected packages; invalid metadata in an unselected sibling does not block a filtered import. Listing is not proof that every listed package will pass validation.
 
-### 2. Reusable Agent Workflows
+Local source paths are persisted canonically, so later invocations do not reinterpret them against a different working directory. Configuration-relative paths beginning with `.` resolve against the configuration directory, or the project root for `.skills/config.yaml`. Ambiguous relative legacy provenance cannot authorize deletion or replacement; back up the installation before re-establishing ownership with an explicit source and `--force`.
 
-**Problem:** You've trained your agent on a complex workflow, but can't reuse it efficiently.
+`add` validates the requested packages and stages the tracking config before installing. A package conflict or validation error stops the import without changing the config. If saving the config fails after installation, `add` rolls back the package and provenance changes. This rollback does not cover process crashes or concurrent writers. Sync can apply successful packages while reporting failures for others, retaining their prior fingerprints.
 
-**Solution:** Package the workflow as a skill that any agent can load on-demand.
+`skills add owner/repo --skill review-notes --force` is an intentional clean replacement of that managed destination. It removes obsolete files as well as replacing current files. Save local modifications first. Do not use force as an automatic response to ownership conflicts.
+
+## Read and edit
 
 ```bash
-skills create \
-  --name code-reviewer \
-  --description "Review code changes for bugs and style issues" \
-  --entrypoint prompted
+skills skill show review-notes
+skills skill show review-notes --file references/checklist.txt
+skills skill create review-notes --skill-md ./SKILL.md
+skills skill edit review-notes --description 'Review release notes against the supplied checklist.'
+skills skill edit review-notes --skill-md ./SKILL.md
+skills skill edit review-notes --append 'Ask before publishing.'
+skills skill delete review-notes --force
 ```
 
-### 3. Secure Code Execution
+Create/edit/delete examples target the managed store; imported-source edits make that checkout dirty for future sync. The CLI may prompt on deletion unless `--force` is supplied. `--force` here skips confirmation; it does not authorize modifying overlays.
 
-**Problem:** Your agent needs to run user-provided code, but you can't trust it.
+MCP uses `manage` operations `get`, `create`, `update`, and `delete`. Reads remain available under read policy. Mutations require trusted configuration with `policy.management_enabled: true` in Standard mode. Update only the fields that should change; do not reconstruct all metadata from a partial response. See the [MCP guide](MCP_GUIDE.md).
 
-**Solution:** skills.rs sandboxes all script execution with configurable resource limits.
+## Instruction-first activation
 
-```yaml
-sandbox:
-  backend: bubblewrap
-  max_memory_bytes: 536870912
-  max_cpu_seconds: 10
-  allow_network: false
-```
+MCP `exec` on a skill without `script` returns its instructions. The presence of `scripts/` never silently changes activation into code execution. The agent reads the procedure, selects relevant references, and makes any needed tool calls individually under policy.
 
-### 4. Team Skill Libraries
+A workflow saying “read, transform, write” is a procedure for the agent. It is not an embedded autonomous orchestrator. Do not report completion based solely on receiving the instructions.
 
-**Problem:** Your team has built many custom tools, but there's no centralized way to share them.
+## Explicit helper execution
 
-**Solution:** Build a shared skills repository that all team agents can access.
-
-```
-skills/
-  data-analysis/
-  code-generation/
-  documentation/
-  testing/
-  deployment/
-```
-
----
-
-## Why skills.rs Matters
-
-The Model Context Protocol is revolutionizing how AI agents access tools and data. But as the ecosystem grows, we face a new challenge: **tool sprawl**.
-
-skills.rs solves this by introducing a **meta-layer** that makes infinite tool access practical while respecting context window constraints.
-
-This unlocks new possibilities:
-
-🚀 **Agents with 100+ tools** without context bloat  
-🔍 **Dynamic tool discovery** instead of static configurations  
-📦 **Reusable skills** that agents can learn on-demand  
-🛡️ **Production-grade security** with sandboxing and auditing  
-⚡ **Blazing fast performance** thanks to Rust  
-
----
-
-## Join the Movement
-
-skills.rs is production-ready and battle-tested:
-
-✅ **30 comprehensive tests passing**  
-✅ **Zero known blockers**  
-✅ **Complete documentation**  
-✅ **MIT/Apache-2.0 licensed**  
-
-### Get Started Today
-
-- **Repository:** [github.com/labiium/skills](https://github.com/labiium/skills)
-- **Documentation:** Full guides in repo
-- **Installation:** `cargo install skillsrs`
-
-### Contribute
-
-We welcome contributions! Check out our:
-- [GitHub Issues](https://github.com/labiium/skills/issues)
-- [GitHub Discussions](https://github.com/labiium/skills/discussions)
-
----
-
-## The Future is Modular
-
-AI agents are getting smarter, but they're also getting hungrier for context. skills.rs ensures your agents can scale to hundreds of tools and skills without hitting context limits.
-
-**Progressive disclosure isn't just an optimization — it's the future of agent architectures.**
-
-Ready to give your AI agents infinite skills with finite context?
+Review the helper source before selecting it. Ask the real user for approval, then use the CLI consent option for trusted interactive execution:
 
 ```bash
-cargo install skillsrs
-skills stdio
+skills skill run review-notes --script scripts/helper.py --args '{"mode":"summary"}' --consent user_confirmed
 ```
 
----
+MCP selects the same helper through `exec.script` with a relative path such as `scripts/helper.py`. Self-reported `consent.level` or a caller-provided token does not authenticate approval. Standard MCP requests remain subject to trusted policy; use a host-approved authorization path rather than inventing approval in JSON. Open mode deliberately bypasses these gates inside an externally trusted workspace.
 
-*Built with 🦀 Rust | Powered by the Model Context Protocol*
+Only supported script types can run, and a selected file must remain inside the skill. Python/Node/shell helpers need their interpreters installed. The JSON argument object is available to native helpers through `SKILL_ARGS_JSON`, with an argument-file path also supplied as `SKILL_ARGS_FILE`; emit useful output on stdout and diagnostics on stderr. For example, a reviewed Python helper can read arguments with:
 
-**skills.rs** — Infinite Skills. Finite Context.
+```python
+import json
+import os
+
+arguments = json.loads(os.environ.get("SKILL_ARGS_JSON", "{}"))
+print(json.dumps({"mode": arguments.get("mode", "summary")}))
+```
+
+Use argument arrays rather than interpolating user text into shell commands. Validate expected types and permitted paths, and avoid printing secrets. A process timeout cannot undo writes or external side effects. See [execution boundaries](OPERATIONS.md#execution-boundaries) for enforced backends and prerequisites.
+
+## Text and binary resources
+
+MCP resource retrieval uses:
+
+```json
+{"operation":"get","skill_id":"review-notes","filename":"assets/logo.png"}
+```
+
+UTF-8 files are returned as text. Non-UTF-8 files use `data` with `filename`, `encoding: "base64"`, and base64 `content`; decode exactly once. Never interpret a lossy text rendering as the original binary. Binary files containing valid UTF-8 bytes may be returned as text; the byte-preserving CLI is useful when saving any asset.
+
+CLI `--file` writes the selected file's bytes directly to stdout:
+
+```bash
+skills skill show review-notes --file assets/logo.png > logo.png
+```
+
+Resource reads do not execute files. Filenames are skill-relative; absolute paths, traversal outside the skill, and escaping symlinks are not a supported way to access host files. Resource availability is not permission to run its contents.

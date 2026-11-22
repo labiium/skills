@@ -5,26 +5,20 @@
 //! - exec: Description, dry-run validation, and execution with policy enforcement
 //! - manage: Skill lifecycle management (create, read, update, delete)
 //!
-//! This implementation uses the official Rust MCP SDK (rmcp) to ensure
-//! full protocol compliance and leverage battle-tested infrastructure.
-//!
-//! Design rationale for 3 tools:
-//! - 2 core tools (search/exec) for the 99% use case of discovering and executing callables
-//! - 1 management tool (manage) for skill lifecycle, keeping the context minimal while enabling full CRUD
-//! - This balance achieves "Infinite Skills. Finite Context." - agents can manage skills without tool bloat
 
 use crate::core::policy::{ConsentLevel, PolicyEngine, PolicyState};
 use crate::core::registry::Registry;
 use crate::core::CallableId;
 use crate::execution::{ExecContext, Runtime};
 use crate::storage::search::{SearchEngine, SearchFilters, SearchQuery};
-use crate::storage::{CreateSkillRequest, SkillStore};
+use crate::storage::{CreateSkillRequest, SkillStore, UpdateSkillRequest};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{
         CacheScope, CallToolResponse, Implementation, ProtocolVersion, ServerCapabilities,
-        ServerInfo,
+        ServerConfig,
     },
     service::RequestContext,
     tool, tool_router, Json, RoleServer, ServerHandler,
@@ -32,6 +26,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -44,6 +39,8 @@ pub struct SkillsServer {
     runtime: Arc<Runtime>,
     skill_store: Arc<SkillStore>,
     upstream_manager: Option<Arc<crate::execution::upstream::UpstreamManager>>,
+    trusted_consent: ConsentLevel,
+    source_revision: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -171,7 +168,7 @@ pub struct SearchOutput {
     pub profile: ComponentProfile,
 }
 
-/// Versioned runtime profile for the Mesurii Register component.
+/// Effective runtime readiness. Mesurii-specific requirements apply only to Open.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComponentProfile {
     #[serde(rename = "schema")]
@@ -181,6 +178,7 @@ pub struct ComponentProfile {
     pub ready: bool,
     pub gates: Vec<String>,
     pub sandbox: String,
+    /// Asserted by the deployment, not verified against a checkout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_revision: Option<String>,
     pub upstreams: Vec<crate::execution::upstream::UpstreamStatus>,
@@ -318,7 +316,19 @@ pub struct ExecInput {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 
-    /// Consent information
+    /// Explicit bundled script selection; omitted means instruction activation.
+    #[serde(default)]
+    pub script: Option<String>,
+
+    #[serde(default, rename = "inputResponses", alias = "input_responses")]
+    #[schemars(schema_with = "optional_json_value_schema")]
+    pub input_responses: Option<JsonValue>,
+
+    #[serde(default, rename = "requestState", alias = "request_state")]
+    #[schemars(schema_with = "optional_json_value_schema")]
+    pub request_state: Option<JsonValue>,
+
+    /// Advisory caller metadata only. This never authenticates consent.
     #[serde(default)]
     pub consent: Option<ConsentArgs>,
 
@@ -392,6 +402,10 @@ pub struct DryRunOutput {
 /// Non-lossy execution output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecOutput {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "optional_json_value_schema")]
+    pub raw_output: Option<JsonValue>,
     #[schemars(schema_with = "json_value_vec_schema")]
     pub content: Vec<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,6 +431,14 @@ impl SkillsServer {
         runtime: Arc<Runtime>,
         skill_store: Arc<SkillStore>,
     ) -> Self {
+        let source_revision = policy_engine
+            .is_open()
+            .then(|| {
+                crate::core::policy::PolicyConfig::mesurii_source_revision(false)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
         Self {
             registry,
             search_engine,
@@ -424,6 +446,8 @@ impl SkillsServer {
             runtime,
             skill_store,
             upstream_manager: None,
+            trusted_consent: ConsentLevel::None,
+            source_revision,
             tool_router: Self::tool_router(),
         }
     }
@@ -434,6 +458,13 @@ impl SkillsServer {
         upstream_manager: Arc<crate::execution::upstream::UpstreamManager>,
     ) -> Self {
         self.upstream_manager = Some(upstream_manager);
+        self
+    }
+
+    /// Set consent established by the embedding host, never by MCP request fields.
+    #[must_use]
+    pub const fn with_trusted_consent(mut self, consent: ConsentLevel) -> Self {
+        self.trusted_consent = consent;
         self
     }
 
@@ -449,9 +480,6 @@ impl SkillsServer {
     #[must_use]
     pub async fn component_profile(&self) -> ComponentProfile {
         let open = self.policy_engine.is_open();
-        let source_revision = crate::core::policy::PolicyConfig::mesurii_source_revision(false)
-            .ok()
-            .flatten();
         let upstreams = if let Some(manager) = &self.upstream_manager {
             manager.status().await
         } else {
@@ -469,27 +497,20 @@ impl SkillsServer {
             })
         };
         ComponentProfile {
-            schema: "mesurii.component-profile.v1".to_string(),
-            component: "register".to_string(),
+            schema: if open {
+                "mesurii.component-profile.v1"
+            } else {
+                "skills.component-profile.v1"
+            }
+            .to_string(),
+            component: if open { "register" } else { "skills" }.to_string(),
             profile: self.policy_engine.state().mode,
             ready: upstreams_ready
                 && (!open || self.runtime.sandbox_backend().as_str() == "none")
-                && (!open || source_revision.is_some()),
-            gates: if open {
-                Vec::new()
-            } else {
-                vec![
-                    "consent".to_string(),
-                    "allowlist".to_string(),
-                    "trust".to_string(),
-                    "deny".to_string(),
-                    "risk".to_string(),
-                    "call".to_string(),
-                    "timeout".to_string(),
-                ]
-            },
+                && (!open || self.source_revision.is_some()),
+            gates: self.policy_engine.gates(),
             sandbox: self.runtime.sandbox_backend().as_str().to_string(),
-            source_revision,
+            source_revision: self.source_revision.clone(),
             upstreams,
         }
     }
@@ -593,10 +614,7 @@ impl SkillsServer {
         let include_timing = trace.is_some_and(|t| t.include_timing);
         let include_steps = trace.is_some_and(|t| t.include_steps);
 
-        let trace_value = result
-            .structured_content
-            .as_ref()
-            .and_then(|structured| structured.get("trace"));
+        let trace_value = result.trace.as_ref();
         let timing = include_timing
             .then(|| {
                 trace_value.map(|trace| {
@@ -618,6 +636,12 @@ impl SkillsServer {
             .flatten();
 
         Ok(ExecOutput {
+            status: match result.status {
+                crate::core::ExecutionStatus::Completed => "completed",
+                crate::core::ExecutionStatus::InputRequired => "input_required",
+            }
+            .to_string(),
+            raw_output: result.raw_output,
             content: result
                 .content
                 .into_iter()
@@ -634,6 +658,47 @@ impl SkillsServer {
         })
     }
 
+    fn validate_execution(
+        &self,
+        record: &crate::core::CallableRecord,
+        arguments: &JsonValue,
+        script: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<u64, String> {
+        script
+            .map_or_else(
+                || {
+                    self.runtime
+                        .validate_callable_arguments(&record.id, arguments)
+                },
+                |script| {
+                    self.runtime
+                        .validate_script_arguments(&record.id, script, arguments)
+                },
+            )
+            .map_err(|error| format!("Validation failed: {error}"))?;
+
+        let policy_result = if record.kind == crate::core::CallableKind::Skill && script.is_none() {
+            self.policy_engine.authorize_read(record)
+        } else if script.is_some() {
+            self.policy_engine
+                .authorize_script(record, self.trusted_consent)
+                .map_err(|error| format!("Policy check failed: {error}"))?
+        } else {
+            self.policy_engine
+                .authorize(record, arguments, self.trusted_consent)
+                .map_err(|error| format!("Policy check failed: {error}"))?
+        };
+        if !policy_result.allowed {
+            warn!("Execution denied: {}", policy_result.reason);
+            return Err(format!("Execution denied: {}", policy_result.reason));
+        }
+
+        self.policy_engine
+            .check_timeout(timeout_ms)
+            .map_err(|error| format!("Policy check failed: {error}"))
+    }
+
     /// # Errors
     /// Returns an error if the operation cannot be completed.
     pub async fn exec_callable(&self, input: ExecInput) -> Result<ExecResponse, String> {
@@ -646,6 +711,26 @@ impl SkillsServer {
             .registry
             .get(&callable_id)
             .ok_or_else(|| format!("Callable not found: {callable_id}"))?;
+
+        let visibility = self.policy_engine.authorize_read(&record);
+        if !visibility.allowed {
+            return Err(format!("Read denied: {}", visibility.reason));
+        }
+        if input.script.is_some() && record.kind != crate::core::CallableKind::Skill {
+            return Err("Only skills have bundled scripts".to_string());
+        }
+        if input.script.is_some()
+            && (input.input_responses.is_some() || input.request_state.is_some())
+        {
+            return Err(
+                "Script execution does not accept upstream continuation fields".to_string(),
+            );
+        }
+        if record.kind != crate::core::CallableKind::Tool
+            && (input.input_responses.is_some() || input.request_state.is_some())
+        {
+            return Err("Only upstream tools accept continuation fields".to_string());
+        }
 
         if input.describe {
             let describe = DescribeOptions {
@@ -665,30 +750,12 @@ impl SkillsServer {
             });
         }
 
-        self.runtime
-            .validate_callable_arguments(&callable_id, &input.arguments)
-            .map_err(|e| format!("Validation failed: {e}"))?;
-
-        let consent_level = input
-            .consent
-            .as_ref()
-            .and_then(|c| c.level.as_deref())
-            .map_or(ConsentLevel::None, |s| match s {
-                "user_confirmed" => ConsentLevel::UserConfirmed,
-                "admin_confirmed" => ConsentLevel::AdminConfirmed,
-                _ => ConsentLevel::None,
-            });
-
-        let policy_result = self
-            .policy_engine
-            .authorize(&record, &input.arguments, consent_level)
-            .await
-            .map_err(|e| format!("Policy check failed: {e}"))?;
-
-        if !policy_result.allowed {
-            warn!("Execution denied: {}", policy_result.reason);
-            return Err(format!("Execution denied: {}", policy_result.reason));
-        }
+        let timeout_ms = self.validate_execution(
+            &record,
+            &input.arguments,
+            input.script.as_deref(),
+            input.timeout_ms,
+        )?;
 
         if dry_run {
             info!("Dry run validated {}", record.fq_name);
@@ -710,17 +777,20 @@ impl SkillsServer {
             .is_some_and(|t| t.include_route || t.include_timing || t.include_steps);
 
         let ctx = ExecContext {
-            callable_id: callable_id.clone(),
+            callable_id,
             arguments: input.arguments,
-            timeout_ms: input.timeout_ms,
+            timeout_ms: Some(timeout_ms),
             trace_enabled,
         };
 
-        let result = self
-            .runtime
-            .execute(ctx)
-            .await
-            .map_err(|e| format!("Execution failed: {e}"))?;
+        let result = if let Some(script) = input.script.as_deref() {
+            self.runtime.execute_script(ctx, script).await
+        } else {
+            self.runtime
+                .execute_with_continuation(ctx, input.input_responses, input.request_state)
+                .await
+        }
+        .map_err(|e| format!("Execution failed: {e}"))?;
 
         info!("exec completed for {}", record.fq_name);
 
@@ -747,13 +817,13 @@ impl SkillsServer {
         name = "search",
         description = "Fast discovery over registry (tools + skills) with filters. Use this to find callables before execution."
     )]
-    async fn search(
+    pub async fn search(
         &self,
         Parameters(input): Parameters<SearchInput>,
     ) -> Result<Json<SearchOutput>, String> {
         debug!("search called with query: {}", input.q);
 
-        let include = input.include.clone();
+        let include = input.include;
 
         let query = SearchQuery {
             q: input.q,
@@ -765,11 +835,19 @@ impl SkillsServer {
 
         let results = self
             .search_engine
-            .search(&query)
-            .await
+            .search_visible(&query, |record| {
+                self.policy_engine.authorize_read(record).allowed
+            })
             .map_err(|e| format!("Search failed: {e}"))?;
 
         let stats = self.registry.stats();
+
+        let mut visible = self.registry.all();
+        visible.retain(|record| self.policy_engine.authorize_read(record).allowed);
+        let visible_servers = visible
+            .iter()
+            .filter_map(|record| record.server_alias.as_deref())
+            .collect::<std::collections::HashSet<_>>();
 
         let matches = results
             .matches
@@ -809,11 +887,21 @@ impl SkillsServer {
             matches,
             next_cursor: results.next_cursor,
             stats: SearchStats {
-                total_callables: stats.total_callables,
-                total_tools: stats.total_tools,
-                total_skills: stats.total_skills,
-                searched_servers: stats.servers.len(),
-                stale_servers: stats.stale_servers,
+                total_callables: visible.len(),
+                total_tools: visible
+                    .iter()
+                    .filter(|record| record.kind == crate::core::CallableKind::Tool)
+                    .count(),
+                total_skills: visible
+                    .iter()
+                    .filter(|record| record.kind == crate::core::CallableKind::Skill)
+                    .count(),
+                searched_servers: visible_servers.len(),
+                stale_servers: stats
+                    .stale_servers
+                    .into_iter()
+                    .filter(|server| visible_servers.contains(server.as_str()))
+                    .collect(),
             },
             policy: self.policy_engine.state(),
             profile: self.component_profile().await,
@@ -843,383 +931,446 @@ impl SkillsServer {
     /// the "Finite Context" principle while enabling full CRUD functionality.
     #[tool(
         name = "manage",
-        description = "Manage skills, upstreams, and the Mesurii Register profile. Operations: profile/create/get/update/delete, add_upstream/remove_upstream/list_upstreams."
+        description = "Manage skills and upstreams, or read the effective runtime profile. Mutations require host-configured management authorization."
     )]
     async fn manage(
         &self,
         Parameters(input): Parameters<ManageInput>,
     ) -> Result<Json<ManageOutput>, String> {
-        debug!("manage called with operation: {:?}", input.operation);
+        self.manage_request(input).await
+    }
+}
+
+impl SkillsServer {
+    /// Execute management operations using the host-configured authorization boundary.
+    ///
+    /// # Errors
+    /// Returns an error before side effects when management is disabled or input is invalid.
+    pub async fn manage_request(&self, input: ManageInput) -> Result<Json<ManageOutput>, String> {
+        if !matches!(
+            input.operation,
+            ManageOperation::Profile | ManageOperation::Get | ManageOperation::ListUpstreams
+        ) {
+            self.policy_engine
+                .authorize_management()
+                .map_err(|error| error.to_string())?;
+        }
 
         match input.operation {
             ManageOperation::Profile => Ok(Json(ManageOutput {
                 operation: "profile".to_string(),
                 skill_id: None,
-                name: Some("register".to_string()),
-                message: "Mesurii Register component profile".to_string(),
+                name: Some(
+                    if self.policy_engine.is_open() {
+                        "register"
+                    } else {
+                        "skills"
+                    }
+                    .to_string(),
+                ),
+                message: "Effective runtime profile".to_string(),
                 data: Some(
                     serde_json::to_value(self.component_profile().await)
                         .map_err(|e| format!("Failed to serialize component profile: {e}"))?,
                 ),
             })),
-            ManageOperation::Create => {
-                let name = input.name.ok_or("name is required for create operation")?;
-                let description = input
-                    .description
-                    .ok_or("description is required for create operation")?;
-                let skill_md = input
-                    .skill_md
-                    .ok_or("skill_md is required for create operation")?;
+            ManageOperation::Create => self.manage_create(input),
 
-                let request = CreateSkillRequest {
-                    name: name.clone(),
-                    version: input.version.unwrap_or_else(|| "1.0.0".to_string()),
-                    description,
-                    skill_md_content: skill_md,
-                    uses_tools: input.uses_tools.unwrap_or_default(),
-                    tags: input.tags.unwrap_or_default(),
-                    scripts: input.scripts.unwrap_or_default(),
-                    references: input.references.unwrap_or_default(),
-                    assets: input.assets.unwrap_or_default(),
-                };
+            ManageOperation::Get => self.manage_get(input),
 
-                let id: crate::core::CallableId = self
-                    .skill_store
-                    .create_skill(request)
-                    .await
-                    .map_err(|e| format!("Failed to create skill: {e}"))?;
+            ManageOperation::Update => self.manage_update(input),
 
-                info!("Created skill: {} ({})", name, id.as_str());
+            ManageOperation::Delete => self.manage_delete(input),
 
-                Ok(Json(ManageOutput {
-                    operation: "create".to_string(),
-                    skill_id: Some(id.as_str().to_string()),
-                    name: Some(name),
-                    message: "Skill created successfully".to_string(),
-                    data: None,
-                }))
-            }
+            ManageOperation::AddUpstream => self.manage_add_upstream(input).await,
 
-            ManageOperation::Get => {
-                let skill_id = input
-                    .skill_id
-                    .ok_or("skill_id is required for get operation")?;
+            ManageOperation::RemoveUpstream => self.manage_remove_upstream(input).await,
 
-                // Parse skill_id - it might be a full CallableId like "skill:name@version" or just "name"
-                let skill_name = if skill_id.starts_with("skill:") {
-                    skill_id
-                        .strip_prefix("skill:")
-                        .and_then(|s| s.split('@').next())
-                        .unwrap_or(&skill_id)
-                        .to_string()
-                } else {
-                    skill_id.clone()
-                };
+            ManageOperation::ListUpstreams => self.manage_list_upstreams().await,
 
-                // If a specific file is requested, return just that file
-                if let Some(filename) = input.filename {
-                    let file_content = self
-                        .skill_store
-                        .load_skill_file(&skill_name, &filename)
-                        .map_err(|e| format!("Failed to load file: {e}"))?;
-                    return Ok(Json(ManageOutput {
-                        operation: "get".to_string(),
-                        skill_id: Some(skill_id),
-                        name: Some(skill_name),
-                        message: file_content,
-                        data: None,
-                    }));
-                }
-
-                let content = self
-                    .skill_store
-                    .load_skill_content(&skill_name)
-                    .map_err(|e| format!("Failed to load skill content: {e}"))?;
-
-                let mut response = format!("# Skill: {skill_id}\n\n");
-                response.push_str(&content.skill_md);
-                response.push_str("\n\n---\n\n");
-                response.push_str("## Metadata\n\n");
-                response.push_str("- Uses tools: ");
-                response.push_str(&content.uses_tools.join(", "));
-                response.push('\n');
-                response.push_str("- Bundled tools: ");
-                response.push_str(
-                    &content
-                        .bundled_tools
-                        .iter()
-                        .map(|tool| tool.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-                response.push('\n');
-                response.push_str("- Additional files: ");
-                response.push_str(&content.additional_files.join(", "));
-                response.push('\n');
-
-                info!("Returned content for skill: {}", skill_id);
-
-                Ok(Json(ManageOutput {
-                    operation: "get".to_string(),
-                    skill_id: Some(skill_id),
-                    name: Some(skill_name),
-                    message: response,
-                    data: Some(serde_json::json!({
-                        "uses_tools": content.uses_tools,
-                        "bundled_tools": content.bundled_tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
-                        "additional_files": content.additional_files,
-                    })),
-                }))
-            }
-
-            ManageOperation::Update => {
-                let skill_id = input
-                    .skill_id
-                    .ok_or("skill_id is required for update operation")?;
-                let name = input.name.ok_or("name is required for update operation")?;
-                let description = input
-                    .description
-                    .ok_or("description is required for update operation")?;
-                let skill_md = input
-                    .skill_md
-                    .ok_or("skill_md is required for update operation")?;
-
-                // Parse skill_id
-                let skill_name = if skill_id.starts_with("skill:") {
-                    skill_id
-                        .strip_prefix("skill:")
-                        .and_then(|s| s.split('@').next())
-                        .unwrap_or(&skill_id)
-                        .to_string()
-                } else {
-                    skill_id.clone()
-                };
-
-                let request = CreateSkillRequest {
-                    name: name.clone(),
-                    version: input.version.unwrap_or_else(|| "1.0.0".to_string()),
-                    description,
-                    skill_md_content: skill_md,
-                    uses_tools: input.uses_tools.unwrap_or_default(),
-                    tags: input.tags.unwrap_or_default(),
-                    scripts: input.scripts.unwrap_or_default(),
-                    references: input.references.unwrap_or_default(),
-                    assets: input.assets.unwrap_or_default(),
-                };
-
-                let id: crate::core::CallableId = self
-                    .skill_store
-                    .update_skill(&skill_name, request)
-                    .await
-                    .map_err(|e| format!("Failed to update skill: {e}"))?;
-
-                info!("Updated skill: {} ({})", skill_id, id.as_str());
-
-                Ok(Json(ManageOutput {
-                    operation: "update".to_string(),
-                    skill_id: Some(id.as_str().to_string()),
-                    name: Some(name),
-                    message: "Skill updated successfully".to_string(),
-                    data: None,
-                }))
-            }
-
-            ManageOperation::Delete => {
-                let skill_id = input
-                    .skill_id
-                    .ok_or("skill_id is required for delete operation")?;
-
-                let skill_name = if skill_id.starts_with("skill:") {
-                    skill_id
-                        .strip_prefix("skill:")
-                        .and_then(|s| s.split('@').next())
-                        .unwrap_or(&skill_id)
-                        .to_string()
-                } else {
-                    skill_id.clone()
-                };
-
-                self.skill_store
-                    .delete_skill(&skill_name)
-                    .map_err(|e| format!("Failed to delete skill: {e}"))?;
-
-                info!("Deleted skill: {}", skill_id);
-
-                Ok(Json(ManageOutput {
-                    operation: "delete".to_string(),
-                    skill_id: Some(skill_id.clone()),
-                    name: Some(skill_name),
-                    message: format!("Skill {skill_id} deleted successfully"),
-                    data: None,
-                }))
-            }
-
-            ManageOperation::AddUpstream => {
-                let alias = input
-                    .upstream_alias
-                    .ok_or("upstream_alias is required for add_upstream operation")?;
-                let transport_str = input
-                    .transport
-                    .ok_or("transport is required for add_upstream operation")?;
-
-                let transport = match transport_str.as_str() {
-                    "stdio" => crate::execution::upstream::Transport::Stdio,
-                    "http" => crate::execution::upstream::Transport::Http,
-                    "http_sse" | "http+sse" => crate::execution::upstream::Transport::HttpSse,
-                    _ => return Err(format!("Invalid transport type: {transport_str}")),
-                };
-
-                let config = crate::execution::upstream::UpstreamConfig {
-                    alias: alias.clone(),
-                    required: false,
-                    transport,
-                    command: input.command,
-                    url: input.url,
-                    auth: None,
-                    repo: None,
-                    git_ref: None,
-                    skills: None,
-                    roots: None,
-                    tags: input.tags.unwrap_or_default(),
-                    sandbox_config: None,
-                    description: input.upstream_description,
-                };
-
-                let message = if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager
-                        .add_upstream(config)
-                        .await
-                        .map_err(|e| format!("Failed to add upstream: {e}"))?;
-
-                    if input.test_connection {
-                        format!("Upstream MCP server '{alias}' added and connected successfully")
-                    } else {
-                        format!("Upstream MCP server '{alias}' added (connection test skipped)")
-                    }
-                } else {
-                    return Err("Upstream manager not available".to_string());
-                };
-
-                info!("Added upstream: {}", alias);
-
-                Ok(Json(ManageOutput {
-                    operation: "add_upstream".to_string(),
-                    skill_id: None,
-                    name: Some(alias.clone()),
-                    message,
-                    data: Some(serde_json::json!({ "alias": alias, "transport": transport_str })),
-                }))
-            }
-
-            ManageOperation::RemoveUpstream => {
-                let alias = input
-                    .upstream_alias
-                    .ok_or("upstream_alias is required for remove_upstream operation")?;
-
-                if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager
-                        .disconnect(&alias)
-                        .await
-                        .map_err(|e| format!("Failed to remove upstream: {e}"))?;
-                } else {
-                    return Err("Upstream manager not available".to_string());
-                }
-
-                info!("Removed upstream: {}", alias);
-
-                Ok(Json(ManageOutput {
-                    operation: "remove_upstream".to_string(),
-                    skill_id: None,
-                    name: Some(alias.clone()),
-                    message: format!("Upstream MCP server '{alias}' removed successfully"),
-                    data: None,
-                }))
-            }
-
-            ManageOperation::ListUpstreams => {
-                let servers = if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager.list_servers().await
-                } else {
-                    return Err("Upstream manager not available".to_string());
-                };
-
-                let message = if servers.is_empty() {
-                    "No upstream MCP servers configured".to_string()
-                } else {
-                    format!(
-                        "Found {} upstream server(s): {}",
-                        servers.len(),
-                        servers.join(", ")
-                    )
-                };
-
-                info!("Listed {} upstream servers", servers.len());
-
-                Ok(Json(ManageOutput {
-                    operation: "list_upstreams".to_string(),
-                    skill_id: None,
-                    name: None,
-                    message,
-                    data: Some(serde_json::json!({ "servers": servers, "count": servers.len() })),
-                }))
-            }
-
-            ManageOperation::UpdateUpstream => {
-                let alias = input
-                    .upstream_alias
-                    .ok_or("upstream_alias is required for update_upstream operation")?;
-
-                let updates = if let Some(ref upstream_manager) = self.upstream_manager {
-                    let current = upstream_manager
-                        .get_config(&alias)
-                        .await
-                        .ok_or_else(|| format!("Upstream '{alias}' not found"))?;
-
-                    crate::execution::upstream::UpstreamConfig {
-                        alias: alias.clone(),
-                        required: current.required,
-                        transport: current.transport,
-                        command: input.command.or(current.command),
-                        url: input.url.or(current.url),
-                        auth: current.auth,
-                        repo: current.repo,
-                        git_ref: current.git_ref,
-                        skills: current.skills,
-                        roots: current.roots,
-                        tags: if let Some(tags) = input.tags {
-                            if tags.is_empty() {
-                                current.tags
-                            } else {
-                                tags
-                            }
-                        } else {
-                            current.tags
-                        },
-                        sandbox_config: current.sandbox_config,
-                        description: input.upstream_description.or(current.description),
-                    }
-                } else {
-                    return Err("Upstream manager not available".to_string());
-                };
-
-                if let Some(ref upstream_manager) = self.upstream_manager {
-                    upstream_manager
-                        .update_upstream(&alias, updates)
-                        .await
-                        .map_err(|e| format!("Failed to update upstream: {e}"))?;
-                }
-
-                info!("Updated upstream: {}", alias);
-
-                Ok(Json(ManageOutput {
-                    operation: "update_upstream".to_string(),
-                    skill_id: None,
-                    name: Some(alias.clone()),
-                    message: format!("Upstream MCP server '{alias}' updated successfully"),
-                    data: Some(serde_json::json!({ "alias": alias })),
-                }))
-            }
+            ManageOperation::UpdateUpstream => self.manage_update_upstream(input).await,
         }
+    }
+
+    fn manage_create(&self, input: ManageInput) -> Result<Json<ManageOutput>, String> {
+        let name = input.name.ok_or("name is required for create operation")?;
+        let description = input
+            .description
+            .ok_or("description is required for create operation")?;
+        let skill_md = input
+            .skill_md
+            .ok_or("skill_md is required for create operation")?;
+
+        let request = CreateSkillRequest {
+            name: name.clone(),
+            version: input.version.unwrap_or_else(|| "1.0.0".to_string()),
+            description,
+            skill_md_content: skill_md,
+            uses_tools: input.uses_tools.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default(),
+            scripts: input.scripts.unwrap_or_default(),
+            references: input.references.unwrap_or_default(),
+            assets: input.assets.unwrap_or_default(),
+        };
+
+        let id: crate::core::CallableId = self
+            .skill_store
+            .create_skill(request)
+            .map_err(|e| format!("Failed to create skill: {e}"))?;
+
+        info!("Created skill: {} ({})", name, id.as_str());
+
+        Ok(Json(ManageOutput {
+            operation: "create".to_string(),
+            skill_id: Some(id.as_str().to_string()),
+            name: Some(name),
+            message: "Skill created successfully".to_string(),
+            data: None,
+        }))
+    }
+
+    fn manage_get(&self, input: ManageInput) -> Result<Json<ManageOutput>, String> {
+        let skill_id = input
+            .skill_id
+            .ok_or("skill_id is required for get operation")?;
+
+        // Parse skill_id - it might be a full CallableId like "skill:name@version" or just "name"
+        let skill_name = if skill_id.starts_with("skill:") {
+            skill_id
+                .strip_prefix("skill:")
+                .and_then(|s| s.split('@').next())
+                .unwrap_or(&skill_id)
+                .to_string()
+        } else {
+            skill_id.clone()
+        };
+
+        let record = self
+            .registry
+            .get_by_fq_name(&format!("skill.{skill_name}"))
+            .ok_or_else(|| format!("Skill not found: {skill_name}"))?;
+        let permission = self.policy_engine.authorize_read(&record);
+        if !permission.allowed {
+            return Err(format!("Read denied: {}", permission.reason));
+        }
+
+        // If a specific file is requested, return just that file
+        if let Some(filename) = input.filename {
+            let bytes = self
+                .skill_store
+                .load_skill_file_bytes(&skill_name, &filename)
+                .map_err(|e| format!("Failed to load file: {e}"))?;
+            let (message, data) = match String::from_utf8(bytes) {
+                Ok(text) => (text, None),
+                Err(error) => (
+                    format!("Binary file: {filename}"),
+                    Some(serde_json::json!({
+                        "filename": filename,
+                        "encoding": "base64",
+                        "content": BASE64.encode(error.as_bytes()),
+                    })),
+                ),
+            };
+            return Ok(Json(ManageOutput {
+                operation: "get".to_string(),
+                skill_id: Some(skill_id),
+                name: Some(skill_name),
+                message,
+                data,
+            }));
+        }
+
+        let content = self
+            .skill_store
+            .load_skill_content(&skill_name)
+            .map_err(|e| format!("Failed to load skill content: {e}"))?;
+
+        let mut response = format!("# Skill: {skill_id}\n\n");
+        response.push_str(&content.skill_md);
+        response.push_str("\n\n---\n\n");
+        response.push_str("## Metadata\n\n");
+        response.push_str("- Uses tools: ");
+        response.push_str(&content.uses_tools.join(", "));
+        response.push('\n');
+        response.push_str("- Bundled tools: ");
+        response.push_str(
+            &content
+                .bundled_tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        response.push('\n');
+        response.push_str("- Additional files: ");
+        response.push_str(&content.additional_files.join(", "));
+        response.push('\n');
+
+        info!("Returned content for skill: {}", skill_id);
+
+        Ok(Json(ManageOutput {
+            operation: "get".to_string(),
+            skill_id: Some(skill_id),
+            name: Some(skill_name),
+            message: response,
+            data: Some(serde_json::json!({
+                "uses_tools": content.uses_tools,
+                "bundled_tools": content.bundled_tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                "additional_files": content.additional_files,
+            })),
+        }))
+    }
+
+    fn manage_update(&self, input: ManageInput) -> Result<Json<ManageOutput>, String> {
+        let skill_id = input
+            .skill_id
+            .ok_or("skill_id is required for update operation")?;
+        // Omitted metadata and bundled files are preserved by storage.
+
+        // Parse skill_id
+        let skill_name = if skill_id.starts_with("skill:") {
+            skill_id
+                .strip_prefix("skill:")
+                .and_then(|s| s.split('@').next())
+                .unwrap_or(&skill_id)
+                .to_string()
+        } else {
+            skill_id.clone()
+        };
+
+        let request = UpdateSkillRequest {
+            name: input.name,
+            version: input.version,
+            description: input.description,
+            skill_md_content: input.skill_md,
+            uses_tools: input.uses_tools,
+            tags: input.tags,
+            scripts: input.scripts.unwrap_or_default(),
+            references: input.references.unwrap_or_default(),
+            assets: input.assets.unwrap_or_default(),
+        };
+
+        let id: crate::core::CallableId = self
+            .skill_store
+            .update_skill(&skill_name, request)
+            .map_err(|e| format!("Failed to update skill: {e}"))?;
+
+        info!("Updated skill: {} ({})", skill_id, id.as_str());
+
+        Ok(Json(ManageOutput {
+            operation: "update".to_string(),
+            skill_id: Some(id.as_str().to_string()),
+            name: Some(skill_name),
+            message: "Skill updated successfully".to_string(),
+            data: None,
+        }))
+    }
+
+    fn manage_delete(&self, input: ManageInput) -> Result<Json<ManageOutput>, String> {
+        let skill_id = input
+            .skill_id
+            .ok_or("skill_id is required for delete operation")?;
+
+        let skill_name = if skill_id.starts_with("skill:") {
+            skill_id
+                .strip_prefix("skill:")
+                .and_then(|s| s.split('@').next())
+                .unwrap_or(&skill_id)
+                .to_string()
+        } else {
+            skill_id.clone()
+        };
+
+        self.skill_store
+            .delete_skill(&skill_name)
+            .map_err(|e| format!("Failed to delete skill: {e}"))?;
+
+        info!("Deleted skill: {}", skill_id);
+
+        Ok(Json(ManageOutput {
+            operation: "delete".to_string(),
+            skill_id: Some(skill_id.clone()),
+            name: Some(skill_name),
+            message: format!("Skill {skill_id} deleted successfully"),
+            data: None,
+        }))
+    }
+
+    async fn manage_add_upstream(&self, input: ManageInput) -> Result<Json<ManageOutput>, String> {
+        let alias = input
+            .upstream_alias
+            .ok_or("upstream_alias is required for add_upstream operation")?;
+        let transport_str = input
+            .transport
+            .ok_or("transport is required for add_upstream operation")?;
+
+        let transport = match transport_str.as_str() {
+            "stdio" => crate::execution::upstream::Transport::Stdio,
+            "http" => crate::execution::upstream::Transport::Http,
+            "http_sse" | "http+sse" => crate::execution::upstream::Transport::HttpSse,
+            _ => return Err(format!("Invalid transport type: {transport_str}")),
+        };
+
+        let config = crate::execution::upstream::UpstreamConfig {
+            alias: alias.clone(),
+            required: false,
+            transport,
+            command: input.command,
+            url: input.url,
+            auth: None,
+            repo: None,
+            git_ref: None,
+            skills: None,
+            roots: None,
+            tags: input.tags.unwrap_or_default(),
+            sandbox_config: None,
+            description: input.upstream_description,
+        };
+
+        let message = if let Some(upstream_manager) = &self.upstream_manager {
+            upstream_manager
+                .add_upstream(config)
+                .await
+                .map_err(|e| format!("Failed to add upstream: {e}"))?;
+
+            if input.test_connection {
+                format!("Upstream MCP server '{alias}' added and connected successfully")
+            } else {
+                format!("Upstream MCP server '{alias}' added (connection test skipped)")
+            }
+        } else {
+            return Err("Upstream manager not available".to_string());
+        };
+
+        info!("Added upstream: {}", alias);
+
+        Ok(Json(ManageOutput {
+            operation: "add_upstream".to_string(),
+            skill_id: None,
+            name: Some(alias.clone()),
+            message,
+            data: Some(serde_json::json!({ "alias": alias, "transport": transport_str })),
+        }))
+    }
+
+    async fn manage_remove_upstream(
+        &self,
+        input: ManageInput,
+    ) -> Result<Json<ManageOutput>, String> {
+        let alias = input
+            .upstream_alias
+            .ok_or("upstream_alias is required for remove_upstream operation")?;
+
+        if let Some(upstream_manager) = &self.upstream_manager {
+            upstream_manager
+                .disconnect(&alias)
+                .await
+                .map_err(|e| format!("Failed to remove upstream: {e}"))?;
+        } else {
+            return Err("Upstream manager not available".to_string());
+        }
+
+        info!("Removed upstream: {}", alias);
+
+        Ok(Json(ManageOutput {
+            operation: "remove_upstream".to_string(),
+            skill_id: None,
+            name: Some(alias.clone()),
+            message: format!("Upstream MCP server '{alias}' removed successfully"),
+            data: None,
+        }))
+    }
+
+    async fn manage_list_upstreams(&self) -> Result<Json<ManageOutput>, String> {
+        let servers = if let Some(upstream_manager) = &self.upstream_manager {
+            upstream_manager
+                .list_servers()
+                .await
+                .into_iter()
+                .filter(|alias| self.policy_engine.is_server_trusted(alias))
+                .collect::<Vec<_>>()
+        } else {
+            return Err("Upstream manager not available".to_string());
+        };
+
+        let message = if servers.is_empty() {
+            "No upstream MCP servers configured".to_string()
+        } else {
+            format!(
+                "Found {} upstream server(s): {}",
+                servers.len(),
+                servers.join(", ")
+            )
+        };
+
+        info!("Listed {} upstream servers", servers.len());
+
+        Ok(Json(ManageOutput {
+            operation: "list_upstreams".to_string(),
+            skill_id: None,
+            name: None,
+            message,
+            data: Some(serde_json::json!({ "servers": servers, "count": servers.len() })),
+        }))
+    }
+
+    async fn manage_update_upstream(
+        &self,
+        input: ManageInput,
+    ) -> Result<Json<ManageOutput>, String> {
+        let alias = input
+            .upstream_alias
+            .ok_or("upstream_alias is required for update_upstream operation")?;
+
+        let updates = if let Some(upstream_manager) = &self.upstream_manager {
+            let current = upstream_manager
+                .get_config(&alias)
+                .await
+                .ok_or_else(|| format!("Upstream '{alias}' not found"))?;
+
+            crate::execution::upstream::UpstreamConfig {
+                alias: alias.clone(),
+                required: current.required,
+                transport: current.transport,
+                command: input.command.or(current.command),
+                url: input.url.or(current.url),
+                auth: current.auth,
+                repo: current.repo,
+                git_ref: current.git_ref,
+                skills: current.skills,
+                roots: current.roots,
+                tags: if let Some(tags) = input.tags {
+                    if tags.is_empty() {
+                        current.tags
+                    } else {
+                        tags
+                    }
+                } else {
+                    current.tags
+                },
+                sandbox_config: current.sandbox_config,
+                description: input.upstream_description.or(current.description),
+            }
+        } else {
+            return Err("Upstream manager not available".to_string());
+        };
+
+        if let Some(upstream_manager) = &self.upstream_manager {
+            upstream_manager
+                .update_upstream(&alias, updates)
+                .await
+                .map_err(|e| format!("Failed to update upstream: {e}"))?;
+        }
+
+        info!("Updated upstream: {}", alias);
+
+        Ok(Json(ManageOutput {
+            operation: "update_upstream".to_string(),
+            skill_id: None,
+            name: Some(alias.clone()),
+            message: format!("Upstream MCP server '{alias}' updated successfully"),
+            data: Some(serde_json::json!({ "alias": alias })),
+        }))
     }
 }
 
@@ -1296,7 +1447,7 @@ pub struct DeleteSkillInput {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ManageOperation {
-    /// Return the resolved Mesurii Register component profile
+    /// Return the effective runtime profile.
     Profile,
     /// Create a new skill
     Create,
@@ -1330,10 +1481,10 @@ pub struct ManageInput {
     /// Skill version (optional, defaults to 1.0.0)
     #[serde(default)]
     pub version: Option<String>,
-    /// Skill description (required for create/update)
+    /// Skill description (required for create; omitted on update preserves it)
     #[serde(default)]
     pub description: Option<String>,
-    /// SKILL.md content (required for create/update)
+    /// SKILL.md content (required for create; omitted on update preserves it)
     #[serde(default)]
     pub skill_md: Option<String>,
     /// MCP tools this skill uses (optional)
@@ -1397,8 +1548,8 @@ pub struct ManageOutput {
 }
 
 impl ServerHandler for SkillsServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(
                 Implementation::new("skillsrs", env!("CARGO_PKG_VERSION"))
@@ -1414,23 +1565,25 @@ impl ServerHandler for SkillsServer {
             )
     }
 
-    async fn initialize(
+    fn initialize(
         &self,
         _request: rmcp::model::InitializeRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::InitializeResult, rmcp::model::ErrorData> {
-        Ok(self.get_info())
+    ) -> impl Future<Output = Result<rmcp::model::InitializeResult, rmcp::model::ErrorData>> + Send
+    {
+        std::future::ready(Ok(self.get_info()))
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData>> + Send
+    {
         let tools = self.tool_router.list_all();
-        Ok(rmcp::model::ListToolsResult::with_all_items(tools)
+        std::future::ready(Ok(rmcp::model::ListToolsResult::with_all_items(tools)
             .with_ttl_ms(0)
-            .with_cache_scope(CacheScope::Public))
+            .with_cache_scope(CacheScope::Public)))
     }
 
     async fn call_tool(

@@ -1,17 +1,14 @@
 //! Search and indexing engine for callables
 //!
-//! Provides fast discovery over the unified registry with:
-//! - Multiple query modes (literal, regex, fuzzy)
-//! - Field-weighted ranking
-//! - Filters (kind, server, tags, requires)
-//! - Pagination support
+//! Field-weighted, separator-insensitive ranking over the registry and cached
+//! skill bodies. Queries scan the catalog; this is not a full-text database.
 
 use crate::core::registry::Registry;
 use crate::core::{CallableId, CallableKind, CallableRecord};
 use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::debug;
@@ -149,29 +146,45 @@ impl SearchEngine {
 
     /// Search the index
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns an error for an empty query, unsupported kind, zero limit or malformed cursor.
+    pub fn search(&self, query: &SearchQuery) -> Result<SearchResults> {
+        self.search_visible(query, |_| true)
+    }
+
+    /// Apply visibility before ranking and pagination so hidden records cannot consume pages.
+    /// # Errors
+    /// Returns an error for malformed queries and cursors.
     #[expect(
         clippy::too_many_lines,
-        reason = "search keeps filtering, exhaustive enumeration, ranking, and pagination together"
+        reason = "filtering, ranking and pagination share a snapshot"
     )]
-    #[expect(
-        clippy::unused_async,
-        reason = "search remains async as part of the public server interface"
-    )]
-    pub async fn search(&self, query: &SearchQuery) -> Result<SearchResults> {
+    pub fn search_visible<F>(&self, query: &SearchQuery, visible: F) -> Result<SearchResults>
+    where
+        F: Fn(&CallableRecord) -> bool + Send + Sync,
+    {
         if query.q.is_empty() {
             return Err(IndexError::InvalidQuery(
                 "Query cannot be empty".to_string(),
             ));
         }
+        if query.limit == 0 {
+            return Err(IndexError::InvalidQuery("Limit must be positive".into()));
+        }
+        let offset = query
+            .cursor
+            .as_deref()
+            .map(str::parse::<usize>)
+            .transpose()
+            .map_err(|_| IndexError::InvalidQuery("Invalid pagination cursor".into()))?
+            .unwrap_or(0);
+        let terms = SearchTerms::new(&query.q);
 
         let exhaustive = query.q == "*";
         debug!("Search query: {:?} (exhaustive={exhaustive})", query.q);
 
-        // Detect query intent
-
         // Get all callables from registry
         let mut candidates = self.registry.all();
+        candidates.retain(visible);
 
         // Apply kind filter
         if query.kind != "any" {
@@ -197,14 +210,15 @@ impl SearchEngine {
         let mut scored: Vec<(CallableRecord, f64)> = if exhaustive {
             candidates.into_iter().map(|record| (record, 0.0)).collect()
         } else {
+            let index = self.index.read();
             candidates
                 .into_iter()
                 .filter_map(|record| {
-                    let body = {
-                        let index = self.index.read();
-                        index.body_texts.get(record.id.as_str()).cloned()
-                    };
-                    let score = score_record(&query.q, &record, body.as_deref());
+                    let body = index
+                        .body_texts
+                        .get(record.id.as_str())
+                        .and_then(Option::as_deref);
+                    let score = score_record(&terms, &record, body);
 
                     if score > 0.0 {
                         Some((record, score))
@@ -217,23 +231,19 @@ impl SearchEngine {
 
         // Sort by score descending
         if exhaustive {
-            scored.sort_by(|(left, _), (right, _)| {
-                stable_instrument_id(left)
-                    .cmp(&stable_instrument_id(right))
-                    .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+            scored.sort_by_cached_key(|(record, _)| {
+                (stable_instrument_id(record), record.id.as_str().to_owned())
             });
         } else {
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.id.as_str().cmp(right.0.id.as_str()))
+            });
         }
 
         let total_matches = scored.len();
-
-        // Apply pagination
-        let offset = query
-            .cursor
-            .as_ref()
-            .and_then(|c| c.parse::<usize>().ok())
-            .unwrap_or(0);
 
         let matches: Vec<SearchMatch> = scored
             .into_iter()
@@ -292,109 +302,51 @@ impl SearchEngine {
     }
 }
 
-/// In-memory inverted index
 struct InMemoryIndex {
-    // Token -> CallableId mappings
-    tokens: HashMap<String, HashSet<String>>,
-    // CallableId -> tokens for removal
-    reverse: HashMap<String, HashSet<String>>,
-    // CallableId -> capped SKILL.md body text for low-weight matching
-    body_texts: HashMap<String, Arc<str>>,
+    body_texts: HashMap<String, Option<Arc<str>>>,
 }
 
 impl InMemoryIndex {
     fn new() -> Self {
         Self {
-            tokens: HashMap::new(),
-            reverse: HashMap::new(),
             body_texts: HashMap::new(),
         }
     }
 
     fn add_record(&mut self, record: &CallableRecord) {
-        let id = record.id.as_str().to_string();
-        let body = load_searchable_body(record);
-        let tokens = tokenize_record(record, body.as_deref());
-
-        for token in &tokens {
-            self.tokens
-                .entry(token.clone())
-                .or_default()
-                .insert(id.clone());
-        }
-
-        if let Some(body) = body {
-            self.body_texts.insert(id.clone(), Arc::from(body));
-        } else {
-            self.body_texts.remove(&id);
-        }
-
-        self.reverse.insert(id, tokens);
+        self.body_texts.insert(
+            record.id.as_str().to_owned(),
+            load_searchable_body(record).map(Arc::from),
+        );
     }
 
     fn remove_record(&mut self, id: &CallableId) {
-        let id_str = id.as_str();
-        if let Some(tokens) = self.reverse.remove(id_str) {
-            for token in tokens {
-                if let Some(ids) = self.tokens.get_mut(&token) {
-                    ids.remove(id_str);
-                }
-            }
-        }
-        self.body_texts.remove(id_str);
+        self.body_texts.remove(id.as_str());
     }
 
     fn clear(&mut self) {
-        self.tokens.clear();
-        self.reverse.clear();
         self.body_texts.clear();
     }
 
     fn len(&self) -> usize {
-        self.reverse.len()
+        self.body_texts.len()
     }
 }
 
-/// Tokenize a record for indexing
-fn tokenize_record(record: &CallableRecord, body: Option<&str>) -> HashSet<String> {
-    let mut tokens = HashSet::new();
+struct SearchTerms {
+    lower: String,
+    compact: String,
+    tokens: Vec<String>,
+}
 
-    // Tokenize name
-    for token in tokenize(&record.name) {
-        tokens.insert(token);
-    }
-
-    // Tokenize FQ name
-    for token in tokenize(&record.fq_name) {
-        tokens.insert(token);
-    }
-
-    // Tokenize title
-    if let Some(title) = &record.title {
-        for token in tokenize(title) {
-            tokens.insert(token);
+impl SearchTerms {
+    fn new(query: &str) -> Self {
+        Self {
+            lower: query.to_lowercase(),
+            compact: compact(query),
+            tokens: tokenize(query),
         }
     }
-
-    // Tokenize description
-    if let Some(desc) = &record.description {
-        for token in tokenize(desc) {
-            tokens.insert(token);
-        }
-    }
-
-    if let Some(body) = body {
-        for token in tokenize(body) {
-            tokens.insert(token);
-        }
-    }
-
-    // Add tags
-    for tag in &record.tags {
-        tokens.insert(tag.to_lowercase());
-    }
-
-    tokens
 }
 
 /// Simple tokenization (lowercase, split on non-alphanumeric including underscores)
@@ -453,35 +405,35 @@ fn compact(text: &str) -> String {
     clippy::arithmetic_side_effects,
     reason = "floating-point relevance scoring intentionally accumulates weighted values"
 )]
-fn score_field(query: &str, query_tokens: &[String], text: &str, weight: f64) -> f64 {
+fn score_field(query: &SearchTerms, text: &str, weight: f64) -> f64 {
     let text_lower = text.to_lowercase();
-    let text_tokens = tokenize(text);
-    let text_compact = compact(text);
-    let query_compact = compact(query);
+    let text_tokens: Vec<_> = text_lower
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let text_compact: String = text_lower
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect();
     let mut score = 0.0;
 
-    if text_lower == query.to_lowercase() {
-        score += weight * 3.0;
-    } else if text_lower.contains(&query.to_lowercase()) {
-        score += weight * 2.0;
+    if text_lower == query.lower {
+        score = weight.mul_add(3.0, score);
+    } else if text_lower.contains(&query.lower) {
+        score = weight.mul_add(2.0, score);
     }
 
-    if !query_compact.is_empty() && text_compact.contains(&query_compact) {
-        score += weight * 1.75;
+    if !query.compact.is_empty() && text_compact.contains(&query.compact) {
+        score = weight.mul_add(1.75, score);
     }
 
     let mut matched_tokens = 0;
-    for query_token in query_tokens {
-        let query_token_compact = compact(query_token);
-        if query_token_compact.is_empty() {
-            continue;
-        }
-
+    for query_token in &query.tokens {
         let matched = text_tokens.iter().any(|text_token| {
-            text_token == query_token
-                || text_token.starts_with(query_token)
-                || query_token.starts_with(text_token)
-        }) || text_compact.contains(&query_token_compact);
+            *text_token == query_token.as_str()
+                || text_token.starts_with(query_token.as_str())
+                || query_token.starts_with(*text_token)
+        }) || text_compact.contains(query_token);
 
         if matched {
             matched_tokens += 1;
@@ -489,8 +441,8 @@ fn score_field(query: &str, query_tokens: &[String], text: &str, weight: f64) ->
         }
     }
 
-    if !query_tokens.is_empty() && matched_tokens == query_tokens.len() {
-        score += weight * 1.25;
+    if !query.tokens.is_empty() && matched_tokens == query.tokens.len() {
+        score = weight.mul_add(1.25, score);
     }
 
     score
@@ -501,27 +453,26 @@ fn score_field(query: &str, query_tokens: &[String], text: &str, weight: f64) ->
 /// - separator-insensitive matching (`pytestlab core` -> `pytestlab-core`)
 /// - per-token matching so partial intent still finds plausible callables
 /// - field weighting so names outrank incidental description mentions
-fn score_record(query: &str, record: &CallableRecord, body: Option<&str>) -> f64 {
-    let query_tokens = tokenize(query);
+fn score_record(query: &SearchTerms, record: &CallableRecord, body: Option<&str>) -> f64 {
     let mut score = 0.0;
 
-    score += score_field(query, &query_tokens, &record.name, 30.0);
-    score += score_field(query, &query_tokens, &record.fq_name, 25.0);
+    score += score_field(query, &record.name, 30.0);
+    score += score_field(query, &record.fq_name, 25.0);
 
     if let Some(title) = &record.title {
-        score += score_field(query, &query_tokens, title, 15.0);
+        score += score_field(query, title, 15.0);
     }
 
     if let Some(desc) = &record.description {
-        score += score_field(query, &query_tokens, desc, 8.0);
+        score += score_field(query, desc, 8.0);
     }
 
     for tag in &record.tags {
-        score += score_field(query, &query_tokens, tag, 12.0);
+        score += score_field(query, tag, 12.0);
     }
 
     if let Some(body) = body {
-        score += score_field(query, &query_tokens, body, 3.0);
+        score += score_field(query, body, 3.0);
     }
 
     score

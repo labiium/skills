@@ -4,7 +4,7 @@
 //! - Risk tier gating (consent requirements)
 //! - Allowlist/denylist filtering
 //! - Server trust levels
-//! - Resource limits and quotas
+//! - Execution deadlines
 
 use crate::{CallableRecord, RiskTier};
 use glob::Pattern;
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::warn;
 
 #[derive(Error, Debug)]
 pub enum PolicyError {
@@ -41,9 +41,7 @@ pub enum ConsentLevel {
     AdminConfirmed,
 }
 
-/// Effective authorization profile. `Open` is intended for a Mesurii workspace
-/// (the workspace boundary is the trust boundary); the historical profile stays
-/// the default for other consumers.
+/// `Open` trusts the Mesurii workspace boundary. Standard is conservative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {
@@ -85,49 +83,25 @@ impl std::fmt::Display for ConsentLevel {
 
 /// Policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
-    /// Authorization profile. `SKILLS_POLICY=open` selects the open profile at runtime.
-    #[serde(default)]
     pub mode: PolicyMode,
-    /// Default risk tier for unknown callables
-    #[serde(default = "default_risk")]
+    /// Enable mutating MCP management for callers inside the host's trust boundary.
+    pub management_enabled: bool,
+    /// Require an explicit trusted server entry for upstream reads and execution.
+    pub enforce_server_trust: bool,
+    /// Risk tier used for callables without authoritative risk metadata.
     pub default_risk: String,
-
-    /// Risk tiers that require consent
-    #[serde(default)]
     pub require_consent_for: Vec<String>,
-
-    /// Trusted server aliases
-    #[serde(default)]
     pub trusted_servers: Vec<String>,
-
-    /// Denied tags (callables with these tags are blocked)
-    #[serde(default)]
     pub deny_tags: Vec<String>,
-
-    /// Maximum calls per skill execution
-    #[serde(default = "default_max_calls")]
-    pub max_calls_per_skill: usize,
-
-    /// Maximum execution time in milliseconds
-    #[serde(default = "default_max_exec_ms")]
     pub max_exec_ms: u64,
-
-    /// Allow patterns (glob-style)
-    #[serde(default)]
     pub allow_patterns: Vec<String>,
-
-    /// Deny patterns (glob-style)
-    #[serde(default)]
     pub deny_patterns: Vec<String>,
 }
 
 fn default_risk() -> String {
     "unknown".to_string()
-}
-
-const fn default_max_calls() -> usize {
-    30
 }
 
 const fn default_max_exec_ms() -> u64 {
@@ -138,15 +112,17 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             mode: PolicyMode::Standard,
+            management_enabled: false,
+            enforce_server_trust: true,
             default_risk: default_risk(),
             require_consent_for: vec![
                 "writes".to_string(),
                 "destructive".to_string(),
                 "admin".to_string(),
+                "unknown".to_string(),
             ],
             trusted_servers: vec![],
             deny_tags: vec![],
-            max_calls_per_skill: default_max_calls(),
             max_exec_ms: default_max_exec_ms(),
             allow_patterns: vec!["*".to_string()],
             deny_patterns: vec![],
@@ -160,9 +136,10 @@ impl PolicyConfig {
     pub fn open() -> Self {
         Self {
             mode: PolicyMode::Open,
+            management_enabled: true,
+            enforce_server_trust: false,
             require_consent_for: vec![],
             trusted_servers: vec!["*".to_string()],
-            max_calls_per_skill: usize::MAX,
             max_exec_ms: u64::MAX,
             ..Self::default()
         }
@@ -174,9 +151,11 @@ impl PolicyConfig {
         Self::from_selector(config, std::env::var("SKILLS_POLICY").ok().as_deref())
     }
 
-    /// Resolve the immutable source identity injected by the Mesurii Bench.
-    /// Open-profile servers require an exact Git object name; standard
-    /// consumers may omit it for backwards compatibility.
+    /// Read the externally asserted source revision supplied by the deployment.
+    /// This validates its shape, not the provenance of the running binary.
+    ///
+    /// # Errors
+    /// Returns a configuration error when a required revision is absent or not exactly 40 hex digits.
     pub fn mesurii_source_revision(require: bool) -> Result<Option<String>> {
         let configured = std::env::var("MESURII_SKILLS_SOURCE_REVISION").ok();
         let value = exact_source_revision(configured.as_deref());
@@ -192,12 +171,13 @@ impl PolicyConfig {
     pub fn from_selector(mut config: Self, selector: Option<&str>) -> Self {
         if selector.is_some_and(|value| value.trim().eq_ignore_ascii_case("open")) {
             config.mode = PolicyMode::Open;
+            config.management_enabled = true;
+            config.enforce_server_trust = false;
             config.require_consent_for.clear();
             config.trusted_servers = vec!["*".to_string()];
             config.allow_patterns = vec!["*".to_string()];
             config.deny_patterns.clear();
             config.deny_tags.clear();
-            config.max_calls_per_skill = usize::MAX;
             config.max_exec_ms = u64::MAX;
         }
         config
@@ -240,8 +220,8 @@ mod source_revision_tests {
 pub struct PolicyState {
     pub mode: String,
     pub unconditional: bool,
-    /// `None` denotes an intentional unbounded limit in the open workspace profile.
-    pub max_calls_per_skill: Option<usize>,
+    pub management_enabled: bool,
+    /// `None` denotes the open workspace's unbounded policy deadline.
     pub max_exec_ms: Option<u64>,
 }
 
@@ -295,18 +275,32 @@ pub struct PolicyEngine {
 
 impl PolicyEngine {
     /// Create new policy engine from config
+    ///
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns a configuration error for zero deadlines, invalid risk tiers, or invalid glob patterns.
     pub fn new(mut config: PolicyConfig) -> Result<Self> {
         if config.mode == PolicyMode::Open {
-            config.max_calls_per_skill = usize::MAX;
             config.max_exec_ms = u64::MAX;
+            config.management_enabled = true;
+            config.enforce_server_trust = false;
         }
+        if config.max_exec_ms == 0 {
+            return Err(PolicyError::ConfigError(
+                "max_exec_ms must be positive".to_string(),
+            ));
+        }
+        config.default_risk.parse::<RiskTier>().map_err(|_| {
+            PolicyError::ConfigError(format!("Invalid default_risk: {}", config.default_risk))
+        })?;
         let consent_required_tiers: HashSet<RiskTier> = config
             .require_consent_for
             .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+            .map(|tier| {
+                tier.parse().map_err(|_| {
+                    PolicyError::ConfigError(format!("Invalid consent risk tier: {tier}"))
+                })
+            })
+            .collect::<Result<_>>()?;
 
         let trusted_servers: HashSet<String> = config.trusted_servers.iter().cloned().collect();
         let deny_tags: HashSet<String> = config.deny_tags.iter().cloned().collect();
@@ -314,14 +308,13 @@ impl PolicyEngine {
         let allow_patterns: Vec<Pattern> = config
             .allow_patterns
             .iter()
-            .filter_map(|p| Pattern::new(p).ok())
-            .collect();
-
+            .map(|p| Pattern::new(p).map_err(|error| PolicyError::ConfigError(error.to_string())))
+            .collect::<Result<_>>()?;
         let deny_patterns: Vec<Pattern> = config
             .deny_patterns
             .iter()
-            .filter_map(|p| Pattern::new(p).ok())
-            .collect();
+            .map(|p| Pattern::new(p).map_err(|error| PolicyError::ConfigError(error.to_string())))
+            .collect::<Result<_>>()?;
 
         let mode = config.mode;
         Ok(Self {
@@ -338,17 +331,7 @@ impl PolicyEngine {
     /// Create permissive policy engine (for testing)
     #[must_use]
     pub fn new_permissive() -> Self {
-        let config = PolicyConfig {
-            mode: PolicyMode::Open,
-            default_risk: "read_only".to_string(),
-            require_consent_for: vec![],
-            trusted_servers: vec!["*".to_string()],
-            deny_tags: vec![],
-            max_calls_per_skill: 100,
-            max_exec_ms: 300_000,
-            allow_patterns: vec!["*".to_string()],
-            deny_patterns: vec![],
-        };
+        let config = PolicyConfig::open();
 
         Self {
             consent_required_tiers: HashSet::new(),
@@ -362,33 +345,77 @@ impl PolicyEngine {
     }
 
     /// Authorize a callable for execution
+    ///
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
-    #[expect(
-        clippy::unused_async,
-        reason = "authorization is async to preserve the public execution interface"
-    )]
-    pub async fn authorize(
+    /// Returns a configuration error if the default risk tier cannot be parsed.
+    pub fn authorize(
         &self,
         callable: &CallableRecord,
         _arguments: &serde_json::Value,
         consent: ConsentLevel,
     ) -> Result<AuthorizationResult> {
-        debug!("Authorizing callable: {}", callable.id.as_str());
+        self.authorize_risk(callable, callable.risk_tier, consent)
+    }
 
+    /// Bundled scripts are unreviewed code regardless of the instruction skill's risk.
+    ///
+    /// # Errors
+    /// Returns a configuration error if the default risk tier cannot be parsed.
+    pub fn authorize_script(
+        &self,
+        callable: &CallableRecord,
+        consent: ConsentLevel,
+    ) -> Result<AuthorizationResult> {
+        self.authorize_risk(callable, RiskTier::Unknown, consent)
+    }
+
+    fn authorize_risk(
+        &self,
+        callable: &CallableRecord,
+        risk: RiskTier,
+        consent: ConsentLevel,
+    ) -> Result<AuthorizationResult> {
+        let visibility = self.authorize_read(callable);
+        if !visibility.allowed || self.is_open() {
+            return Ok(visibility);
+        }
+        let risk_tier = if risk == RiskTier::Unknown {
+            self.config
+                .default_risk
+                .parse()
+                .map_err(|_| PolicyError::ConfigError("Invalid default risk tier".to_string()))?
+        } else {
+            risk
+        };
+        if self.consent_required_tiers.contains(&risk_tier) {
+            let required = match risk_tier {
+                RiskTier::Admin => ConsentLevel::AdminConfirmed,
+                _ => ConsentLevel::UserConfirmed,
+            };
+            if consent < required {
+                return Ok(AuthorizationResult::deny_with_consent(
+                    format!("Risk tier {risk_tier} requires trusted consent level {required}"),
+                    required,
+                ));
+            }
+        }
+        Ok(AuthorizationResult::allow())
+    }
+
+    /// Authorize metadata and instruction reads without granting code execution.
+    #[must_use]
+    pub fn authorize_read(&self, callable: &CallableRecord) -> AuthorizationResult {
         // Open means the workspace is the trust boundary. Deliberately bypass
         // consent, trust, allowlist, denylist, and risk-tier gates.
         if self.mode == PolicyMode::Open {
-            return Ok(AuthorizationResult::allow());
+            return AuthorizationResult::allow();
         }
 
         // Check deny tags
         for tag in &callable.tags {
             if self.deny_tags.contains(tag) {
                 warn!("Callable denied due to tag: {}", tag);
-                return Ok(AuthorizationResult::deny(format!(
-                    "Callable has denied tag: {tag}"
-                )));
+                return AuthorizationResult::deny(format!("Callable has denied tag: {tag}"));
             }
         }
 
@@ -396,10 +423,10 @@ impl PolicyEngine {
         for pattern in &self.deny_patterns {
             if pattern.matches(&callable.fq_name) {
                 warn!("Callable denied by pattern: {}", pattern.as_str());
-                return Ok(AuthorizationResult::deny(format!(
+                return AuthorizationResult::deny(format!(
                     "Callable matches deny pattern: {}",
                     pattern.as_str()
-                )));
+                ));
             }
         }
 
@@ -412,70 +439,78 @@ impl PolicyEngine {
 
             if !matched {
                 warn!("Callable not in allowlist: {}", callable.fq_name);
-                return Ok(AuthorizationResult::deny(
-                    "Callable not in allowlist".to_string(),
-                ));
+                return AuthorizationResult::deny("Callable not in allowlist".to_string());
             }
         }
 
         // Check server trust (tools only)
         if let Some(server) = &callable.server_alias {
-            if !self.trusted_servers.is_empty()
+            if self.config.enforce_server_trust
                 && !self.trusted_servers.contains(server)
                 && !self.trusted_servers.contains("*")
             {
                 warn!("Server not trusted: {}", server);
-                return Ok(AuthorizationResult::deny(format!(
-                    "Server not in trusted list: {server}"
-                )));
+                return AuthorizationResult::deny(format!("Server not in trusted list: {server}"));
             }
         }
-
-        // Check risk tier and consent
-        if self.consent_required_tiers.contains(&callable.risk_tier) {
-            let required_consent = match callable.risk_tier {
-                RiskTier::Admin => ConsentLevel::AdminConfirmed,
-                RiskTier::Destructive | RiskTier::Writes => ConsentLevel::UserConfirmed,
-                _ => ConsentLevel::None,
-            };
-
-            if consent < required_consent {
-                warn!(
-                    "Insufficient consent for {}: required {:?}, provided {:?}",
-                    callable.fq_name, required_consent, consent
-                );
-                return Ok(AuthorizationResult::deny_with_consent(
-                    format!(
-                        "Risk tier {} requires consent level {}",
-                        callable.risk_tier, required_consent
-                    ),
-                    required_consent,
-                ));
-            }
-        }
-
-        debug!("Authorization granted for: {}", callable.fq_name);
-        Ok(AuthorizationResult::allow())
+        AuthorizationResult::allow()
     }
 
     /// Check if execution time is within limits
+    ///
     /// # Errors
-    /// Returns an error if the operation cannot be completed.
+    /// Returns a resource-limit error when the requested timeout is zero.
     pub fn check_timeout(&self, requested_ms: Option<u64>) -> Result<u64> {
         let timeout = requested_ms.unwrap_or(self.config.max_exec_ms);
-        if timeout > self.config.max_exec_ms {
-            return Err(PolicyError::LimitExceeded(format!(
-                "Requested timeout {}ms exceeds maximum {}ms",
-                timeout, self.config.max_exec_ms
-            )));
+        if timeout == 0 {
+            return Err(PolicyError::LimitExceeded(
+                "Execution timeout must be positive".to_string(),
+            ));
         }
-        Ok(timeout)
+        Ok(timeout.min(self.config.max_exec_ms))
     }
 
-    /// Get max calls per skill
+    /// Require a host-configured management trust boundary before any mutation.
+    ///
+    /// # Errors
+    /// Returns an authorization error when the host has not enabled management.
+    pub fn authorize_management(&self) -> Result<()> {
+        if self.is_open() || self.config.management_enabled {
+            Ok(())
+        } else {
+            Err(PolicyError::Denied(
+                "Mutating MCP management is disabled; configure policy.management_enabled explicitly".to_string(),
+            ))
+        }
+    }
+
     #[must_use]
-    pub const fn max_calls_per_skill(&self) -> usize {
-        self.config.max_calls_per_skill
+    pub fn gates(&self) -> Vec<String> {
+        if self.is_open() {
+            return Vec::new();
+        }
+        let mut gates = vec!["timeout".to_string()];
+        if !self.config.management_enabled {
+            gates.push("management".to_string());
+        }
+        if self.config.enforce_server_trust {
+            gates.push("trust".to_string());
+        }
+        if !self.consent_required_tiers.is_empty() {
+            gates.push("consent".to_string());
+        }
+        if !self.deny_patterns.is_empty() || !self.deny_tags.is_empty() {
+            gates.push("deny".to_string());
+        }
+        if !self.allow_patterns.is_empty()
+            && !self
+                .allow_patterns
+                .iter()
+                .any(|pattern| pattern.as_str() == "*")
+        {
+            gates.push("allowlist".to_string());
+        }
+        gates
     }
 
     #[must_use]
@@ -488,8 +523,7 @@ impl PolicyEngine {
         PolicyState {
             mode: self.mode.to_string(),
             unconditional: self.is_open(),
-            max_calls_per_skill: (self.mode != PolicyMode::Open)
-                .then_some(self.config.max_calls_per_skill),
+            management_enabled: self.is_open() || self.config.management_enabled,
             max_exec_ms: (self.mode != PolicyMode::Open).then_some(self.config.max_exec_ms),
         }
     }
@@ -497,6 +531,9 @@ impl PolicyEngine {
     /// Check if a server is trusted
     #[must_use]
     pub fn is_server_trusted(&self, server: &str) -> bool {
-        self.trusted_servers.contains(server) || self.trusted_servers.contains("*")
+        self.is_open()
+            || !self.config.enforce_server_trust
+            || self.trusted_servers.contains(server)
+            || self.trusted_servers.contains("*")
     }
 }

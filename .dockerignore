@@ -22,7 +22,8 @@ target/
 # Documentation
 *.md
 !README.md
-docs/
+docs/*
+!docs/config.example.yaml
 
 # CI/CD
 .travis.yml

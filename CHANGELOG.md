@@ -7,9 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Instruction-first skill activation with explicit supporting-script selection; ranked CLI search and non-mutating source update checks.
+- Read-only `.agents/skills`, `.claude/skills`, and explicit skill roots with deterministic precedence. Project roots require operator opt-in.
+- Current MCP discovery, paginated upstream tools, opaque content forwarding, and input-required continuation.
+
 ### Changed
-- **MCP schema flow** - Merged callable schema inspection into `exec` via `describe`, reducing the MCP surface to `search`, `exec`, and `manage`.
-- **MCP exec output** - `exec` now returns non-lossy content, structured content, and error status instead of joining text blocks into a string.
+- MCP exposes `search`, `exec`, and `manage`; schema inspection lives in `exec`, and execution preserves content, structured results, and error status.
+- Rust 1.97 minimum; Wasmtime/WASI 50 and maintained YAML parsing, with patched transitive dependencies.
+- Skill metadata edits preserve optional and unknown frontmatter. Descriptions are required; arbitrary nested resources and binary reads are supported.
+- Local sources are persisted as canonical paths. Git refs, source ownership, dirty installations, missing packages, and clean replacement are reconciled explicitly.
+- Storage mutation, search, and authorization APIs that perform no asynchronous work are synchronous. Partial edits use `UpdateSkillRequest`.
+- CI, release packaging, Docker health checks, configuration examples, and reproducible local-operation benchmarks use the single-crate build.
+- Repeated `add` extends the tracked selection; use explicit sync to apply source removals or updates. Server startup no longer syncs sources.
+- `check` distinguishes up-to-date (`0`), pending changes (`1`), and errors (`2`). `init` reports a nonzero exit when it refuses to overwrite a config.
+- Rust timestamp fields now use `jiff::Timestamp`. Existing UTC RFC 3339 records and SQLite epoch-second columns remain readable.
+
+### Security
+- Standard policy disables mutating MCP management and requires trusted-server authorization and host-confirmed consent. Caller-supplied MCP consent cannot authorize execution.
+- HTTP requires bearer authentication for remote binds and for executable or management-enabled loopback profiles.
+- Execution defaults to an enforced backend and fails closed when it is unavailable. Native timeout/restricted modes are trusted-code hardening, not hostile-code containment.
+- Combined subprocess output defaults to an 8 MiB cap. WASM compilation and execution run in a killable, resource-bounded worker; embedded consumers must provide a trusted absolute `SKILLS_WASM_WORKER` when the CLI cannot be located.
+- Upgraded the MCP SDK, Wasmtime/WASI, bundled SQLite, URL, Rustix, and QUIC dependencies to patched releases. The release audit allows the Chrono maintenance advisory only while RMCP is the reason Chrono is present.
+
+### Fixed
+- Skill watcher startup no longer blocks when filesystem events arrive before the receiver starts.
+- Relative-source synchronization from another working directory can no longer remove the installed package.
+- Source folders install under their declared names. Listing no longer validates every package, and invalid metadata in an unselected sibling no longer blocks filtered imports.
+- Managed deletion, renaming, and filesystem changes restore the correct overlay and remove stale registry entries.
+- HTTP handles Unix `SIGTERM` as well as Ctrl+C, allowing containers and service managers to stop it gracefully.
+- Project/global source merges, explicit security defaults, Docker-only overrides, and configuration persistence retain their intended precedence.
+- Upstream request IDs, cancellation cleanup, connection generations, SSE parsing, transport authentication, and deadlines are enforced.
+- Local skill search and activation no longer connect to upstreams. Mixed CLI discovery skips unavailable optional upstreams; targeted commands connect only to the named upstream.
+- `add-mcp` leaves config unchanged on failed discovery unless `--no-test` is supplied. Stdio registration and editing preserve individual arguments after `--`.
+- Skill import uses the tracked source form for both discovery and installation. A config save failure rolls back package and ownership changes.
+
+### Removed
+- Placeholder workflow execution, unenforced policy fields, and unsupported performance and compatibility claims. Unknown configuration fields now fail validation.
 
 ## [0.1.7] - 2026-02-08
 

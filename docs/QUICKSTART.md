@@ -1,278 +1,79 @@
-# Quick Start Guide
+# Quick start
 
-Get skills.rs running in 5 minutes.
+This walkthrough creates a local instruction-only skill. It does not download skill instructions, connect to an upstream, or execute a helper.
 
----
+## Install and initialize
 
-## 1. Install
-
-```bash
-# Clone repository
-git clone https://github.com/labiium/skills
-cd skills
-
-# Build release binary
-cargo build --release
-
-# Verify installation
-./target/release/skills --version
-```
-
----
-
-## 2. Initialize Project Config
-
-Initialize a project-local setup (run in the repo root):
+Use Rust 1.97 or newer with the system build dependencies described in [operations](OPERATIONS.md).
 
 ```bash
-./target/release/skills init
+cargo install --locked skillsrs
+mkdir skill-demo
+cd skill-demo
+skills init
+skills paths
 ```
 
-This creates:
+`init` creates `.skills/config.yaml` and the managed `.skills/skills/` root. Commands in this project discover that configuration. Inspect the generated paths rather than guessing platform-global directories.
 
-- `.skills/config.yaml`
-- `.skills/skills/`
-- `.skills/skills.db`
-
-Edit `.skills/config.yaml` as needed. Example:
-
-```yaml
-paths:
-  data_dir: ".skills"
-  database_path: ".skills/skills.db"
-
-sandbox:
-  backend: timeout
-  timeout_ms: 30000
-  allow_read: []
-  allow_write: []
-  allow_network: false
-  max_memory_bytes: 536870912
-  max_cpu_seconds: 30
-
-use_global:
-  enabled: false
-
-upstreams:
-  - alias: brave
-    transport: stdio
-    command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"]
-    tags: ["search", "web"]
-```
-
-To disable sandboxing entirely:
-
-```yaml
-sandbox:
-  backend: none
-```
-
----
-
-## 3. Create Your First Skill
+## Write a skill
 
 ```bash
-# Create skills directory
-mkdir -p .skills/skills/my-first-skill
-
-# Create SKILL.md with YAML frontmatter
-cat > .skills/skills/my-first-skill/SKILL.md << 'EOF'
+mkdir -p .skills/skills/review-notes/references
+cat > .skills/skills/review-notes/SKILL.md <<'EOF'
 ---
-name: my-first-skill
-description: A simple test skill
-version: 1.0.0
-allowed-tools: ["brave_search"]
-tags: ["demo", "test"]
+name: review-notes
+description: Review supplied release notes against a local checklist.
 ---
 
-# My First Skill
+# Review notes
 
-## Purpose
-A simple test skill that demonstrates the SKILL.md format.
-
-## Instructions
-1. Read the input message
-2. Optionally search the web for related information
-3. Return a response
-
-## Tools Used
-- `brave_search` (optional) - Search the web for context
-
-## Expected Output
-A text response acknowledging the message.
+Read the user's release notes and references/checklist.txt. Report missing
+items with their file locations. Ask before modifying any files.
 EOF
+printf 'Check version, migration notes, and breaking changes.\n' > .skills/skills/review-notes/references/checklist.txt
+skills validate
+skills search review-notes --kind skills --json
+skills skill show review-notes
+skills skill show review-notes --file references/checklist.txt
 ```
 
----
+This is a valid baseline skill without version or tool metadata. Reading it is not proof that an agent performed the review.
 
-## 4. Run the Server
+## Connect an MCP client
 
-**Stdio mode (for MCP clients):**
-```bash
-./target/release/skills server stdio
-```
+Configure your client to run the absolute installed binary path if `skills` is not on its PATH, and use an absolute configuration path:
 
-**HTTP mode (for testing):**
-```bash
-./target/release/skills server http --bind 127.0.0.1:8000
-```
-
-The server will:
-- Load all skills from `./skills/`
-- Connect to upstream MCP servers
-- Expose 3 MCP tools
-
----
-
-## 5. Test with MCP Tools
-
-### Search for your skill
-
-**Tool:** `search`
-
-**Input:**
 ```json
 {
-  "q": "first",
-  "kind": "skill",
-  "limit": 10
+  "mcpServers": {
+    "skills": {
+      "command": "skills",
+      "args": ["--config", "/absolute/path/skill-demo/.skills/config.yaml", "server", "stdio"]
+    }
+  }
 }
 ```
 
-**Expected:** Should find "my-first-skill"
+In the connected client, call MCP `search`:
 
-### Get skill content
-
-**Tool:** `manage`
-
-**Input:**
 ```json
-{
-  "operation": "get",
-  "skill_id": "my-first-skill"
-}
+{"q":"review-notes","kind":"skills","limit":10}
 ```
 
-**Expected:** Returns SKILL.md content
+Use the returned ID with `exec` and `describe: true` to inspect it. Load the instructions with `manage`:
 
-### Execute the skill
-
-**Tool:** `exec`
-
-**Input:**
 ```json
-{
-  "id": "skill://my-first-skill@1.0.0@<digest>",
-  "arguments": {
-    "message": "Hello, world!"
-  },
-  "timeout_ms": 5000
-}
+{"operation":"get","skill_id":"review-notes"}
 ```
 
-**Expected:** Skill executes successfully
+A normal `exec` on a skill also activates instructions; scripts run only with explicit `script` selection. Standard mutating MCP management is disabled by default. Do not enable it simply to read instructions.
 
----
+## Choose the next step
 
-## 6. Add a Bundled Script (Optional)
+- Add reviewed upstream tools using the [MCP guide](MCP_GUIDE.md).
+- Import a reviewed repository with `skills add owner/repo --list`, then `skills add owner/repo --skill name --git-ref "$REVISION"`, where `REVISION` is the reviewed full commit ID.
+- Read [skill sources and scripts](SKILLS.md) before enabling code execution or project overlays.
+- Use [operations](OPERATIONS.md) for authenticated HTTP and Docker deployment.
 
-Create a Python script in your skill:
-
-```bash
-cat > skills/my-first-skill/process.py << 'EOF'
-#!/usr/bin/env python3
-import json
-import os
-
-# Read arguments
-args = json.loads(os.environ.get('SKILL_ARGS_JSON', '{}'))
-message = args.get('message', 'No message')
-
-# Process
-result = {
-    "processed": True,
-    "original_message": message,
-    "response": f"Processed: {message.upper()}"
-}
-
-# Output as JSON
-print(json.dumps(result))
-EOF
-
-chmod +x skills/my-first-skill/process.py
-```
-
-Restart the server - it will auto-detect the bundled tool.
-
----
-
-## 7. Verify Everything Works
-
-```bash
-# Run all tests
-cargo test --workspace --all-features
-
-# Should see: "30 tests passing"
-```
-
----
-
-## Next Steps
-
-- **Add more skills** - Create additional skill directories
-- **Configure upstreams** - Connect to more MCP servers
-- **Enable sandboxing** - Use `restricted` or `bubblewrap` backend
-- **Enable persistence** - Add database configuration
-- **Read the docs:**
-  - [README.md](README.md) - Full feature overview
-  - [PRODUCTION_READY.md](PRODUCTION_READY.md) - Deployment guide
-  - [HANDOFF.md](HANDOFF.md) - Architecture details
-
----
-
-## Troubleshooting
-
-**Skills not loading?**
-```bash
-# Check directory
-ls -la ./skills
-
-# Run with debug logging
-RUST_LOG=debug ./target/release/skills server stdio --config config.yaml
-```
-
-**Upstream connection failed?**
-```bash
-# Test upstream manually
-npx -y @modelcontextprotocol/server-brave-search
-
-# Check logs for connection errors
-```
-
-**Bundled script not executing?**
-```bash
-# Test script directly
-cd .skills/skills/my-first-skill
-export SKILL_ARGS_JSON='{"message":"test"}'
-python3 process.py
-
-# Check sandbox configuration
-# Use backend: timeout for development
-```
-
----
-
-## Configuration Quick Reference
-
-| Setting | Development | Production |
-|---------|-------------|------------|
-| `sandbox.backend` | `timeout` | `bubblewrap` |
-| `sandbox.timeout_ms` | `60000` | `30000` |
-| `server.log_level` | `debug` | `info` |
-| `persistence.enabled` | `false` | `true` |
-
----
-
-**You're all set! 🎉**
-
-For more details, see [README.md](README.md) or [PRODUCTION_READY.md](PRODUCTION_READY.md).
+No helper is needed for this example. If you add one later, inspect its source and use explicit `skills skill run ... --script ... --consent user_confirmed` only after real user approval and with a usable enforced execution backend.

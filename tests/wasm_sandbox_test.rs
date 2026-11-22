@@ -7,12 +7,13 @@
 //! - `CallableRecord` with `sandbox_config`
 //! - Integration tests
 
+use jiff::Timestamp;
 use skillsrs::core::registry::Registry;
 use skillsrs::core::{
     BundledTool, CallableId, CallableKind, CallableRecord, CostHints, RiskTier, SchemaDigest,
 };
 use skillsrs::execution::upstream::{UpstreamConfig, UpstreamManager};
-use skillsrs::execution::wasm::{WasmModuleInfo, WasmSandbox};
+use skillsrs::execution::wasm::WasmSandbox;
 use skillsrs::execution::{
     sandbox::{Sandbox, SandboxBackend, SandboxConfig, SandboxConfigOverride, SandboxError},
     Runtime,
@@ -60,7 +61,7 @@ fn create_test_tool_record(name: &str, server: &str) -> CallableRecord {
         additional_files: vec![],
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
+        last_seen: Timestamp::now(),
         sandbox_config: None,
     }
 }
@@ -107,124 +108,109 @@ fn create_test_skill_with_bundled_tool(name: &str, tool_name: &str) -> CallableR
         additional_files: vec![],
         cost_hints: CostHints::default(),
         risk_tier: RiskTier::ReadOnly,
-        last_seen: chrono::Utc::now(),
+        last_seen: Timestamp::now(),
         sandbox_config: None,
     }
 }
 
-/// Returns a path to a test WASM module (placeholder - returns non-existent path)
-/// In a real test environment, this would create a valid WASM module
-#[allow(dead_code)]
-fn create_wasm_test_module_path() -> PathBuf {
-    PathBuf::from("/tmp/test_module.wasm")
+#[cfg(unix)]
+fn wasm_fixture(source: &str) -> std::io::Result<(tempfile::TempDir, PathBuf)> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("fixture.wasm");
+    std::fs::write(&path, source)?;
+    Ok((directory, path))
 }
 
 // ============================================================================
 // WASM Sandbox Tests
 // ============================================================================
 
+#[cfg(unix)]
 #[tokio::test]
-#[expect(
-    clippy::panic,
-    reason = "test assertions intentionally fail fast with source-local context"
-)]
-async fn test_wasm_sandbox_basic() {
-    // Test WASM sandbox creation
-    let config = SandboxConfig {
+async fn malformed_module_is_rejected_by_the_compilation_worker() -> Result<(), anyhow::Error> {
+    let (_directory, path) = wasm_fixture("not a wasm module")?;
+    let result = WasmSandbox::new(SandboxConfig {
         backend: SandboxBackend::Wasm,
-        timeout_ms: 30000,
-        max_memory_bytes: 512 * 1024 * 1024,
+        timeout_ms: 10_000,
         ..Default::default()
-    };
+    })
+    .execute(&path, "{}")
+    .await;
+    anyhow::ensure!(
+        matches!(&result, Err(SandboxError::ExecutionFailed(_))),
+        "Malformed module was not rejected as a compilation error: {result:?}"
+    );
+    Ok(())
+}
 
-    let wasm_sandbox = WasmSandbox::new(config);
-    // The sandbox was created successfully
+#[cfg(not(unix))]
+#[tokio::test]
+async fn wasm_workers_fail_closed_without_process_resource_limits() -> Result<(), anyhow::Error> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("worker.wasm");
+    std::fs::write(&path, "(module)")?;
+    let result = WasmSandbox::new(SandboxConfig {
+        backend: SandboxBackend::Wasm,
+        ..Default::default()
+    })
+    .execute(&path, "{}")
+    .await;
+    anyhow::ensure!(
+        matches!(&result, Err(SandboxError::NotAvailable(_))),
+        "WASM worker did not reject unsupported process limits: {result:?}"
+    );
+    Ok(())
+}
 
-    // Test that execution returns error for non-existent file
-    let result = wasm_sandbox
-        .execute(PathBuf::from("/nonexistent.wasm").as_path(), "{}")
-        .await;
-    assert!(result.is_err());
-    match result {
-        Err(SandboxError::ExecutionFailed(msg)) => {
-            assert!(msg.contains("not found") || msg.contains("WASM file"));
-        }
-        Err(_) => { /* Other errors are also acceptable */ }
-        Ok(_) => panic!("Expected error for non-existent file"),
+#[cfg(unix)]
+#[tokio::test]
+async fn test_wasm_sandbox_memory_limits() -> Result<(), anyhow::Error> {
+    for source in [
+        r#"(module (memory (export "memory") 2)
+            (func (export "malloc") (param i32) (result i32) i32.const 128)
+            (func (export "run") (param i32 i32) (result i32) i32.const 0))"#,
+        r#"(module (memory (export "memory") 1)
+            (func (export "malloc") (param i32) (result i32) i32.const 128)
+            (func (export "run") (param i32 i32) (result i32) i32.const 1 memory.grow drop i32.const 0))"#,
+    ] {
+        let (_directory, path) = wasm_fixture(source)?;
+        let sandbox = WasmSandbox::new(SandboxConfig {
+            backend: SandboxBackend::Wasm,
+            max_memory_bytes: 65_536,
+            ..Default::default()
+        });
+        anyhow::ensure!(
+            sandbox.execute(&path, "{}").await.is_err(),
+            "Initial or grown guest memory exceeded the configured cap"
+        );
     }
+    Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn test_wasm_sandbox_validation() {
-    // Test validation of non-existent file
-    let nonexistent = PathBuf::from("/nonexistent/test.wasm");
-    let result = WasmSandbox::validate(&nonexistent);
-    assert!(result.is_err());
-
-    // Test validation of invalid file (not wasm)
-    let invalid_path = PathBuf::from("/tmp/not_wasm.txt");
-    // Create a text file
-    std::fs::write(&invalid_path, "not a wasm module").ok();
-
-    let result = WasmSandbox::validate(&invalid_path);
-    assert!(result.is_err());
-
-    // Cleanup
-    let _ = std::fs::remove_file(&invalid_path);
-}
-
-#[test]
-fn test_wasm_module_info() {
-    // Test WasmModuleInfo structure
-    let info = WasmModuleInfo {
-        imports: vec!["env".to_string(), "wasi_snapshot_preview1".to_string()],
-        exports: vec!["memory".to_string(), "run".to_string(), "init".to_string()],
-        has_run_export: true,
-        has_memory_export: true,
-    };
-
-    assert_eq!(info.imports.len(), 2);
-    assert_eq!(info.exports.len(), 3);
-    assert!(info.has_run_export);
-    assert!(info.has_memory_export);
-    assert!(info.exports.contains(&"run".to_string()));
-    assert!(info.exports.contains(&"memory".to_string()));
-}
-
-#[tokio::test]
-async fn test_wasm_sandbox_memory_limits() {
-    // Test that memory limits are properly configured
-    let config = SandboxConfig {
+async fn test_wasm_sandbox_timeout() -> Result<(), anyhow::Error> {
+    let (_directory, path) = wasm_fixture(
+        r#"(module
+        (memory (export "memory") 1)
+        (func (export "malloc") (param i32) (result i32) i32.const 128)
+        (func (export "run") (param i32 i32) (result i32)
+            (loop $spin br $spin) i32.const 0))"#,
+    )?;
+    let sandbox = WasmSandbox::new(SandboxConfig {
         backend: SandboxBackend::Wasm,
-        timeout_ms: 30000,
-        max_memory_bytes: 1024 * 1024 * 100, // 100 MB
+        timeout_ms: 50,
+        max_cpu_seconds: 0,
         ..Default::default()
-    };
-
-    let wasm_sandbox = WasmSandbox::new(config);
-    // Memory limits are configured but execution of non-existent file will fail
-    let result = wasm_sandbox
-        .execute(PathBuf::from("/tmp/test.wasm").as_path(), "{}")
-        .await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_wasm_sandbox_timeout() {
-    // Test that timeout is properly configured
-    let config = SandboxConfig {
-        backend: SandboxBackend::Wasm,
-        timeout_ms: 1000, // 1 second timeout
-        max_memory_bytes: 512 * 1024 * 1024,
-        ..Default::default()
-    };
-
-    let wasm_sandbox = WasmSandbox::new(config);
-    // Timeout is configured but execution of non-existent file will fail before timeout
-    let result = wasm_sandbox
-        .execute(PathBuf::from("/tmp/test.wasm").as_path(), "{}")
-        .await;
-    assert!(result.is_err());
+    });
+    let output = sandbox.execute(&path, "{}").await?;
+    anyhow::ensure!(output.timed_out, "Guest did not time out");
+    anyhow::ensure!(
+        output.duration_ms < 5000,
+        "Guest timeout took {} ms",
+        output.duration_ms
+    );
+    Ok(())
 }
 
 // ============================================================================
@@ -236,11 +222,19 @@ fn test_sandbox_config_default() {
     let config = SandboxConfig::default();
 
     // Check default values
-    assert_eq!(config.backend, SandboxBackend::Timeout);
+    assert_eq!(
+        config.backend,
+        if cfg!(target_os = "linux") {
+            SandboxBackend::Bubblewrap
+        } else {
+            SandboxBackend::Docker
+        }
+    );
     assert_eq!(config.timeout_ms, 30000); // 30 seconds
     assert!(!config.allow_network);
     assert_eq!(config.max_memory_bytes, 512 * 1024 * 1024); // 512 MB
     assert_eq!(config.max_cpu_seconds, 30);
+    assert_eq!(config.max_output_bytes, 8 * 1024 * 1024);
     assert!(config.allow_read.is_empty());
     assert!(config.allow_write.is_empty());
 }
@@ -275,6 +269,7 @@ fn test_sandbox_config_with_full_override() {
         allow_network: Some(true),
         max_memory_bytes: Some(1024 * 1024 * 1024), // 1 GB
         max_cpu_seconds: Some(60),
+        max_output_bytes: Some(4096),
         allow_read: vec![PathBuf::from("/home/user/projects")],
         allow_write: vec![PathBuf::from("/tmp")],
     };
@@ -286,6 +281,7 @@ fn test_sandbox_config_with_full_override() {
     assert!(merged.allow_network);
     assert_eq!(merged.max_memory_bytes, 1024 * 1024 * 1024);
     assert_eq!(merged.max_cpu_seconds, 60);
+    assert_eq!(merged.max_output_bytes, 4096);
     assert_eq!(merged.allow_read.len(), 1);
     assert_eq!(merged.allow_write.len(), 1);
 }
@@ -317,7 +313,7 @@ fn test_sandbox_config_for_tool() {
     // Tool override should be used for max_memory_bytes
     assert_eq!(merged.max_memory_bytes, 1024 * 1024 * 1024);
     // Base default should be used for backend
-    assert_eq!(merged.backend, SandboxBackend::Timeout);
+    assert_eq!(merged.backend, base.backend);
 }
 
 #[test]
@@ -425,6 +421,7 @@ fn test_sandbox_config_override_serialization() {
         allow_network: Some(false),
         max_memory_bytes: None,
         max_cpu_seconds: None,
+        max_output_bytes: Some(8192),
         allow_read: vec![PathBuf::from("/data")],
         allow_write: vec![],
     };
@@ -435,6 +432,7 @@ fn test_sandbox_config_override_serialization() {
     assert!(yaml.contains("45000"));
     assert!(yaml.contains("false"));
     assert!(yaml.contains("/data"));
+    assert!(yaml.contains("max_output_bytes: 8192"));
 }
 
 // ============================================================================
@@ -699,6 +697,7 @@ fn test_sandbox_backend_serialization() {
 // Sandbox Execution Tests
 // ============================================================================
 
+#[cfg(unix)]
 #[tokio::test]
 #[expect(
     clippy::unwrap_used,
@@ -708,6 +707,7 @@ async fn test_sandbox_execute_timeout() {
     let config = SandboxConfig {
         backend: SandboxBackend::Timeout,
         timeout_ms: 100, // Very short timeout
+        allow_network: true,
         ..Default::default()
     };
 
@@ -725,6 +725,7 @@ async fn test_sandbox_execute_timeout() {
     assert!(output.stderr.contains("timed out") || output.stderr.contains("timeout"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[expect(
     clippy::unwrap_used,
@@ -734,6 +735,9 @@ async fn test_unsandboxed_zero_timeout_does_not_apply_timeout_gate() {
     let sandbox = Sandbox::new(SandboxConfig {
         backend: SandboxBackend::None,
         timeout_ms: 0,
+        allow_network: true,
+        max_memory_bytes: 0,
+        max_cpu_seconds: 0,
         ..Default::default()
     });
     let output = sandbox
@@ -749,13 +753,238 @@ async fn test_unsandboxed_zero_timeout_does_not_apply_timeout_gate() {
     assert!(!output.timed_out);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn native_output_limit_kills_stdout_stderr_and_child_group() -> Result<(), anyhow::Error> {
+    for backend in [
+        SandboxBackend::None,
+        SandboxBackend::Timeout,
+        SandboxBackend::Restricted,
+    ] {
+        for redirect in ["", ">&2"] {
+            let directory = tempfile::tempdir()?;
+            let sandbox = Sandbox::new(SandboxConfig {
+                backend,
+                timeout_ms: 0,
+                allow_network: true,
+                max_memory_bytes: 0,
+                max_cpu_seconds: 0,
+                max_output_bytes: 1024,
+                ..Default::default()
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sandbox.execute(
+                    "sh",
+                    &[
+                        "-c".to_string(),
+                        format!(
+                            "(sleep 0.3; printf late > marker) & while :; do printf 12345678 {redirect}; done"
+                        ),
+                    ],
+                    directory.path(),
+                    &[],
+                ),
+            )
+            .await?;
+            anyhow::ensure!(
+                matches!(result, Err(SandboxError::OutputLimitExceeded(1024))),
+                "Native output did not exceed the 1024-byte limit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            anyhow::ensure!(
+                !directory.path().join("marker").exists(),
+                "Native descendant survived the output limit"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_output_limit_counts_both_streams_and_accepts_exact_limit(
+) -> Result<(), anyhow::Error> {
+    for (limit, command, expected) in [
+        (8, "printf 1234; printf 5678 >&2", Some(("1234", "5678"))),
+        (7, "printf 1234; printf 5678 >&2", None),
+        (0, ":", Some(("", ""))),
+        (0, "printf x", None),
+    ] {
+        let sandbox = Sandbox::new(SandboxConfig {
+            backend: SandboxBackend::Timeout,
+            allow_network: true,
+            max_output_bytes: limit,
+            ..Default::default()
+        });
+        let result = sandbox
+            .execute(
+                "sh",
+                &["-c".to_string(), command.to_string()],
+                std::path::Path::new("."),
+                &[],
+            )
+            .await;
+        if let Some((stdout, stderr)) = expected {
+            let output = result?;
+            anyhow::ensure!(
+                output.stdout == stdout,
+                "Unexpected stdout: {:?}; expected {stdout:?}",
+                output.stdout
+            );
+            anyhow::ensure!(
+                output.stderr == stderr,
+                "Unexpected stderr: {:?}; expected {stderr:?}",
+                output.stderr
+            );
+            anyhow::ensure!(
+                !output.timed_out,
+                "Exact-limit execution unexpectedly timed out"
+            );
+        } else {
+            anyhow::ensure!(
+                matches!(result, Err(SandboxError::OutputLimitExceeded(value)) if value == limit),
+                "Native output did not enforce the {limit}-byte limit"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon and the alpine:latest image"]
+async fn docker_output_limit_kills_stdout_stderr_and_descendants() -> Result<(), anyhow::Error> {
+    for redirect in ["", ">&2"] {
+        let directory = tempfile::tempdir()?;
+        let marker = directory.path().join("marker");
+        let sandbox = Sandbox::new(SandboxConfig {
+            backend: SandboxBackend::Docker,
+            timeout_ms: 0,
+            max_cpu_seconds: 0,
+            max_output_bytes: 1024,
+            allow_write: vec![directory.path().to_path_buf()],
+            ..Default::default()
+        });
+        let args = [
+            "-c".to_string(),
+            format!(
+                "(sleep 0.3; printf late > \"$1\") & while :; do printf 12345678 {redirect}; done"
+            ),
+            "sh".to_string(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sandbox.execute("sh", &args, directory.path(), &[]),
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(result, Err(SandboxError::OutputLimitExceeded(1024))),
+            "Docker output did not exceed the 1024-byte limit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        anyhow::ensure!(
+            !marker.exists(),
+            "Docker descendant survived the output limit"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon and the alpine:latest image"]
+async fn docker_disables_daemon_logs_and_preserves_bounded_capture() -> Result<(), anyhow::Error> {
+    use bollard::query_parameters::{ListContainersOptions, RemoveContainerOptions};
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut config = SandboxConfig {
+        backend: SandboxBackend::Docker,
+        max_output_bytes: 8,
+        ..Default::default()
+    };
+    config.docker.auto_remove = false;
+    let result = Sandbox::new(config)
+        .execute(
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf 1234; printf 5678 >&2; exit 3".to_string(),
+                token.clone(),
+            ],
+            std::path::Path::new("."),
+            &[],
+        )
+        .await;
+
+    let docker = bollard::Docker::connect_with_local_defaults()?;
+    let containers = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: Some(std::collections::HashMap::from([(
+                "name".to_string(),
+                vec!["skills-sandbox-".to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await?;
+    let id = containers
+        .into_iter()
+        .find_map(|container| {
+            container
+                .command
+                .is_some_and(|command| command.contains(&token))
+                .then_some(container.id)
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("Retained test container not found"))?;
+    let inspection = docker.inspect_container(&id, None).await;
+    docker
+        .remove_container(
+            &id,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let inspection = inspection?;
+    anyhow::ensure!(
+        inspection
+            .host_config
+            .and_then(|host| host.log_config)
+            .and_then(|log| log.typ)
+            .as_deref()
+            == Some("none"),
+        "Docker daemon logging was not disabled"
+    );
+    let output = result?;
+    anyhow::ensure!(
+        output.stdout == "1234",
+        "Unexpected Docker stdout: {:?}",
+        output.stdout
+    );
+    anyhow::ensure!(
+        output.stderr == "5678",
+        "Unexpected Docker stderr: {:?}",
+        output.stderr
+    );
+    anyhow::ensure!(
+        output.exit_code == Some(3),
+        "Unexpected Docker exit code: {:?}",
+        output.exit_code
+    );
+    anyhow::ensure!(!output.timed_out, "Docker execution unexpectedly timed out");
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
 #[expect(
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
 async fn test_sandbox_execute_with_env_vars() {
-    let config = SandboxConfig::default();
+    let config = SandboxConfig::development();
     let sandbox = Sandbox::new(config);
 
     let env_vars = vec![
@@ -775,7 +1004,7 @@ async fn test_sandbox_execute_with_env_vars() {
 
 #[tokio::test]
 async fn test_sandbox_execute_nonexistent() {
-    let config = SandboxConfig::default();
+    let config = SandboxConfig::development();
     let sandbox = Sandbox::new(config);
 
     // Execute a non-existent command
@@ -823,7 +1052,7 @@ fn test_sandbox_config_override_empty() {
     let merged = base.with_override(&empty_override);
 
     // All values should remain at defaults
-    assert_eq!(merged.backend, SandboxBackend::Timeout);
+    assert_eq!(merged.backend, base.backend);
     assert_eq!(merged.timeout_ms, 30000);
     assert!(!merged.allow_network);
 }
@@ -889,26 +1118,142 @@ fn test_sandbox_config_path_merging() {
 // Error Handling Tests
 // ============================================================================
 
-#[test]
-fn test_sandbox_error_display() {
-    let errors = vec![
-        SandboxError::ExecutionFailed("test error".to_string()),
-        SandboxError::Timeout(5000),
-        SandboxError::NotAvailable("feature not available".to_string()),
-        SandboxError::InvalidConfig("bad config".to_string()),
-    ];
-
-    for error in errors {
-        let msg = error.to_string();
-        assert!(!msg.is_empty());
-        // Should not panic
-    }
+#[cfg(unix)]
+#[tokio::test]
+async fn wasi_stdio_is_private_and_captured() -> Result<(), anyhow::Error> {
+    let (_directory, path) = wasm_fixture(
+        r#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "\40\00\00\00\0d\00\00\00")
+        (data (i32.const 64) "private-stdio")
+        (data (i32.const 128) "\02\00\00\00ok")
+        (func (export "malloc") (param i32) (result i32) i32.const 512)
+        (func (export "run") (param i32 i32) (result i32)
+            i32.const 1 i32.const 0 i32.const 1 i32.const 16 call $write drop
+            i32.const 2 i32.const 0 i32.const 1 i32.const 16 call $write drop
+            i32.const 128))"#,
+    )?;
+    let result = WasmSandbox::new(SandboxConfig::wasm_optimized())
+        .execute(&path, "{}")
+        .await?;
+    anyhow::ensure!(
+        result.stdout == "private-stdiook",
+        "Unexpected private stdout: {:?}",
+        result.stdout
+    );
+    anyhow::ensure!(
+        result.stderr == "private-stdio",
+        "Unexpected private stderr: {:?}",
+        result.stderr
+    );
+    Ok(())
 }
 
-#[test]
-fn test_sandbox_error_from_io() {
-    let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-    let sandbox_error: SandboxError = io_error.into();
+#[cfg(unix)]
+#[tokio::test]
+async fn wasm_fuel_budget_stops_busy_guest_without_wall_timeout() -> Result<(), anyhow::Error> {
+    let (_directory, path) = wasm_fixture(
+        r#"(module
+        (memory (export "memory") 1)
+        (func (export "malloc") (param i32) (result i32) i32.const 128)
+        (func (export "run") (param i32 i32) (result i32) (loop $spin br $spin) i32.const 0))"#,
+    )?;
+    let sandbox = WasmSandbox::new(SandboxConfig {
+        backend: SandboxBackend::Wasm,
+        timeout_ms: 0,
+        max_cpu_seconds: 1,
+        ..Default::default()
+    });
+    let result = sandbox.execute(&path, "{}").await?;
+    anyhow::ensure!(result.timed_out, "Fuel budget did not stop the guest");
+    anyhow::ensure!(
+        result.exit_code.is_none(),
+        "Fuel-exhausted guest returned an exit code: {:?}",
+        result.exit_code
+    );
+    Ok(())
+}
 
-    assert!(matches!(sandbox_error, SandboxError::Io(_)));
+#[cfg(unix)]
+#[tokio::test]
+async fn wasi_stdin_contains_only_invocation_input() -> Result<(), anyhow::Error> {
+    let (_directory, path) = wasm_fixture(
+        r#"(module
+        (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "\84\00\00\00\40\00\00\00")
+        (func (export "malloc") (param i32) (result i32) i32.const 512)
+        (func (export "run") (param i32 i32) (result i32)
+            i32.const 0 i32.const 0 i32.const 1 i32.const 128 call $read drop
+            i32.const 128))"#,
+    )?;
+    let input = r#"{"private":"input"}"#;
+    let result = WasmSandbox::new(SandboxConfig::wasm_optimized())
+        .execute(&path, input)
+        .await?;
+    anyhow::ensure!(
+        result.stdout == input,
+        "Guest stdin differed from invocation input: {:?}",
+        result.stdout
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wasi_host_waits_are_cancelled_at_effective_deadline() -> Result<(), anyhow::Error> {
+    let (_directory, path) = wasm_fixture(
+        r#"(module
+        (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 16) "\01\00\00\00\00\00\00\00\00\ac\23\fc\06\00\00\00")
+        (func (export "malloc") (param i32) (result i32) i32.const 512)
+        (func (export "run") (param i32 i32) (result i32)
+            i32.const 0 i32.const 64 i32.const 1 i32.const 128 call $poll drop
+            i32.const 128))"#,
+    )?;
+    let sandbox = WasmSandbox::new(SandboxConfig {
+        backend: SandboxBackend::Wasm,
+        timeout_ms: 200,
+        max_cpu_seconds: 0,
+        ..Default::default()
+    });
+    let result = sandbox.execute(&path, "{}").await?;
+    anyhow::ensure!(result.timed_out, "Host wait did not time out");
+    anyhow::ensure!(
+        result.duration_ms < 5000,
+        "Host wait timeout took {} ms",
+        result.duration_ms
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_unbounded_wasm_drops_guest_execution() -> Result<(), anyhow::Error> {
+    let (directory, path) = wasm_fixture(
+        r#"(module
+        (memory (export "memory") 1)
+        (func (export "malloc") (param i32) (result i32) i32.const 128)
+        (func (export "run") (param i32 i32) (result i32) (loop $spin br $spin) i32.const 0))"#,
+    )?;
+    let execution = tokio::spawn(async move {
+        let _directory = directory;
+        WasmSandbox::new(SandboxConfig {
+            backend: SandboxBackend::Wasm,
+            timeout_ms: 0,
+            max_cpu_seconds: 0,
+            ..Default::default()
+        })
+        .execute(&path, "{}")
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    execution.abort();
+    anyhow::ensure!(
+        execution.await.is_err(),
+        "Aborted guest execution completed successfully"
+    );
+    Ok(())
 }

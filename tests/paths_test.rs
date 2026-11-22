@@ -63,18 +63,21 @@ fn test_ensure_directories() {
     clippy::unwrap_used,
     reason = "test assertions intentionally fail fast with source-local context"
 )]
-fn test_path_overrides() {
+fn data_root_isolates_persistence_unless_explicitly_overridden() {
     let temp_dir = TempDir::new().unwrap();
-    let custom_root = temp_dir.path().join("custom_skills");
-
-    let config = PathsConfig {
-        data_dir: Some(custom_root.clone()),
+    let managed = temp_dir.path().join("managed");
+    let explicit_database = temp_dir.path().join("shared.db");
+    let mut config = PathsConfig {
+        data_dir: Some(managed.clone()),
         ..Default::default()
     };
-
-    let paths = config.apply_to(SkillsPaths::new().unwrap());
-    // skills_root is derived from data_dir/skills/
-    assert_eq!(paths.skills_root, custom_root.join("skills"));
+    let paths = config.apply_to(SkillsPaths::with_root(temp_dir.path().join("old")));
+    assert_eq!(paths.database_path, managed.join("skills.db"));
+    assert_eq!(paths.cache_dir, managed.join("cache"));
+    assert_eq!(paths.logs_dir, managed.join("logs"));
+    config.database_path = Some(explicit_database.clone());
+    let paths = config.apply_to(paths);
+    assert_eq!(paths.database_path, explicit_database);
 }
 
 #[test]
@@ -90,4 +93,25 @@ fn test_display() {
     assert!(display.contains("Data directory"));
     assert!(display.contains("Skills root"));
     assert!(display.contains(temp_dir.path().to_str().unwrap()));
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "isolated fixture setup and assertions")]
+fn shared_roots_respect_project_trust_and_repository_boundary() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    let nested = repository.join("packages/app");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(repository.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let user_only = skillsrs::paths::shared_skill_roots(None, &home);
+    assert_eq!(
+        user_only,
+        vec![home.join(".agents/skills"), home.join(".claude/skills")]
+    );
+    let trusted = skillsrs::paths::shared_skill_roots(Some(&nested), &home);
+    assert_eq!(trusted.first(), Some(&nested.join(".agents/skills")));
+    assert!(trusted.contains(&repository.join(".agents/skills")));
+    assert!(!trusted.contains(&temp.path().join(".agents/skills")));
+    assert_eq!(trusted.last(), Some(&home.join(".claude/skills")));
 }

@@ -2,11 +2,10 @@ name: Docker
 
 on:
   push:
-    branches: [ main, develop ]
-    tags:
-      - 'v*'
+    branches: [main, develop]
+    tags: ['v*']
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -15,29 +14,52 @@ env:
 
 jobs:
   build-and-push:
-    name: Build and Push Docker Image
+    name: Validate and publish Docker image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build local validation image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: skills-validation:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: RUST_VERSION=1.97
+      - name: Validate non-root HTTP server and readiness
+        run: |
+          set -euo pipefail
+          token=$(openssl rand -hex 32)
+          docker run -d --name skills-validation -e SKILLS_HTTP_TOKEN="$token" skills-validation:local
+          trap 'docker logs skills-validation; docker rm -f skills-validation' EXIT
+          test "$(docker inspect --format '{{.Config.User}}' skills-validation)" = skills
+          ready=false
+          for attempt in $(seq 1 30); do
+            if docker exec skills-validation curl --fail --silent --header "Authorization: Bearer $token" http://127.0.0.1:8000/health; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          status=$(docker exec skills-validation curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8000/mcp)
+          test "$status" = 401
+      - name: Log in to registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -51,68 +73,43 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push Docker image
+      - name: Build and push validated image
+        id: publish
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            RUST_VERSION=1.92
-
-  test-image:
-    name: Test Docker Image
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    steps:
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull and test image
-        run: |
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }} --version
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }} --help
+          build-args: RUST_VERSION=1.97
 
   scan-image:
-    name: Scan Docker Image for Vulnerabilities
+    name: Scan published image
     needs: build-and-push
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
+      packages: read
       security-events: write
     steps:
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull image
-        run: docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+      - uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-
-      - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+      - uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: 'trivy-results.sarif'
+          sarif_file: trivy-results.sarif

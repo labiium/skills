@@ -2,179 +2,152 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release'
+        description: 'Existing tag version to release (without v)'
         required: true
         type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
+  validate:
+    runs-on: ubuntu-24.04
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Get version
-        id: get_version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
         with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          release_name: Release ${{ steps.get_version.outputs.version }}
-          draft: false
-          prerelease: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.0'
+      - name: Validate tag against package version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1']))
+          package = next(p for p in metadata['packages'] if p['name'] == 'skillsrs')
+          version = os.environ['REQUESTED_VERSION'] or os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          if version != package['version']:
+              raise SystemExit(f"Tag version {version!r} differs from skillsrs {package['version']!r}")
+          tag = 'v' + version
+          subprocess.run(['git', 'rev-parse', '--verify', 'refs/tags/' + tag], check=True)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\ntag={tag}\n')
+          PY
+      - name: Test release source
+        run: cargo test --locked -p skillsrs --all-features
+      - name: Validate crate packaging
+        run: cargo publish --locked -p skillsrs --dry-run
+      - name: Install audit tool
+        run: cargo install cargo-audit --locked
+      - name: Audit release dependencies
+        run: python3 scripts/audit.py
 
-  build-release:
-    name: Build Release
-    needs: create-release
+  build:
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            artifact_name: skills
-            asset_name: skills-linux-x86_64
-          - os: ubuntu-latest
+            asset: skills-linux-x86_64
+            binary: skills
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact_name: skills
-            asset_name: skills-linux-aarch64
-          - os: macos-latest
+            asset: skills-linux-aarch64
+            binary: skills
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-            artifact_name: skills
-            asset_name: skills-macos-x86_64
-          - os: macos-latest
+            asset: skills-macos-x86_64
+            binary: skills
+          - os: macos-15
             target: aarch64-apple-darwin
-            artifact_name: skills
-            asset_name: skills-macos-aarch64
+            asset: skills-macos-aarch64
+            binary: skills
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: skills.exe
-            asset_name: skills-windows-x86_64.exe
-
+            asset: skills-windows-x86_64
+            binary: skills.exe
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.0'
           targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin skills
-
-      - name: Strip binary (Linux and macOS)
-        if: matrix.os != 'windows-latest'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
-      - name: Create archive
+      - name: Build locked native binary
+        run: cargo build --locked --release -p skillsrs --bin skills --target ${{ matrix.target }}
+      - name: Validate binary
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a ../../../${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+          target/${{ matrix.target }}/release/${{ matrix.binary }} server http --help
+      # Cargo's release profile strips symbols with the native target toolchain.
+      - name: Archive binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ '${{ runner.os }}' == 'Windows' ]]; then
+            (cd target/${{ matrix.target }}/release && 7z a ../../../dist/${{ matrix.asset }}.zip ${{ matrix.binary }})
           else
-            tar czf ../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+            tar -C target/${{ matrix.target }}/release -czf dist/${{ matrix.asset }}.tar.gz ${{ matrix.binary }}
           fi
-
-      - name: Upload Release Asset (tar.gz)
-        if: matrix.os != 'windows-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.asset_name }}.tar.gz
-          asset_name: ${{ matrix.asset_name }}.tar.gz
-          asset_content_type: application/gzip
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
 
-      - name: Upload Release Asset (zip)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.asset_name }}.zip
-          asset_name: ${{ matrix.asset_name }}.zip
-          asset_content_type: application/zip
-
-  publish-crates:
-    name: Publish to crates.io
-    needs: build-release
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.0'
+      - name: Publish single crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked -p skillsrs
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Login to crates.io
-        run: cargo login ${{ secrets.CRATES_IO_TOKEN }}
-
-      - name: Publish crates
+  release:
+    needs: [validate, build, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: skills-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
         run: |
-          # Publish core crates first
-          cargo publish -p skillsrs-core --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-registry --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-index --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-policy --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-upstream --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-skillstore --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-runtime --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-mcp --allow-dirty
-          sleep 10
-          cargo publish -p skillsrs-cli --allow-dirty
-          sleep 10
-          cargo publish -p skills --allow-dirty
-        continue-on-error: true
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+      - name: Publish validated release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "Release $RELEASE_TAG"
